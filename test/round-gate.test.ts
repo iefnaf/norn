@@ -573,6 +573,45 @@ describe('runWorkAttempt: slots, state, and crash-safety', () => {
     }
   })
 
+  it('defers on a full registry, then works once another run releases capacity', async () => {
+    // §16: shared repository-wide capacity — a full registry defers the
+    // attempt (polling within its budget) instead of parking it, so Work of
+    // concurrent maps interleaves as reservations release.
+    const harness = makeHarness({
+      label: 'slot-defer',
+      worker: committingWorker(),
+      reviewer: passReviewer,
+      slots: { fullFirst: 3 },
+      slotWaitMs: 2_000,
+    })
+    try {
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok', outcome.kind === 'error' ? outcome.reason : '')
+      assert.ok(harness.slots.reserveCalls > 3, 'the attempt polled while deferred')
+      assert.equal(harness.slots.releaseCalls, 1)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('parks with slot-unavailable after the defer budget elapses', async () => {
+    const harness = makeHarness({
+      label: 'slot-budget',
+      worker: committingWorker(),
+      reviewer: passReviewer,
+      slots: { reserve: 'full' },
+      slotWaitMs: 30,
+    })
+    try {
+      const outcome = await harness.run()
+      expectBlocked(outcome, 'slot-unavailable')
+      assert.ok(harness.slots.reserveCalls > 1, 'the attempt exhausted its budget polling')
+      assert.equal(harness.runner.launches.length, 0)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
   it('maps a slot registry failure to a run-scoped error without parking', async () => {
     const harness = makeHarness({
       label: 'slot-error',

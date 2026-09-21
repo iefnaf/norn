@@ -560,7 +560,7 @@ describe('resume reconciliation ordering (§13.2, §16)', () => {
     }
   })
 
-  it('releases a stale reservation only after settlement is persisted, and never touches other runs', async () => {
+  it('releases a stale reservation only after settlement is persisted, and never touches other live runs', async () => {
     const harness = await makeRunHarness({ label: 'order-release', members: [ticketA()] })
     try {
       const events: string[] = []
@@ -600,13 +600,17 @@ describe('resume reconciliation ordering (§13.2, §16)', () => {
       assert.ok(settledAt !== -1 && releasedAt !== -1)
       assert.ok(settledAt < releasedAt, 'the stale release follows the persisted settlement')
 
-      // The parked attempt's workspace was never inspected, and the other
-      // run's reservation is untouched (§16).
+      // The parked attempt's workspace was never inspected. The other run's
+      // reservation has no Run State at all — no matching recorded attempt,
+      // no recorded process groups — so §16 permits its release once this
+      // run's settlement ordering is proven. (A foreign reservation that
+      // DOES match a recorded working attempt stays charged — covered by the
+      // cross-map slot tests.)
       assert.ok(
         !events.some((entry) => entry.startsWith('git:')),
         'no workspace of the parked attempt was inspected',
       )
-      assert.deepEqual(reservedIds(harness), ['wa-other'])
+      assert.deepEqual(reservedIds(harness), [])
 
       const state = harness.runState()!
       assert.equal(state.activeProcesses[0]?.state, 'settled')

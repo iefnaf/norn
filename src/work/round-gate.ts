@@ -377,6 +377,11 @@ export interface WorkSlotSeam {
   release(): Promise<ReleaseOutcome>
 }
 
+/** Default budget for waiting on shared repository-wide capacity (§16). */
+export const DEFAULT_SLOT_WAIT_MS = 10 * 60_000
+/** Default poll interval while waiting for a Work slot. */
+export const DEFAULT_SLOT_POLL_MS = 100
+
 /** What the gate persists for one live attempt. */
 export type WorkAttemptRecord = {
   readonly attempt: WorkAttemptCheckpoint
@@ -440,6 +445,10 @@ export type RoundGateDeps = {
   readonly newInvocationId?: (owner: 'worker' | 'reviewer', round: number) => string
   /** Handle persisted at launch intent; defaults to a stable adapter name. */
   readonly launchIntentHandle?: (invocationId: string) => string
+  /** How long a full registry may defer this attempt (§16); default 10 min. */
+  readonly slotWaitMs?: number
+  /** Poll interval while waiting for shared capacity; default 100 ms. */
+  readonly slotPollMs?: number
 }
 
 /** The immutable input plus everything the gate needs to execute one attempt. */
@@ -848,25 +857,54 @@ export async function runWorkAttempt(
   if (recorded.kind !== 'ok') return recorded
 
   if (!state.reserved) {
-    const reservation = await deps.slots.reserve()
-    if (reservation.kind !== 'ok') {
-      return runScopedSlot('reserving the Work slot', reservation)
+    // Shared repository-wide capacity (§8, §16): concurrent runs of other
+    // maps in this repository may hold every slot. The attempt defers —
+    // polling with a bounded budget — because those reservations release as
+    // their attempts settle; a coordinator crash leaves them charged until
+    // reconciliation proves settlement, so waiting never exceeds the budget.
+    const waitMs = deps.slotWaitMs ?? DEFAULT_SLOT_WAIT_MS
+    const pollMs = Math.max(1, deps.slotPollMs ?? DEFAULT_SLOT_POLL_MS)
+    const deadline = Date.now() + waitMs
+    let reserved = false
+    for (;;) {
+      const reservation = await deps.slots.reserve()
+      if (reservation.kind !== 'ok') {
+        return runScopedSlot('reserving the Work slot', reservation)
+      }
+      if (reservation.value.reserved) {
+        reserved = true
+        break
+      }
+      if (params.signal?.aborted) {
+        return finishAttempt(deps, state, blocked({
+          scope: 'ticket',
+          code: 'user-abort',
+          reason:
+            `operator interrupted while attempt ${params.workAttemptId} waited for ` +
+            'repository-wide Work capacity',
+          sharedWrite: 'none',
+          evidence: [{ workAttemptId: params.workAttemptId }],
+        }), { retainWorkspace: false })
+      }
+      if (Date.now() >= deadline) {
+        return finishAttempt(deps, state, blocked({
+          scope: 'ticket',
+          code: 'slot-unavailable',
+          reason:
+            `the repository-wide Work capacity stayed fully charged for ${waitMs}ms; ` +
+            `attempt ${params.workAttemptId} cannot start`,
+          sharedWrite: 'none',
+          evidence: [{ workAttemptId: params.workAttemptId, waitedMs: waitMs }],
+        }), { retainWorkspace: false })
+      }
+      await delay(Math.min(pollMs, Math.max(1, deadline - Date.now())))
     }
-    if (!reservation.value.reserved) {
-      return finishAttempt(deps, state, blocked({
-        scope: 'ticket',
-        code: 'slot-unavailable',
-        reason:
-          `the repository-wide Work capacity is fully charged; attempt ${params.workAttemptId} ` +
-          'cannot start',
-        sharedWrite: 'none',
-        evidence: [{ workAttemptId: params.workAttemptId }],
-      }), { retainWorkspace: false })
+    if (reserved) {
+      state.reserved = true
+      state.record = withAttempt(state, { slot: 'reserved' })
+      const saved = await persistWorking(deps.store, state)
+      if (saved.kind !== 'ok') return saved
     }
-    state.reserved = true
-    state.record = withAttempt(state, { slot: 'reserved' })
-    const saved = await persistWorking(deps.store, state)
-    if (saved.kind !== 'ok') return saved
   }
 
   // --- the attempt-owned branch and workspace at the exact Wave base -----
@@ -1934,4 +1972,8 @@ function sameJson(a: unknown, b: unknown): boolean {
 
 function describe(cause: unknown): string {
   return cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause)
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
 }

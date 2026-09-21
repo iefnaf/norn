@@ -88,6 +88,7 @@ import type { ProcessGroupLivenessProbe } from '../runstate/slot-registry.ts'
 import type { ReleaseOutcome } from '../runstate/slot-registry.ts'
 import { acquireControlLock, acquireMapLock } from '../runstate/locks.ts'
 import { loadAllRunStates, loadRunState, saveRunState } from '../runstate/run-state-store.ts'
+import { reconcileStaleWorkSlots } from '../runstate/slot-registry.ts'
 import type {
   EvidenceGateV1,
   RunReport,
@@ -235,6 +236,10 @@ export type RunLifecycleDeps = CheckMapDeps & {
     repositoryHome: string,
     workAttemptId: string,
   ) => Promise<ReleaseOutcome>
+  /** How long a full slot registry may defer one Work attempt (§16). */
+  readonly slotWaitMs?: number
+  /** Poll interval while a Work attempt waits for shared capacity (§16). */
+  readonly slotPollMs?: number
 }
 
 /** The bound target and delivery facts of one run's repository (§14). */
@@ -532,9 +537,28 @@ export async function runMap(deps: RunLifecycleDeps, mapUrl: string): Promise<Ru
         tickets: {},
         activeProcesses: [],
       }
-      const saved = saveRunState(repositoryHome, encodedMapIssueId, state)
-      if (saved.kind !== 'ok') {
-        return error({ scope: 'operation', code: saved.code as never, reason: saved.reason })
+      // Claim this run's complete member set atomically under the repository
+      // control lock (§16): preflight proved disjointness against a snapshot
+      // of the other runs' claims, and the recheck here closes the window in
+      // which another coordinator registered a run or adopted an extension
+      // claiming an overlapping Ticket.
+      const claimed = await createRunUnderControlLock({
+        repositoryHome,
+        encodedMapIssueId,
+        state,
+        memberIssueIds: snapshot.tickets.map((ticket) => ticket.ref.issueId),
+      })
+      if (claimed.kind !== 'ok') {
+        if (claimed.kind === 'blocked') {
+          return blocked({
+            scope: 'operation',
+            code: 'check-findings',
+            reason: claimed.reason,
+            sharedWrite: 'none',
+            evidence: [...claimed.evidence],
+          })
+        }
+        return error({ scope: 'operation', code: claimed.code, reason: claimed.reason })
       }
     }
 
@@ -632,6 +656,17 @@ async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapO
     ])
   }
   let state = reconciled.value
+
+  // Reclaim only provably-settled reservations of other runs (§16): a
+  // coordinator that crashed between persisting an attempt outcome and
+  // releasing its slot must not strand repository-wide capacity. A
+  // reservation whose attempt is still `working` — including a crashed
+  // coordinator's — stays charged to its own resume or abort reconciliation.
+  const reclaimed = await reconcileStaleWorkSlots(ctx.repositoryHome)
+  if (reclaimed.kind !== 'ok') {
+    return runFailure(ctx, reclaimed.code as never,
+      `reconciling stale Work-slot reservations failed: ${reclaimed.reason}`)
+  }
 
   for (;;) {
     // --- resume a persisted ship queue before anything else (§13.2) ---------
@@ -1098,6 +1133,16 @@ async function adoptExtension(
     addedTicketIssueIds: [...addedTicketIssueIds],
   }
   const adopted = await adoptUnderControlLock(ctx, state.runId, extension, newRecords)
+  if (adopted.kind === 'blocked') {
+    // §7.4: an ownership-blocked added-Ticket preflight prevents adoption
+    // and is treated as an incompatible change.
+    return {
+      kind: 'stop',
+      outcome: terminalFailure(ctx, state, 'blocked', 'changed-input', adopted.reason, [
+        ...adopted.evidence,
+      ]),
+    }
+  }
   if (adopted.kind !== 'ok') {
     return {
       kind: 'stop',
@@ -1117,29 +1162,125 @@ async function claimedByOtherRun(
 ): Promise<Outcome<string[] | undefined, never, 'control-store' | 'state-integrity'>> {
   const states = await loadAllRunStates(ctx.repositoryHome)
   if (states.kind !== 'ok') return states
-  for (const state of states.value.values()) {
+  return ok(overlappingActiveClaims(states.value, runId, issueIds))
+}
+
+/** The member Ticket IDs another running run already claims, if any (§16). */
+function overlappingActiveClaims(
+  states: ReadonlyMap<string, RunState>,
+  runId: string,
+  issueIds: readonly string[],
+): string[] | undefined {
+  for (const state of states.values()) {
     if (state.runId === runId || state.status !== 'running') continue
     const claimed = new Set(
       state.acceptedMapRevisions.at(-1)!.payload.members.map((member) => member.ticketIssueId),
     )
     const overlap = issueIds.filter((id) => claimed.has(id))
-    if (overlap.length > 0) return ok(overlap)
+    if (overlap.length > 0) return overlap
   }
-  return ok(undefined)
+  return undefined
+}
+
+/**
+ * Claim a new run's complete member set atomically (§16): under the
+ * repository control lock, recheck executor compatibility and member
+ * disjointness against every other running run, then persist the new Run
+ * State — the claim itself — in the same critical section. A violation
+ * blocks the second run at preflight exactly as `/norn check` would have.
+ */
+async function createRunUnderControlLock(init: {
+  readonly repositoryHome: string
+  readonly encodedMapIssueId: string
+  readonly state: RunState
+  readonly memberIssueIds: readonly string[]
+}): Promise<
+  | { readonly kind: 'ok' }
+  | {
+      readonly kind: 'blocked'
+      readonly reason: string
+      readonly evidence: Evidence[]
+    }
+  | { readonly kind: 'error'; readonly code: 'control-store' | 'state-integrity' | 'lock-failed'; readonly reason: string }
+> {
+  const lock = await acquireControlLock(init.repositoryHome)
+  if (lock.kind !== 'ok') {
+    return { kind: 'error', code: 'lock-failed', reason: `acquiring the repository control lock failed: ${lock.reason}` }
+  }
+  try {
+    const states = await loadAllRunStates(init.repositoryHome)
+    if (states.kind !== 'ok') {
+      return { kind: 'error', code: states.code, reason: states.reason }
+    }
+
+    const findings: Evidence[] = []
+    for (const other of states.value.values()) {
+      const sameMap =
+        other.map.githubHost === init.state.map.githubHost &&
+        other.map.repositoryId === init.state.map.repositoryId &&
+        other.map.issueId === init.state.map.issueId
+      if (sameMap || other.status !== 'running') continue
+      const mismatches: string[] = []
+      if (other.configRevision !== init.state.configRevision) mismatches.push('configRevision')
+      if (other.nornVersion !== init.state.nornVersion) mismatches.push('nornVersion')
+      if (mismatches.length > 0) {
+        findings.push({
+          kind: 'incompatible-active-run',
+          runId: other.runId,
+          mapNumber: other.map.number,
+          mismatches,
+        })
+      }
+      const claimed = new Set(
+        other.acceptedMapRevisions.at(-1)!.payload.members.map((member) => member.ticketIssueId),
+      )
+      const overlap = init.memberIssueIds.filter((id) => claimed.has(id))
+      if (overlap.length > 0) {
+        findings.push({
+          kind: 'ticket-claimed-by-active-run',
+          ticketIssueIds: overlap,
+          runId: other.runId,
+          mapNumber: other.map.number,
+        })
+      }
+    }
+    if (findings.length > 0) {
+      return {
+        kind: 'blocked',
+        reason:
+          `another active run claimed overlapping Tickets or an incompatible executor identity ` +
+          `while run ${init.state.runId} was starting: ${findings.map((entry) => (entry as { kind: string }).kind).join(', ')}`,
+        evidence: findings,
+      }
+    }
+
+    const saved = saveRunState(init.repositoryHome, init.encodedMapIssueId, init.state)
+    if (saved.kind !== 'ok') {
+      return { kind: 'error', code: saved.code, reason: saved.reason }
+    }
+    return { kind: 'ok' }
+  } finally {
+    await lock.value.release()
+  }
 }
 
 /**
  * The §7.4/§16 adoption core, shared by the coordinator and the Ship
  * adoption seam: under the repository control lock, recheck active
  * ownership, then atomically append the lineage entry and claim the added
- * Ticket IDs in one Run State update.
+ * Ticket IDs in one Run State update. A claim that loses the race — another
+ * active run claimed an added Ticket between this coordinator's pre-lock
+ * check and the lock — is `blocked(claimed-by-active-run)`; §7.4 treats it as
+ * an incompatible change rather than an error.
  */
 async function adoptUnderControlLock(
   ctx: RunContext,
   runId: string,
   extension: ShipExtensionAdoption,
   newRecords: Record<string, TicketRunState>,
-): Promise<Outcome<RunState, never, 'control-store' | 'state-integrity' | 'lock-failed'>> {
+): Promise<
+  Outcome<RunState, 'claimed-by-active-run', 'control-store' | 'state-integrity' | 'lock-failed'>
+> {
   const lock = await acquireControlLock(ctx.repositoryHome)
   if (lock.kind !== 'ok') {
     return error({
@@ -1153,10 +1294,12 @@ async function adoptUnderControlLock(
     const overlap = await claimedByOtherRun(ctx, runId, extension.addedTicketIssueIds)
     if (overlap.kind !== 'ok') return overlap
     if (overlap.value !== undefined) {
-      return error({
+      return blocked({
         scope: 'run',
-        code: 'control-store',
-        reason: `added ticket(s) ${overlap.value.join(', ')} are claimed by another active run`,
+        code: 'claimed-by-active-run',
+        reason:
+          `added ticket(s) ${overlap.value.join(', ')} were claimed by another active run while ` +
+          'this extension was being adopted; adoption is prevented',
         sharedWrite: 'none',
         evidence: [{ claimedTicketIssueIds: overlap.value }],
       })
@@ -1402,6 +1545,8 @@ async function runOneWork(
       family: ctx.reviewerFamily,
     }),
     reviewerPlanIsReadOnly: ctx.deps.launches.reviewerPlanIsReadOnly,
+    ...(ctx.deps.slotWaitMs === undefined ? {} : { slotWaitMs: ctx.deps.slotWaitMs }),
+    ...(ctx.deps.slotPollMs === undefined ? {} : { slotPollMs: ctx.deps.slotPollMs }),
   }
   const params: WorkAttemptParams = {
     input: {
@@ -1575,6 +1720,17 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
     )
     const adopted = await adoptUnderControlLock(ctx, state.runId, extension, records)
     if (adopted.kind === 'ok') return ok(undefined)
+    if (adopted.kind === 'blocked') {
+      // §7.4: ownership lost the claim race under the control lock — the
+      // change is treated as incompatible, never an infrastructure error.
+      return blocked({
+        scope: 'run' as const,
+        code: 'changed-input' as const,
+        reason: adopted.reason,
+        sharedWrite: 'none' as const,
+        evidence: [...adopted.evidence],
+      })
+    }
     // The seam's closed error vocabulary is `control-store`; any richer
     // failure keeps its original code as machine evidence.
     return error({
@@ -2141,6 +2297,15 @@ async function adoptForCompletion(
   }
 
   const adopted = await adoptUnderControlLock(ctx, ctx.runId, extension, preflight.records)
+  if (adopted.kind === 'blocked') {
+    return blocked({
+      scope: 'run',
+      code: 'changed-input',
+      reason: adopted.reason,
+      sharedWrite: ctx.sharedWrite ? 'confirmed' : 'none',
+      evidence: [...adopted.evidence],
+    })
+  }
   if (adopted.kind !== 'ok') {
     return error({
       scope: 'run',

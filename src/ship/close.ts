@@ -152,10 +152,14 @@ export type ShipCloseDeps = {
   readonly writer: GitHubIssueWriter
   /** The remote target and commit facts seam, fetch included (§14). */
   readonly facts: ShipFacts
-  /** Persists a Compatible Map Extension before the close continues (§7.4). */
+  /** Persists a Compatible Map Extension before the close continues (§7.4).
+   * `blocked(changed-input)` means another active run claimed an added
+   * Ticket under the repository control lock — adoption is prevented and
+   * the change is treated as incompatible (§7.4, §16).
+   */
   readonly adoptExtension: (
     extension: ShipExtensionAdoption,
-  ) => Promise<Outcome<void, never, 'control-store'>>
+  ) => Promise<Outcome<void, 'changed-input', 'control-store'>>
   /** Atomic Ship Checkpoint persistence over the Run State store. */
   readonly checkpoint: ShipCheckpointStore
   /** The target lock serializing Ship per repository and branch (§16). */
@@ -573,6 +577,17 @@ async function adoptWithDance(
     }
   }
   ctx.lock = reacquired.value
+  if (adopted.kind === 'blocked') {
+    // §7.4/§16: another active run claimed an added Ticket under the
+    // repository control lock — the change is treated as incompatible.
+    return {
+      failure: changedInput(ctx, [
+        { stage: 'extension-adoption', reason: adopted.reason },
+        ...adopted.evidence,
+      ]),
+      ticketState: undefined,
+    }
+  }
   if (adopted.kind !== 'ok') {
     return {
       failure: storeFailure(ctx, 'adopting the Compatible Map Extension', adopted),

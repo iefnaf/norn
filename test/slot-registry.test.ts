@@ -13,6 +13,7 @@ import { saveRunState } from '../src/runstate/run-state-store.ts'
 import type { RunState } from '../src/runstate/types.ts'
 import {
   readWorkSlotRegistry,
+  reconcileStaleWorkSlots,
   releaseWorkSlot,
   reserveWorkSlot,
 } from '../src/runstate/slot-registry.ts'
@@ -342,3 +343,165 @@ describe('Work-slot release: settlement proof from persisted truth', () => {
     }
   })
 })
+
+// ---------------------------------------------------------------------------
+// Stale-reservation reconciliation (§16): settlement proof, never a lock
+// ---------------------------------------------------------------------------
+
+describe('stale-reservation reconciliation: settlement proof, never a vanished lock', () => {
+  it('retains a crashed coordinator’s reservation while its attempt is still recorded live', async () => {
+    const home = tempHome()
+    try {
+      // The map lock is absent — the coordinator died — and every recorded
+      // group has exited, yet the attempt itself is still `working`: only
+      // that run’s own resume or abort reconciliation may settle it (§16).
+      const live = runStateWithLiveGroup('wa-crash', 424242, encodeLocalProcessHandle(424242))
+      const settled: RunState = {
+        ...live,
+        activeProcesses: live.activeProcesses.map((group) => ({
+          ...group,
+          state: 'settled' as const,
+        })),
+      }
+      assert.equal(saveRunState(home, MAP_ISSUE_ID, settled).kind, 'ok')
+      const reservation = { runId: settled.runId, encodedMapIssueId: MAP_ISSUE_ID, workAttemptId: 'wa-crash' }
+      assert.equal((await reserveWorkSlot(home, reservation, 2)).kind, 'ok')
+
+      const outcome = await reconcileStaleWorkSlots(home)
+      assert.ok(isOk(outcome))
+      if (outcome.kind === 'ok') {
+        assert.deepEqual(outcome.value.released, [])
+        assert.deepEqual(
+          outcome.value.retained.map((entry) => [entry.reservation.workAttemptId, entry.reason]),
+          [['wa-crash', 'attempt-live']],
+        )
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('retains while a recorded group of a terminal attempt is still live', { timeout: 30_000 }, async () => {
+    const home = tempHome()
+    let child: Awaited<ReturnType<typeof spawnProcessGroup>> | undefined
+    try {
+      child = await spawnProcessGroup(['sleep', '30'])
+      const pgid = child.pid as number
+      const base = runStateWithLiveGroup('wa-orphan', pgid, encodeLocalProcessHandle(pgid))
+      const parked = parkAttemptOf(base, 'wa-orphan')
+      assert.equal(saveRunState(home, MAP_ISSUE_ID, parked).kind, 'ok')
+      const reservation = { runId: parked.runId, encodedMapIssueId: MAP_ISSUE_ID, workAttemptId: 'wa-orphan' }
+      assert.equal((await reserveWorkSlot(home, reservation, 2)).kind, 'ok')
+
+      const outcome = await reconcileStaleWorkSlots(home)
+      assert.ok(isOk(outcome))
+      if (outcome.kind === 'ok') {
+        assert.deepEqual(outcome.value.released, [])
+        assert.equal(outcome.value.retained[0]?.reason, 'process-groups-live')
+      }
+    } finally {
+      if (child !== undefined) child.kill('SIGKILL')
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+
+  it('releases a settled attempt of a terminal run and a vanished run state, but retains an unreadable one', async () => {
+    const home = tempHome()
+    try {
+      // A coordinator that crashed between persisting its attempt outcome and
+      // releasing its slot: the attempt is terminal and no group is recorded
+      // — settlement is proven, so capacity is reclaimed.
+      const terminal = parkAttemptOf(
+        runStateWithLiveGroup('wa-done', 1, encodeLocalProcessHandle(1)),
+        'wa-done',
+        [],
+      )
+      assert.equal(saveRunState(home, MAP_ISSUE_ID, terminal).kind, 'ok')
+      assert.equal(
+        (
+          await reserveWorkSlot(
+            home,
+            { runId: terminal.runId, encodedMapIssueId: MAP_ISSUE_ID, workAttemptId: 'wa-done' },
+            3,
+          )
+        ).kind,
+        'ok',
+      )
+      // A reservation whose run state vanished: no recorded attempt can own a
+      // live child, so it is releasable.
+      assert.equal(
+        (
+          await reserveWorkSlot(
+            home,
+            { runId: 'run-gone', encodedMapIssueId: 'I_gone', workAttemptId: 'wa-gone' },
+            3,
+          )
+        ).kind,
+        'ok',
+      )
+      // A reservation whose run state cannot be read: not provable, retained.
+      mkdirSync(join(home, 'maps', 'I_corrupt'), { recursive: true })
+      writeFileSync(join(home, 'maps', 'I_corrupt', 'run-state.json'), '{ torn', 'utf8')
+      assert.equal(
+        (
+          await reserveWorkSlot(
+            home,
+            { runId: 'run-x', encodedMapIssueId: 'I_corrupt', workAttemptId: 'wa-x' },
+            3,
+          )
+        ).kind,
+        'ok',
+      )
+
+      const outcome = await reconcileStaleWorkSlots(home)
+      assert.ok(isOk(outcome))
+      if (outcome.kind === 'ok') {
+        assert.deepEqual(
+          outcome.value.released.map((entry) => entry.workAttemptId).sort(),
+          ['wa-done', 'wa-gone'],
+        )
+        assert.deepEqual(
+          outcome.value.retained.map((entry) => [entry.reservation.workAttemptId, entry.reason]),
+          [['wa-x', 'unreadable-state']],
+        )
+      }
+      const registry = await readWorkSlotRegistry(home)
+      assert.ok(isOk(registry))
+      if (registry.kind === 'ok' && registry.value !== undefined) {
+        assert.deepEqual(
+          registry.value.reserved.map((entry) => entry.workAttemptId),
+          ['wa-x'],
+        )
+      }
+    } finally {
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
+})
+
+/** Terminalize one member of a crafted state: the attempt is no longer live. */
+function parkAttemptOf(
+  state: RunState,
+  workAttemptId: string,
+  processes: RunState['activeProcesses'] = state.activeProcesses,
+): RunState {
+  const working = state.tickets.I_A
+  assert.ok(working?.phase === 'working' && working.attempt.workAttemptId === workAttemptId)
+  return {
+    ...state,
+    tickets: {
+      I_A: {
+        phase: 'parked',
+        wave: 1,
+        outcome: {
+          kind: 'blocked',
+          code: 'user-abort',
+          reason: 'the run ended before this attempt shipped',
+          evidence: [],
+        },
+      },
+    },
+    parkedTickets: [working.attempt.input.ticket],
+    activeProcesses: processes,
+  }
+}

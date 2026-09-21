@@ -245,10 +245,14 @@ export type ShipReconcileDeps = {
   readonly facts: ShipFacts
   /** One stable read of the current Task Map snapshot (§7.3). */
   readonly readMap: () => Promise<StableSnapshotOutcome>
-  /** Persists a Compatible Map Extension before Ship continues (§11.1). */
+  /** Persists a Compatible Map Extension before Ship continues (§7.4, §7.1).
+   * `blocked(changed-input)` means another active run claimed an added
+   * Ticket under the repository control lock — adoption is prevented and the
+   * change is treated as incompatible (§7.4, §16).
+   */
   readonly adoptExtension: (
     extension: ShipExtensionAdoption,
-  ) => Promise<Outcome<void, never, 'control-store'>>
+  ) => Promise<Outcome<void, 'changed-input', 'control-store'>>
   /** The issue-evidence reader for blocker completion evidence (§14). */
   readonly readIssueEvidence: IssueEvidenceReader['loadIssueEvidence']
   /** The Visible Agent Runner seam for the ship reviewer (§6, §17). */
@@ -544,6 +548,14 @@ export async function reconcileFinalCandidate(
       fromRevision: params.accepted.revision,
       addedTicketIssueIds: classification.addedTicketIssueIds,
     })
+    if (persisted.kind === 'blocked') {
+      // §7.4/§16: another active run claimed an added Ticket under the
+      // repository control lock — the change is treated as incompatible.
+      return changedInput(params, [
+        { stage: 'extension-adoption', reason: persisted.reason },
+        ...persisted.evidence,
+      ])
+    }
     if (persisted.kind !== 'ok') {
       return shipError('run', 'control-store', persisted.reason, [...persisted.evidence])
     }

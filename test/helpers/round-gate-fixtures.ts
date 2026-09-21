@@ -352,7 +352,12 @@ export type FakeSlots = WorkSlotSeam & {
 }
 
 export function fakeSlots(
-  behavior: { readonly reserve?: 'ok' | 'full' | 'fail'; readonly releaseFails?: boolean } = {},
+  behavior: {
+    readonly reserve?: 'ok' | 'full' | 'fail'
+    readonly releaseFails?: boolean
+    /** Return `full` for the first N reserve calls, then succeed (§16 defer). */
+    readonly fullFirst?: number
+  } = {},
 ): FakeSlots {
   const calls = { reserve: 0, release: 0 }
   return {
@@ -364,7 +369,8 @@ export function fakeSlots(
     },
     async reserve() {
       calls.reserve++
-      const mode = behavior.reserve ?? 'ok'
+      let mode = behavior.reserve ?? 'ok'
+      if (behavior.fullFirst !== undefined && calls.reserve <= behavior.fullFirst) mode = 'full'
       if (mode === 'fail') {
         return {
           kind: 'error' as const,
@@ -497,7 +503,13 @@ export type HarnessOptions = {
   readonly tests?: readonly RunConfigCommand[]
   readonly maxWorkRounds?: number
   readonly initialRecord?: WorkAttemptRecord
-  readonly slots?: { readonly reserve?: 'ok' | 'full' | 'fail'; readonly releaseFails?: boolean }
+  readonly slots?: {
+    readonly reserve?: 'ok' | 'full' | 'fail'
+    readonly releaseFails?: boolean
+    readonly fullFirst?: number
+  }
+  /** Budget a full registry may defer one attempt for; default 0 (park). */
+  readonly slotWaitMs?: number
   readonly store?: FakeStore
   readonly onLaunch?: (role: 'worker' | 'reviewer', invocationId: string) => void
   readonly reviewerPlannerOverride?: (input: ReviewerLaunchInput) => AgentLaunchPlan
@@ -569,6 +581,8 @@ export function makeHarness(options: HarnessOptions): Harness {
     git: options.git ?? runGit,
     store,
     slots,
+    slotWaitMs: options.slotWaitMs ?? 0,
+    slotPollMs: 1,
     planWorker: (launchInput) => {
       workerInputs.push(launchInput)
       events.push(`planWorker:${launchInput.round}`)

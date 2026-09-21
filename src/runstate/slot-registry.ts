@@ -362,3 +362,122 @@ export function collectAttemptCheckpoints(
   }
   return [...recorded.values()]
 }
+
+// ---------------------------------------------------------------------------
+// Cross-run stale-reservation reconciliation (§16)
+// ---------------------------------------------------------------------------
+
+/** Why one reservation stayed charged during stale-slot reconciliation. */
+export type RetainedSlotReason =
+  /** The owning run still records the attempt as `working` (§16: only its
+   * own resume or abort reconciliation may settle it). */
+  | 'attempt-live'
+  /** A recorded process group of the attempt is provably still live. */
+  | 'process-groups-live'
+  /** The owning run state exists but cannot be read or trusted. */
+  | 'unreadable-state'
+
+/** The outcome of one stale-slot reconciliation pass. */
+export type StaleSlotReconciliation = {
+  /** Reservations whose settlement was proven and that were released. */
+  readonly released: readonly WorkSlotReservation[]
+  /** Reservations that stayed charged, each with its typed reason. */
+  readonly retained: readonly { readonly reservation: WorkSlotReservation; readonly reason: RetainedSlotReason }[]
+}
+
+export type ReconcileSlotsOutcome = Outcome<
+  StaleSlotReconciliation,
+  LockBlockCode,
+  SlotRegistryErrorCode
+>
+
+/** Whether one run state still records the attempt as live (`working`). */
+function attemptIsLive(state: RunState, workAttemptId: string): boolean {
+  return Object.values(state.tickets).some(
+    (ticket) => ticket.phase === 'working' && ticket.attempt.workAttemptId === workAttemptId,
+  )
+}
+
+/**
+ * Reconcile every reservation in the repository-wide registry against the
+ * persisted truth of the owning runs (§16). A reservation is released only
+ * when settlement is *proven*: its owning run state is gone (a persisted
+ * launch intent precedes every child, so an unrecorded attempt owns none),
+ * or the attempt is no longer `working` and every process-group checkpoint
+ * recorded for it is provably settled. A reservation whose attempt is still
+ * `working` — including one left behind by a crashed coordinator whose map
+ * lock has since vanished — stays charged until that run's own resume or
+ * abort reconciliation settles it; unrelated coordinators never reclaim it.
+ * The map lock is deliberately never consulted.
+ *
+ * Callers must not already hold the control lock; this function takes it.
+ */
+export async function reconcileStaleWorkSlots(
+  repositoryHome: string,
+  options: { readonly probe?: ProcessGroupLivenessProbe } = {},
+): Promise<ReconcileSlotsOutcome> {
+  const probe = options.probe ?? defaultProcessGroupLivenessProbe
+  const lock = await acquireControlLock(repositoryHome)
+  if (lock.kind !== 'ok') return lock
+
+  try {
+    const existing = await readWorkSlotRegistry(repositoryHome)
+    if (existing.kind !== 'ok') return existing
+    if (existing.value === undefined) {
+      return ok({ released: [], retained: [] })
+    }
+
+    // One run-state load per distinct map, so shared maps cost one read.
+    const states = new Map<string, RunState | undefined | 'unreadable'>()
+    const stateOf = (encodedMapIssueId: string): RunState | undefined | 'unreadable' => {
+      if (!states.has(encodedMapIssueId)) {
+        const loaded = loadRunState(repositoryHome, encodedMapIssueId)
+        states.set(
+          encodedMapIssueId,
+          loaded.kind === 'ok' ? loaded.value : 'unreadable',
+        )
+      }
+      return states.get(encodedMapIssueId)
+    }
+
+    const released: WorkSlotReservation[] = []
+    const retained: { reservation: WorkSlotReservation; reason: RetainedSlotReason }[] = []
+    for (const reservation of existing.value.reserved) {
+      const state = stateOf(reservation.encodedMapIssueId)
+      if (state === 'unreadable') {
+        retained.push({ reservation, reason: 'unreadable-state' })
+        continue
+      }
+      if (state === undefined) {
+        released.push(reservation) // no recorded attempt owns a live child
+        continue
+      }
+      if (attemptIsLive(state, reservation.workAttemptId)) {
+        retained.push({ reservation, reason: 'attempt-live' })
+        continue
+      }
+      const live = collectAttemptCheckpoints(state, reservation.workAttemptId).filter((group) =>
+        probe(group),
+      )
+      if (live.length > 0) {
+        retained.push({ reservation, reason: 'process-groups-live' })
+        continue
+      }
+      released.push(reservation)
+    }
+
+    if (released.length > 0) {
+      const releasedIds = new Set(released.map((entry) => entry.workAttemptId))
+      const written = await writeRegistry(repositoryHome, {
+        ...existing.value,
+        reserved: existing.value.reserved.filter(
+          (entry) => !releasedIds.has(entry.workAttemptId),
+        ),
+      })
+      if (written.kind !== 'ok') return written
+    }
+    return ok({ released, retained })
+  } finally {
+    await lock.value.release()
+  }
+}

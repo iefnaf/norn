@@ -972,6 +972,7 @@ async function stabilizeMap(
       }
       const adopted = await adoptWithDance(
         deps,
+        params,
         {
           revision: snapshot.mapRevision,
           payload: payload.payload,
@@ -1032,6 +1033,7 @@ async function stabilizeMap(
  */
 async function adoptWithDance(
   deps: ShipPushDeps,
+  params: ShipPushParams,
   extension: ShipExtensionAdoption,
   ctx: ShipContext,
 ): Promise<ShipPushOutcome | undefined> {
@@ -1051,6 +1053,14 @@ async function adoptWithDance(
     )
   }
   ctx.lock = reacquired.value
+  if (adopted.kind === 'blocked') {
+    // §7.4/§16: another active run claimed an added Ticket under the
+    // repository control lock — the change is treated as incompatible.
+    return changedInput(params, [
+      { stage: 'extension-adoption', reason: adopted.reason },
+      ...adopted.evidence,
+    ])
+  }
   if (adopted.kind !== 'ok') {
     return pushError('run', 'control-store', adopted.reason, [...adopted.evidence])
   }
@@ -1095,7 +1105,9 @@ async function runReconcile(
 ): Promise<Outcome<FinalCandidate, ShipPushBlockCode, ShipPushErrorCode>> {
   const dancingDeps: ShipPushDeps = {
     ...deps,
-    adoptExtension: (extension) => adoptWithDance(deps, extension, ctx).then(outcomeToAdoption),
+    adoptExtension: async (extension) => outcomeToAdoption(
+      await adoptWithDance(deps, params, extension, ctx),
+    ),
   }
   return reconcileFinalCandidate(dancingDeps, { ...params, accepted: ctx.accepted })
 }
@@ -1103,8 +1115,19 @@ async function runReconcile(
 /** Adapt the dance outcome back to the adoption seam's outcome shape. */
 function outcomeToAdoption(
   outcome: ShipPushOutcome | undefined,
-): Outcome<void, never, 'control-store'> {
+): Outcome<void, 'changed-input', 'control-store'> {
   if (outcome === undefined) return ok(undefined)
+  if (outcome.kind === 'blocked' && outcome.code === 'changed-input') {
+    // A claim race or incompatible change observed while adopting: pass the
+    // block through so reconcile treats the change as incompatible (§7.4, §16).
+    return blocked({
+      scope: 'run',
+      code: 'changed-input',
+      reason: outcome.reason,
+      sharedWrite: 'none',
+      evidence: [...outcome.evidence],
+    })
+  }
   return error({
     scope: 'run',
     code: 'control-store',
