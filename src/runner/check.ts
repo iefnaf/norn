@@ -349,6 +349,7 @@ export async function checkMap(deps: CheckMapDeps, mapUrl: string): Promise<Chec
       // Existing run states (§2.3, §13.2, §16): resumability of this map's
       // state, member disjointness against other active runs, and executor
       // compatibility with every active run.
+      let ownMidFlight: Set<string> | undefined
       if (report.repositoryHome !== undefined && report.config !== undefined && report.snapshot !== undefined) {
         const states = await loadAllRunStates(report.repositoryHome)
         if (states.kind !== 'ok') {
@@ -361,6 +362,16 @@ export async function checkMap(deps: CheckMapDeps, mapUrl: string): Promise<Chec
             if (mismatches.length > 0) {
               findings.push({ kind: 'state-not-resumable', runId: state.runId, mismatches })
             }
+            // Members mid-flight in this map's own running state are owned
+            // by its persisted checkpoints: their Delivery Record state is
+            // judged by the §13.3 recovery of `run`, not by preflight's
+            // fresh-Work decision (§13.2, §13.3 steps 3–5, §14).
+            ownMidFlight = new Set(
+              Object.entries(state.tickets)
+                .filter(([, ticket]) =>
+                  ticket.phase === 'working' || ticket.phase === 'shippable' || ticket.phase === 'shipping')
+                .map(([issueId]) => issueId),
+            )
             continue
           }
           const claimed = new Set(acceptedMembers(state))
@@ -424,6 +435,7 @@ export async function checkMap(deps: CheckMapDeps, mapUrl: string): Promise<Chec
           }
 
           for (const ticket of report.snapshot.tickets) {
+            if (ownMidFlight?.has(ticket.ref.issueId)) continue
             const read = await deps.evidence.loadIssueEvidence({
               githubHost: ticket.ref.githubHost,
               number: ticket.ref.number,

@@ -47,6 +47,7 @@
  * here has `sharedWrite: 'none'` — Work never performs a shared write.
  */
 import { join } from 'node:path'
+import { existsSync } from 'node:fs'
 
 import { canonicalJson } from '../core/canonical-json.ts'
 import type { CanonicalJsonValue } from '../core/canonical-json.ts'
@@ -899,7 +900,13 @@ export async function runWorkAttempt(
       }))
     }
   } else {
-    // Resume: the workspace already exists; re-establish branch ownership.
+    // Resume: a crash may have preceded the workspace creation — the attempt
+    // record, slot reservation, and branch all outlive the worktree. Recreate
+    // the workspace from the attempt-owned branch (creating the branch at the
+    // recorded base when even that crashed first), then re-establish branch
+    // ownership through the normal inspection (§13.2).
+    const ensured = await ensureResumedWorkspace(deps, params, workspaceRef)
+    if (ensured.kind !== 'ok') return finishAttempt(deps, state, ensured)
     const inspection = await inspectWorkspace(deps.git, workspacePath)
     if (inspection.status !== 'ok') {
       return finishAttempt(deps, state, error({
@@ -995,6 +1002,63 @@ type RoundContext = {
   readonly newInvocationId: (owner: 'worker' | 'reviewer', round: number) => string
   readonly launchIntentHandle: (invocationId: string) => string
   readonly reviewerPlanIsReadOnly: (plan: AgentLaunchPlan) => boolean
+}
+
+/**
+ * Repair the workspace of a resumed attempt whose directory is absent: the
+ * crash preceded (or interrupted) the attempt-owned worktree creation, while
+ * the persisted attempt record already names the branch and workspace. The
+ * worktree is recreated from the attempt-owned branch — which holds the last
+ * round's candidate when one exists — and the branch itself is created at
+ * the recorded Wave base when the crash preceded even that. The caller's
+ * inspection then re-establishes branch ownership exactly as for any resumed
+ * workspace (§10.1, §13.2).
+ */
+async function ensureResumedWorkspace(
+  deps: RoundGateDeps,
+  params: WorkAttemptParams,
+  workspace: TicketWorkspaceRef,
+): Promise<Outcome<void, never, WorkErrorCode>> {
+  if (existsSync(workspace.path)) return ok(undefined)
+  const baseHex = parseGitObjectOid(params.input.target.baseSha)?.hex
+  if (baseHex === undefined) {
+    return error({
+      scope: 'ticket',
+      code: 'workspace-verification-failed',
+      reason: `the recorded base of the resumed attempt is malformed: ${params.input.target.baseSha}`,
+      sharedWrite: 'none',
+      evidence: [{ workAttemptId: params.workAttemptId }],
+    })
+  }
+
+  const branchRef = `refs/heads/${workspace.branch}`
+  const existing = await deps.git(['rev-parse', '--verify', '--quiet', branchRef], params.repositoryRoot)
+  if (!existing.ok) {
+    const created = await deps.git(['branch', workspace.branch, baseHex], params.repositoryRoot)
+    if (!created.ok) {
+      return error({
+        scope: 'ticket',
+        code: 'git-failed',
+        reason: `recreating the attempt-owned branch of the resumed attempt failed: ${created.message}`,
+        sharedWrite: 'none',
+        evidence: [{ operation: 'branch', branch: workspace.branch }],
+      })
+    }
+  }
+  const added = await deps.git(
+    ['worktree', 'add', '--checkout', workspace.path, workspace.branch],
+    params.repositoryRoot,
+  )
+  if (!added.ok) {
+    return error({
+      scope: 'ticket',
+      code: 'git-failed',
+      reason: `recreating the workspace of the resumed attempt failed: ${added.message}`,
+      sharedWrite: 'none',
+      evidence: [{ operation: 'worktree-add', path: workspace.path, branch: workspace.branch }],
+    })
+  }
+  return ok(undefined)
 }
 
 /** One worker round: candidate → setup → tests → reviewer (§10.2). */

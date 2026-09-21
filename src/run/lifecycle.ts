@@ -83,11 +83,13 @@ import type {
   MapCompletionReviewerPlanner,
 } from './completion.ts'
 import { runStateMapCompletionStore } from './completion.ts'
+import { reconcileResumedRun, resumeExecutorMismatches } from './recovery.ts'
+import type { ProcessGroupLivenessProbe } from '../runstate/slot-registry.ts'
+import type { ReleaseOutcome } from '../runstate/slot-registry.ts'
 import { acquireControlLock, acquireMapLock } from '../runstate/locks.ts'
 import { loadAllRunStates, loadRunState, saveRunState } from '../runstate/run-state-store.ts'
 import type {
   EvidenceGateV1,
-  ProcessGroupCheckpoint,
   RunReport,
   RunState,
   TicketRunState,
@@ -226,6 +228,13 @@ export type RunLifecycleDeps = CheckMapDeps & {
   readonly signal?: AbortSignal
   /** Budget for settling one recovered live process group (§13.2). */
   readonly agentSettleTimeoutMs?: number
+  /** Liveness probe for stale-slot settlement proofs; default: §16's. */
+  readonly slotProbe?: ProcessGroupLivenessProbe
+  /** Overrides stale-reservation release for tests; default: the registry. */
+  readonly releaseReservation?: (
+    repositoryHome: string,
+    workAttemptId: string,
+  ) => Promise<ReleaseOutcome>
 }
 
 /** The bound target and delivery facts of one run's repository (§14). */
@@ -473,9 +482,14 @@ export async function runMap(deps: RunLifecycleDeps, mapUrl: string): Promise<Ru
 
     let state: RunState
     if (existingRead.value !== undefined && existingRead.value.status === 'running') {
-      const mismatches: string[] = []
-      if (existingRead.value.configRevision !== config.configRevision) mismatches.push('configRevision')
-      if (existingRead.value.nornVersion !== NORN_VERSION) mismatches.push('nornVersion')
+      // §13.2: the executor gate — a mismatch refuses the resume rather than
+      // mixing evidence produced by different executors (the same gate runs
+      // as one preflight finding, §2.3).
+      const mismatches = resumeExecutorMismatches(
+        existingRead.value,
+        config.configRevision,
+        NORN_VERSION,
+      )
       if (mismatches.length > 0) {
         return blocked({
           scope: 'operation',
@@ -563,13 +577,18 @@ function isTameId(value: string): boolean {
 
 /**
  * Whether the persisted state already proves this run attempted or performed
- * a shared write (§13.2): a push attempt was counted, or a checkpoint stage
- * beyond `prepared` was remotely confirmed.
+ * a shared write (§13.2). Only remotely confirmed facts count: a Ship
+ * checkpoint beyond `prepared`, or a map-completion close or record beyond
+ * `gated`. A push-attempt counter alone does not — §13.3 recovery resolves
+ * every recorded attempt against the fetched target (free probes) before the
+ * run can terminalize, so an exhausted attempt budget whose integration is
+ * provably absent is `none`, exactly as an uninterrupted run that exhausted
+ * it (§11.3).
  */
 function persistedSharedWrite(state: RunState): boolean {
   for (const ticket of Object.values(state.tickets)) {
     if (ticket.phase !== 'shipping') continue
-    if (ticket.checkpoint.pushAttempts > 0 || ticket.checkpoint.stage !== 'prepared') return true
+    if (ticket.checkpoint.stage !== 'prepared') return true
   }
   // A map-completion close or record confirmed remotely is a shared write (§15).
   const completion = state.mapCompletion
@@ -582,9 +601,37 @@ function persistedSharedWrite(state: RunState): boolean {
 // ---------------------------------------------------------------------------
 
 async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapOutcome> {
-  const reconciled = await reconcileActiveProcesses(ctx, initial)
-  if (reconciled.kind === 'stop') return reconciled.outcome
-  let state = reconciled.state
+  // --- the ordered §13.2 resume reconciliation --------------------------------
+
+  // Process-group settlement is persisted first; only then may stale slot
+  // reservations release. The wave loop below — including every workspace
+  // inspection of a resumed Work attempt — runs strictly after this step,
+  // and its stable Map reload classifies identical / Compatible Map
+  // Extension / incompatible against the accepted lineage (src/run/recovery).
+  const reconciled = await reconcileResumedRun(
+    {
+      runner: ctx.deps.runner,
+      repositoryHome: ctx.repositoryHome,
+      encodedMapIssueId: ctx.encodedMapIssueId,
+      ...(ctx.deps.agentSettleTimeoutMs === undefined
+        ? {}
+        : { agentSettleTimeoutMs: ctx.deps.agentSettleTimeoutMs }),
+      ...(ctx.deps.slotProbe === undefined ? {} : { probe: ctx.deps.slotProbe }),
+      ...(ctx.deps.releaseReservation === undefined
+        ? {}
+        : {
+            releaseReservation: (repositoryHome: string, workAttemptId: string) =>
+              ctx.deps.releaseReservation!(repositoryHome, workAttemptId),
+          }),
+    },
+    initial,
+  )
+  if (reconciled.kind !== 'ok') {
+    return runFailure(ctx, reconciled.code, `the resume reconciliation failed: ${reconciled.reason}`, [
+      ...reconciled.evidence,
+    ])
+  }
+  let state = reconciled.value
 
   for (;;) {
     // --- resume a persisted ship queue before anything else (§13.2) ---------
@@ -2380,71 +2427,4 @@ function withCompletedTicket(
 function currentStateOf(ctx: RunContext): RunState | undefined {
   const loaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
   return loaded.kind === 'ok' ? loaded.value : undefined
-}
-
-// ---------------------------------------------------------------------------
-// Resume reconciliation (§13.2)
-// ---------------------------------------------------------------------------
-
-/**
- * Reconcile every recorded, not-yet-settled process group of a resumed run:
- * reattach, wait for a live group to exit (terminating it after the budget),
- * then persist `settled`. No Work slot may release and no attempt may resume
- * before every recorded group is settled (§16).
- */
-async function reconcileActiveProcesses(ctx: RunContext, state: RunState): Promise<StepResult> {
-  const pending: readonly ProcessGroupCheckpoint[] = state.activeProcesses.filter(
-    (group) => group.state !== 'settled',
-  )
-  if (pending.length === 0) return { kind: 'next', state, value: null }
-  const budget = ctx.deps.agentSettleTimeoutMs ?? 60_000
-
-  for (const group of pending) {
-    const attached = ctx.deps.runner.attach(group.adapterHandle)
-    const live = await ctx.deps.runner.isLive(attached)
-    if (!live) continue
-    const exited = await ctx.deps.runner.waitForExit(attached, budget)
-    if (exited === 'timeout') {
-      const terminated = await ctx.deps.runner.terminate(attached)
-      if (terminated !== 'terminated') {
-        return {
-          kind: 'stop',
-          outcome: runFailure(ctx, 'adapter-failure',
-            `terminating the recovered process group ${group.id} failed; its slot stays charged`,
-            [{ processGroupId: group.id, adapterHandle: group.adapterHandle }]),
-        }
-      }
-    }
-  }
-
-  const loaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
-  if (loaded.kind !== 'ok') {
-    return {
-      kind: 'stop',
-      outcome: runFailure(ctx, loaded.code as never,
-        `reloading run state after process reconciliation failed: ${loaded.reason}`),
-    }
-  }
-  if (loaded.value === undefined) {
-    return {
-      kind: 'stop',
-      outcome: runFailure(ctx, 'control-store',
-        'reloading run state after process reconciliation found no document'),
-    }
-  }
-  const next: RunState = {
-    ...loaded.value,
-    activeProcesses: loaded.value.activeProcesses.map((group) =>
-      group.state === 'settled' ? group : { ...group, state: 'settled' },
-    ),
-  }
-  const saved = saveRunState(ctx.repositoryHome, ctx.encodedMapIssueId, next)
-  if (saved.kind !== 'ok') {
-    return {
-      kind: 'stop',
-      outcome: runFailure(ctx, saved.code as never,
-        `persisting process reconciliation failed: ${saved.reason}`),
-    }
-  }
-  return { kind: 'next', state: next, value: null }
 }
