@@ -52,7 +52,7 @@
 import { randomBytes } from 'node:crypto'
 
 import { blocked, error, ok } from '../core/outcome.ts'
-import type { Evidence, Outcome } from '../core/outcome.ts'
+import type { Evidence, Outcome, OutcomeBlocked, OutcomeError } from '../core/outcome.ts'
 import type { CanonicalJsonValue } from '../core/canonical-json.ts'
 import type {
   GitCommandRunner,
@@ -75,6 +75,14 @@ import type { StableSnapshotOutcome } from '../map/stable-read.ts'
 import { checkMap } from '../runner/check.ts'
 import type { CheckMapDeps } from '../runner/check.ts'
 import { plausibleRemoteIdentities } from '../runner/init.ts'
+import { completeMap } from './completion.ts'
+import type {
+  MapCompletionDeps,
+  MapCompletionParams,
+  MapCompletionResult,
+  MapCompletionReviewerPlanner,
+} from './completion.ts'
+import { runStateMapCompletionStore } from './completion.ts'
 import { acquireControlLock, acquireMapLock } from '../runstate/locks.ts'
 import { loadAllRunStates, loadRunState, saveRunState } from '../runstate/run-state-store.ts'
 import type {
@@ -128,6 +136,7 @@ export type RunBlockCode =
   | 'changed-input'
   | 'push-rejected'
   | 'no-eligible-frontier'
+  | 'map-completion-gate-failed'
 
 /**
  * Closed error codes of `/norn run`. Infrastructure and adapter failures
@@ -174,6 +183,10 @@ export type RunLaunchPlans = {
   readonly planShipReviewer: (
     reviewer: RunConfigAgentRole & { readonly family: string },
   ) => ReviewerLaunchPlanner
+  /** The map-completion reviewer launch planner for the resolved reviewer (§15). */
+  readonly planMapCompletionReviewer: (
+    reviewer: RunConfigAgentRole & { readonly family: string },
+  ) => MapCompletionReviewerPlanner
   /** Validates reviewer plans; defaults to the argv allowlist check. */
   readonly reviewerPlanIsReadOnly?: (plan: AgentLaunchPlan) => boolean
   /** Unique ship-reviewer invocation IDs. */
@@ -221,6 +234,7 @@ type BoundFacts = ShipFacts & DeliveryTargetFacts
 /** Per-invocation run context shared by every wave. */
 type RunContext = {
   readonly deps: RunLifecycleDeps
+  readonly runId: string
   readonly locator: MapIssueLocator
   readonly repositoryHome: string
   readonly encodedMapIssueId: string
@@ -512,6 +526,7 @@ export async function runMap(deps: RunLifecycleDeps, mapUrl: string): Promise<Ru
 
     const ctx: RunContext = {
       deps,
+      runId: state.runId,
       locator,
       repositoryHome,
       encodedMapIssueId,
@@ -556,6 +571,9 @@ function persistedSharedWrite(state: RunState): boolean {
     if (ticket.phase !== 'shipping') continue
     if (ticket.checkpoint.pushAttempts > 0 || ticket.checkpoint.stage !== 'prepared') return true
   }
+  // A map-completion close or record confirmed remotely is a shared write (§15).
+  const completion = state.mapCompletion
+  if (completion !== undefined && completion.stage !== 'gated') return true
   return false
 }
 
@@ -577,6 +595,18 @@ async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapO
       const cleared = clearActiveWave(ctx, shipped.state)
       if (cleared.kind === 'stop') return cleared.outcome
       state = cleared.state
+      continue
+    }
+
+    // --- resume a persisted map completion before planning (§13.2, §13.4) ---
+
+    // A pending completion checkpoint — the only reason a CLOSED Map may be
+    // resumed — routes through the §13.4 recovery reconciliation before the
+    // ordinary OPEN-state planning rule applies.
+    if (state.mapCompletion !== undefined) {
+      const finished = await driveMapCompletion(ctx, state)
+      if (finished.kind === 'stop') return finished.outcome
+      state = finished.state
       continue
     }
 
@@ -836,6 +866,136 @@ async function validateMembers(
 // ---------------------------------------------------------------------------
 
 /**
+ * Per-member preflight of one extension's added Tickets (§7.4): stable
+ * evidence reads, Delivery Record validation, and target facts. Returns the
+ * records to claim, or a raw (non-terminalized) failure outcome — the caller
+ * decides how it propagates.
+ */
+async function preflightAddedTickets(
+  ctx: RunContext,
+  snapshot: TaskMapSnapshot,
+  addedTicketIssueIds: readonly string[],
+): Promise<
+  | { readonly kind: 'ok'; readonly records: Record<string, TicketRunState> }
+  | {
+      readonly kind: 'failure'
+      readonly outcome: OutcomeBlocked<'changed-input'> | OutcomeError<RunErrorCode>
+    }
+> {
+  const records: Record<string, TicketRunState> = {}
+  for (const issueId of addedTicketIssueIds) {
+    const ticket = snapshot.tickets.find((entry) => entry.ref.issueId === issueId)
+    if (ticket === undefined) {
+      return {
+        kind: 'failure',
+        outcome: blocked({
+          scope: 'run',
+          code: 'changed-input',
+          reason: `the added ticket ${issueId} vanished from the snapshot before its preflight`,
+          sharedWrite: 'none',
+          evidence: [{ ticketIssueId: issueId }],
+        }),
+      }
+    }
+    const read = await ctx.deps.evidence.loadIssueEvidence({
+      githubHost: ticket.ref.githubHost,
+      number: ticket.ref.number,
+      url: ticket.ref.url,
+    })
+    if (read.kind === 'error') {
+      return {
+        kind: 'failure',
+        outcome: error({
+          scope: 'run',
+          code: 'evidence-read',
+          reason: `reading delivery evidence of added ticket #${ticket.ref.number} failed: ${read.reason}`,
+          sharedWrite: 'none',
+          evidence: [{ ticketIssueId: issueId }],
+        }),
+      }
+    }
+    if (read.kind === 'blocked') {
+      return {
+        kind: 'failure',
+        outcome: blocked({
+          scope: 'run',
+          code: 'changed-input',
+          reason: `delivery evidence of added ticket #${ticket.ref.number} could not be read: ${read.reason}`,
+          sharedWrite: ctx.sharedWrite ? 'confirmed' : 'none',
+          evidence: [{ ticketIssueId: issueId, code: read.code }],
+        }),
+      }
+    }
+    const fetched = await ctx.facts.fetchTarget(ctx.branch)
+    if (fetched.kind !== 'ok') {
+      return {
+        kind: 'failure',
+        outcome: error({
+          scope: 'run',
+          code: 'target-read',
+          reason: `fetching the target while preflighting an added ticket failed: ${fetched.reason}`,
+          sharedWrite: 'none',
+          evidence: [],
+        }),
+      }
+    }
+    const evaluation = await evaluateDeliveryEvidence({
+      map: { issueId: snapshot.ref.issueId, repositoryId: snapshot.ref.repositoryId },
+      ticket: { issueId, state: ticket.state, ticketRevision: ticket.ticketRevision },
+      targetBranch: ctx.branch,
+      trustedEvidenceAuthorIds: ctx.config.trustedEvidenceAuthorIds,
+      evidence: read.value,
+      facts: ctx.facts,
+    })
+    if (evaluation.status === 'error') {
+      return {
+        kind: 'failure',
+        outcome: error({
+          scope: 'run',
+          code: 'target-read',
+          reason: `validating added ticket #${ticket.ref.number} failed: ${evaluation.reason}`,
+          sharedWrite: 'none',
+          evidence: [{ ticketIssueId: issueId, code: evaluation.code }],
+        }),
+      }
+    }
+    if (evaluation.status === 'completed') {
+      if (evaluation.record.run.id === ctx.runId) ctx.sharedWrite = true
+      records[issueId] = {
+        phase: 'completed',
+        deliveryId: evaluation.record.deliveryId,
+        integratedSha: evaluation.record.target.integratedSha,
+      }
+      continue
+    }
+    if (evaluation.status === 'no-record' && ticket.state === 'OPEN') {
+      records[issueId] = { phase: 'waiting' }
+      continue
+    }
+    return {
+      kind: 'failure',
+      outcome: blocked({
+        scope: 'run',
+        code: 'changed-input',
+        reason:
+          `added ticket #${ticket.ref.number} fails per-member preflight; ` +
+          'adoption is prevented and the change is incompatible',
+        sharedWrite: ctx.sharedWrite ? 'confirmed' : 'none',
+        evidence: [
+          {
+            ticketIssueId: issueId,
+            ticketState: ticket.state,
+            status: evaluation.status,
+            findings: evaluation.status === 'findings' ? [...evaluation.findings] : [],
+          },
+        ],
+      }),
+    }
+  }
+  return { kind: 'ok', records }
+}
+
+/**
  * Adopt one Compatible Map Extension: per-member preflight of every added
  * Ticket (§14 evidence and active-run ownership), then — under the
  * repository control lock, with ownership rechecked — one atomic Run State
@@ -851,82 +1011,19 @@ async function adoptExtension(
 ): Promise<StepResult> {
   // --- per-member preflight, before any lock (§7.4) -------------------------
 
-  const newRecords: Record<string, TicketRunState> = {}
-  for (const issueId of addedTicketIssueIds) {
-    const ticket = snapshot.tickets.find((entry) => entry.ref.issueId === issueId)!
-    const read = await ctx.deps.evidence.loadIssueEvidence({
-      githubHost: ticket.ref.githubHost,
-      number: ticket.ref.number,
-      url: ticket.ref.url,
-    })
-    if (read.kind === 'error') {
-      return {
-        kind: 'stop',
-        outcome: runFailure(ctx, 'evidence-read',
-          `reading delivery evidence of added ticket #${ticket.ref.number} failed: ${read.reason}`,
-          [{ ticketIssueId: issueId }]),
-      }
-    }
-    if (read.kind === 'blocked') {
-      return {
-        kind: 'stop',
-        outcome: terminalFailure(ctx, state, 'blocked', 'changed-input',
-          `delivery evidence of added ticket #${ticket.ref.number} could not be read: ${read.reason}`,
-          [{ ticketIssueId: issueId, code: read.code }]),
-      }
-    }
-    const fetched = await ctx.facts.fetchTarget(ctx.branch)
-    if (fetched.kind !== 'ok') {
-      return {
-        kind: 'stop',
-        outcome: runFailure(ctx, 'target-read',
-          `fetching the target while preflighting an added ticket failed: ${fetched.reason}`),
-      }
-    }
-    const evaluation = await evaluateDeliveryEvidence({
-      map: { issueId: snapshot.ref.issueId, repositoryId: snapshot.ref.repositoryId },
-      ticket: { issueId, state: ticket.state, ticketRevision: ticket.ticketRevision },
-      targetBranch: ctx.branch,
-      trustedEvidenceAuthorIds: ctx.config.trustedEvidenceAuthorIds,
-      evidence: read.value,
-      facts: ctx.facts,
-    })
-    if (evaluation.status === 'error') {
-      return {
-        kind: 'stop',
-        outcome: runFailure(ctx, 'target-read',
-          `validating added ticket #${ticket.ref.number} failed: ${evaluation.reason}`,
-          [{ ticketIssueId: issueId, code: evaluation.code }]),
-      }
-    }
-    if (evaluation.status === 'completed') {
-      if (evaluation.record.run.id === state.runId) ctx.sharedWrite = true
-      newRecords[issueId] = {
-        phase: 'completed',
-        deliveryId: evaluation.record.deliveryId,
-        integratedSha: evaluation.record.target.integratedSha,
-      }
-      continue
-    }
-    if (evaluation.status === 'no-record' && ticket.state === 'OPEN') {
-      newRecords[issueId] = { phase: 'waiting' }
-      continue
-    }
+  const preflight = await preflightAddedTickets(ctx, snapshot, addedTicketIssueIds)
+  if (preflight.kind === 'failure') {
     return {
       kind: 'stop',
-      outcome: terminalFailure(ctx, state, 'blocked', 'changed-input',
-        `added ticket #${ticket.ref.number} fails per-member preflight; ` +
-          'adoption is prevented and the change is incompatible',
-        [
-          {
-            ticketIssueId: issueId,
-            ticketState: ticket.state,
-            status: evaluation.status,
-            findings: evaluation.status === 'findings' ? [...evaluation.findings] : [],
-          },
-        ]),
+      outcome: preflight.outcome.kind === 'blocked'
+        ? terminalFailure(ctx, state, 'blocked', 'changed-input',
+            preflight.outcome.reason, [...preflight.outcome.evidence],
+            preflight.outcome.sharedWrite)
+        : runFailure(ctx, preflight.outcome.code, preflight.outcome.reason,
+            [...preflight.outcome.evidence]),
     }
   }
+  const newRecords = preflight.records
 
   // --- active-run ownership of the added Ticket IDs (§7.4, §16) -------------
 
@@ -1723,25 +1820,12 @@ async function finishRun(
     }
   }
 
-  // Every member is a valid Completed Ticket. §15's full map-completion
-  // protocol (completion review, map close, completion record) is a later
-  // ticket; this coordinator records the passed report against the fetched
-  // remote target that every member's integration provably builds on.
-  const target = await captureTarget(ctx)
-  if (target.kind !== 'ok') {
-    return { kind: 'stop', outcome: runFailure(ctx, target.code, target.reason) }
-  }
-  const warnings = [...ctx.warnings]
-  if (!ctx.sharedWrite) {
-    warnings.push(
-      'every member was already a valid Completed Ticket; this run performed no shared write',
-    )
-  }
-  const report = buildReport(ctx, state, final, 'passed', undefined, 'confirmed', target.value.sha, warnings)
-  return {
-    kind: 'stop',
-    outcome: persistTerminal(ctx, state, report, { kind: 'ok' }),
-  }
+  // Every member is a valid Completed Ticket: §15's full map-completion
+  // protocol — completion gates at the exact remote commit, the guarded map
+  // close, and the validated completion record — terminalizes the run.
+  const driven = await driveMapCompletion(ctx, state)
+  if (driven.kind === 'stop') return { kind: 'stop', outcome: driven.outcome }
+  return { kind: 'next', state: driven.state, value: final }
 }
 
 /**
@@ -1910,6 +1994,250 @@ function invalidateRemaining(
 }
 
 // ---------------------------------------------------------------------------
+// Map completion driving (§15, §13.4)
+// ---------------------------------------------------------------------------
+
+/**
+ * The completion-adoption seam of the §15 protocol: per-member preflight of
+ * every added Ticket (§7.4), then the repository control lock with ownership
+ * rechecked and one atomic lineage + claims update. Called only with the
+ * target lock released (§16); a blocked result means adoption was prevented
+ * and the change is treated as incompatible.
+ */
+async function adoptForCompletion(
+  ctx: RunContext,
+  extension: ShipExtensionAdoption,
+): Promise<Outcome<void, 'changed-input', 'control-store'>> {
+  const state = currentStateOf(ctx)
+  if (state === undefined) {
+    return error({
+      scope: 'run',
+      code: 'control-store',
+      reason: 'the run state to adopt the completion extension into no longer exists',
+      sharedWrite: 'none',
+      evidence: [],
+    })
+  }
+  // Idempotence: a retried dance may find its extension already persisted —
+  // the lineage then already carries it (§7.4).
+  if (state.acceptedMapRevisions.at(-1)!.revision === extension.revision) {
+    return ok(undefined)
+  }
+  const mapRead = await readMapSnapshot(ctx)
+  if (mapRead.kind === 'error') {
+    return error({
+      scope: 'run',
+      code: 'control-store',
+      reason: `the Task Map could not be re-read for extension adoption: ${mapRead.reason}`,
+      sharedWrite: 'none',
+      evidence: [...mapRead.evidence],
+    })
+  }
+  if (mapRead.kind === 'blocked') {
+    return error({
+      scope: 'run',
+      code: 'control-store',
+      reason: `the Task Map could not be re-read for extension adoption: ${mapRead.code} — ${mapRead.reason}`,
+      sharedWrite: 'none',
+      evidence: [...mapRead.evidence],
+    })
+  }
+  if (mapRead.value.mapRevision !== extension.revision) {
+    return error({
+      scope: 'run',
+      code: 'control-store',
+      reason: `the map moved to ${mapRead.value.mapRevision} before the extension ${extension.revision} was adopted`,
+      sharedWrite: 'none',
+      evidence: [{ expected: extension.revision, current: mapRead.value.mapRevision }],
+    })
+  }
+
+  const preflight = await preflightAddedTickets(ctx, mapRead.value, extension.addedTicketIssueIds)
+  if (preflight.kind === 'failure') {
+    return preflight.outcome.kind === 'blocked'
+      ? blocked({
+          scope: 'run',
+          code: 'changed-input',
+          reason: preflight.outcome.reason,
+          sharedWrite: preflight.outcome.sharedWrite,
+          evidence: [...preflight.outcome.evidence],
+        })
+      : error({
+          scope: 'run',
+          code: 'control-store',
+          reason: `extension adoption preflight failed: ${preflight.outcome.reason}`,
+          sharedWrite: 'none',
+          evidence: [...preflight.outcome.evidence, { originalCode: preflight.outcome.code }],
+        })
+  }
+
+  const overlap = await claimedByOtherRun(ctx, ctx.runId, extension.addedTicketIssueIds)
+  if (overlap.kind !== 'ok') {
+    return error({
+      scope: 'run',
+      code: 'control-store',
+      reason: overlap.reason,
+      sharedWrite: 'none',
+      evidence: [...overlap.evidence],
+    })
+  }
+  if (overlap.value !== undefined) {
+    return blocked({
+      scope: 'run',
+      code: 'changed-input',
+      reason:
+        `added ticket(s) ${overlap.value.join(', ')} are already claimed by another active run; ` +
+        'adoption is prevented',
+      sharedWrite: ctx.sharedWrite ? 'confirmed' : 'none',
+      evidence: [{ claimedTicketIssueIds: overlap.value }],
+    })
+  }
+
+  const adopted = await adoptUnderControlLock(ctx, ctx.runId, extension, preflight.records)
+  if (adopted.kind !== 'ok') {
+    return error({
+      scope: 'run',
+      code: 'control-store',
+      reason: `adopting the Compatible Map Extension failed: ${adopted.reason}`,
+      sharedWrite: 'none',
+      evidence: [...adopted.evidence],
+    })
+  }
+  return ok(undefined)
+}
+
+/** The §15 completion seams bound to one run context. */
+function completionDepsOf(ctx: RunContext): MapCompletionDeps {
+  return {
+    runner: ctx.deps.runner,
+    commands: ctx.deps.commands,
+    git: ctx.deps.workGit,
+    facts: ctx.facts,
+    readMap: async () => {
+      const read = await readMapSnapshot(ctx)
+      if (read.kind === 'ok') {
+        ctx.lastSnapshot = read.value
+        for (const ticket of read.value.tickets) {
+          ctx.ticketRefs.set(ticket.ref.issueId, ticket.ref)
+        }
+      }
+      return read
+    },
+    readIssueEvidence: ctx.deps.evidence.loadIssueEvidence,
+    writer: ctx.deps.writer,
+    adoptExtension: (extension) => adoptForCompletion(ctx, extension),
+    checkpoint: runStateMapCompletionStore({
+      repositoryHome: ctx.repositoryHome,
+      encodedMapIssueId: ctx.encodedMapIssueId,
+    }),
+    lock:
+      ctx.deps.targetLockFor?.(ctx.repositoryHome, ctx.branch) ??
+      osTargetLock(ctx.repositoryHome, ctx.branch),
+    planReviewer: ctx.deps.launches.planMapCompletionReviewer({
+      ...ctx.config.reviewer,
+      family: ctx.reviewerFamily,
+    }),
+    reviewerPlanIsReadOnly: ctx.deps.launches.reviewerPlanIsReadOnly,
+    ...(ctx.deps.now === undefined ? {} : { now: ctx.deps.now }),
+  }
+}
+
+/**
+ * Drive one §15 map-completion pass: run (or recover) the completion
+ * protocol and map its result onto the coordinator's flow — a completed map
+ * terminalizes `passed` with `completionSha`; a replan returns to Wave
+ * planning; blocked and error outcomes propagate through the shared failure
+ * mapping of §13.2.
+ */
+async function driveMapCompletion(ctx: RunContext, state: RunState): Promise<StepResult> {
+  const current = currentStateOf(ctx) ?? state
+  const outcome = await completeMap(completionDepsOf(ctx), {
+    runId: current.runId,
+    map: current.map,
+    accepted: current.acceptedMapRevisions.at(-1)!,
+    repositoryRoot: ctx.repositoryRoot,
+    repositoryId: current.map.repositoryId,
+    repositoryHome: ctx.repositoryHome,
+    targetBranch: ctx.branch,
+    setup: ctx.config.setup,
+    tests: ctx.config.tests,
+    reviewer: { ...ctx.config.reviewer, family: ctx.reviewerFamily },
+    trustedEvidenceAuthorIds: ctx.config.trustedEvidenceAuthorIds,
+    completionsDir: completionsDirFor(ctx.repositoryHome, current.runId),
+    alreadyShipped: ctx.sharedWrite,
+    gate: ctx.gate,
+    actorId: ctx.actorId,
+    configRevision: ctx.configRevision,
+    nornVersion: NORN_VERSION,
+  })
+  if (outcome.kind !== 'ok') {
+    return { kind: 'stop', outcome: failureOutcome(ctx, outcome) }
+  }
+  if (outcome.value.kind === 'replan') {
+    const reloaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
+    if (reloaded.kind !== 'ok') {
+      return {
+        kind: 'stop',
+        outcome: runFailure(ctx, reloaded.code as never,
+          `reloading run state after extension adoption failed: ${reloaded.reason}`),
+      }
+    }
+    return { kind: 'next', state: reloaded.value!, value: null }
+  }
+  return { kind: 'stop', outcome: await finishCompletion(ctx, current, outcome.value) }
+}
+
+/**
+ * Terminalize the passed report of a verified map completion (§13.1, §15),
+ * then clean up the map-completion workspace — only after terminal state is
+ * persisted; a cleanup failure is a warning and cannot undo valid
+ * completion.
+ */
+async function finishCompletion(
+  ctx: RunContext,
+  state: RunState,
+  result: Extract<MapCompletionResult, { readonly kind: 'completed' }>,
+): Promise<RunMapOutcome> {
+  const warnings = [...new Set([...ctx.warnings, ...result.warnings])]
+  const finalState = currentStateOf(ctx) ?? state
+  const report = buildReport(
+    ctx,
+    finalState,
+    ctx.lastSnapshot ?? emptySnapshotOf(finalState),
+    'passed',
+    undefined,
+    'confirmed',
+    result.completionSha,
+    warnings,
+  )
+  const terminalized = persistTerminal(ctx, finalState, report, { kind: 'ok' })
+
+  const cleaned = await (ctx.deps.cleanup ?? fsWorkspaceCleanup())(result.workspace)
+  if (cleaned.kind !== 'ok') {
+    const withWarning = currentStateOf(ctx)
+    if (
+      withWarning !== undefined &&
+      withWarning.report !== undefined &&
+      terminalized.kind === 'ok'
+    ) {
+      const warning =
+        'map-completion workspace cleanup failed and was recorded as a warning; the verified ' +
+        `completion stands: ${cleaned.reason}`
+      const amended = {
+        ...withWarning.report,
+        warnings: [...withWarning.report.warnings, warning],
+      }
+      const saved = saveRunState(ctx.repositoryHome, ctx.encodedMapIssueId, {
+        ...withWarning,
+        report: amended,
+      })
+      if (saved.kind === 'ok') return ok(amended)
+    }
+  }
+  return terminalized
+}
+
+// ---------------------------------------------------------------------------
 // Failure mapping (§9, §13.2)
 // ---------------------------------------------------------------------------
 
@@ -2014,6 +2342,10 @@ function normalizeErrorCode(code: string): RunErrorCode {
     'control-store', 'state-integrity', 'lock-failed', 'slot-registry',
     'map-read', 'target-read', 'evidence-read', 'push-unknown',
     'comment-write', 'issue-close', 'issue-reopen', 'adapter-failure',
+    'launch-failed', 'agent-timeout', 'protocol-error', 'malformed-sidecar', 'terminate-failed',
+    'command-launch-failed', 'command-settle-failed', 'command-protocol',
+    'workspace-inspection-failed', 'invalid-workspace-name', 'object-format-mismatch',
+    'base-tree-mismatch', 'workspace-verification-failed', 'reviewer-not-read-only',
   ]
   return known.includes(code) ? (code as RunErrorCode) : 'control-store'
 }

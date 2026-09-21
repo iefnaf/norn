@@ -25,12 +25,13 @@
  * tests script "the map changed at the barrier" deterministically.
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { ok } from '../../src/core/outcome.ts'
 import type { Sha256Digest } from '../../src/core/digest.ts'
+import { canonicalJsonDigest } from '../../src/core/digest.ts'
 import type { GitRemote, GitRepositoryAdapter } from '../../src/adapters/git-repository.ts'
 import { gitCliDeliveryFacts, gitCliPush, runGit, runGitDetailed } from '../../src/adapters/git-repository.ts'
 import type { GitHubGatewayAdapter } from '../../src/adapters/github-gateway.ts'
@@ -55,13 +56,20 @@ import { osTargetLock } from '../../src/ship/push.ts'
 import { runMap } from '../../src/run/lifecycle.ts'
 import type { RunLifecycleDeps, RunMapOutcome } from '../../src/run/lifecycle.ts'
 import { loadRunState } from '../../src/runstate/run-state-store.ts'
-import type { ProcessGroupCheckpoint, RunState } from '../../src/runstate/types.ts'
+import type {
+  EvidenceGateV1,
+  MapCompletionCheckpoint,
+  ProcessGroupCheckpoint,
+  RunState,
+  TestEvidence,
+} from '../../src/runstate/types.ts'
 import { NORN_VERSION } from '../../src/version.ts'
 import { resolveRunConfigText } from '../../src/config/run-config.ts'
 import { fakeIssueGateway, fakeIssue } from './close-fixtures.ts'
 import type { FakeGateway, FakeIssueState, GatewayScript } from './close-fixtures.ts'
 import { fakeShipCommands } from './ship-fixtures.ts'
 import type { FakeShipCommands } from './ship-fixtures.ts'
+import type { CommandExecution, CommandExecutionRequest } from '../../src/work/command-runner.ts'
 import { tempBareRemote } from './push-fixtures.ts'
 import type { BareRemote } from './push-fixtures.ts'
 import type { TempRepository } from './round-gate-fixtures.ts'
@@ -145,10 +153,25 @@ export type Observed = {
   readonly workerLaunches: number
   readonly workReviewerLaunches: number
   readonly shipReviewerLaunches: number
+  readonly completionReviewerLaunches: number
   readonly pushes: number
   readonly closeCalls: number
   readonly commentCalls: number
   readonly reopenCalls: number
+  /** Map-issue writes the harness observed (close, reopen, comment). */
+  readonly mapCloseCalls: number
+  readonly mapCommentCalls: number
+  readonly mapReopenCalls: number
+}
+
+/**
+ * Failure scripts aimed at the map issue only, so completion tests can arm
+ * unknown map-write results without touching member-Ticket delivery writes.
+ */
+export type MapIssueScript = {
+  writeCommentFails?: string
+  closeFails?: string
+  reopenFails?: string
 }
 
 /** One staged map change, applied at a load boundary when first due. */
@@ -167,6 +190,8 @@ export class RunMapStore {
   readonly issues = new Map<number, FakeIssueState>()
   readonly changes: StagedChange[] = []
   readonly script: MutableGatewayScript = {}
+  /** Failure scripts aimed at the map issue only (§15 unknown writes). */
+  readonly mapScript: MapIssueScript = {}
   /** When set, every map load from this read index on fails (§7.3 loader error). */
   failReadsFrom: number | undefined
   readonly observed = {
@@ -174,10 +199,14 @@ export class RunMapStore {
     workerLaunches: 0,
     workReviewerLaunches: 0,
     shipReviewerLaunches: 0,
+    completionReviewerLaunches: 0,
     pushes: 0,
     closeCalls: 0,
     commentCalls: 0,
     reopenCalls: 0,
+    mapCloseCalls: 0,
+    mapCommentCalls: 0,
+    mapReopenCalls: 0,
   }
 
   constructor(members: readonly MemberSpec[], behaviors: Readonly<Record<string, WorkerBehavior>> = {}) {
@@ -255,6 +284,7 @@ export type FakeRunAgents = VisibleAgentRunner & {
 export function fakeRunRunner(
   store: RunMapStore,
   reviewer: () => ReviewerCompletion = () => ({ discriminant: 'pass' }),
+  completionReviewer: () => ReviewerCompletion = () => ({ discriminant: 'pass' }),
 ): FakeRunAgents {
   const launches: AgentLaunchRecord[] = []
   let nextHandle = 0
@@ -276,12 +306,15 @@ export function fakeRunRunner(
       })
       if (context.role === 'worker') store.observed.workerLaunches += 1
       else if (context.phase === 'work') store.observed.workReviewerLaunches += 1
+      else if (context.phase === 'map-completion') store.observed.completionReviewerLaunches += 1
       else store.observed.shipReviewerLaunches += 1
 
       const completion: AgentCompletion =
         context.role === 'worker'
           ? performWorker(this.workerBehavior(context.ticket!.issueId), request)
-          : reviewer()
+          : context.phase === 'map-completion'
+            ? completionReviewer()
+            : reviewer()
       const sidecarStore = new CompletionStore(context.completionsDir)
       const written = await sidecarStore.write(context, completion, agentRecordedAt())
       if (written.status === 'conflict') throw new Error('sidecar conflict')
@@ -334,6 +367,13 @@ export type RunHarnessOptions = {
   readonly changes?: readonly StagedChange[]
   /** Overrides the gateway write script (failures model unknown results). */
   readonly gatewayScript?: GatewayScript
+  /** The map-completion reviewer verdict script; default: pass (§15 step 4). */
+  readonly completionReviewer?: () => ReviewerCompletion
+  /** Scripts gate commands (§10.2); e.g. fail the completion test list. */
+  readonly commandScript?: (
+    request: CommandExecutionRequest,
+    call: number,
+  ) => CommandExecution | void
   /** Deterministic run IDs; default: run-1, run-2, ... per harness. */
   readonly newRunId?: () => string
 }
@@ -355,7 +395,7 @@ export type RunHarness = {
   /** The evaluated snapshot of the current map world (§7.3 shape). */
   snapshot(): TaskMapSnapshot
   /** A valid running Run State for the current map world, run ID `run-crafted`. */
-  craftRunningState(processes?: readonly ProcessGroupCheckpoint[]): RunState
+  craftRunningState(processes?: readonly ProcessGroupCheckpoint[], options?: { readonly completed?: readonly string[] }): RunState
   runState(): RunState | undefined
   remoteMainSha(): string
   /** Remote main's commit subjects, oldest first. */
@@ -385,22 +425,56 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
 
   const gateway = fakeIssueGateway(store.issues, store.script)
   // The fake gateway writes through its own script; expose the counters the
-  // staged changes observe by wrapping the mutating methods.
+  // staged changes observe by wrapping the mutating methods, routing the map
+  // issue's writes through the completion-specific `mapScript`.
   const baseWriter = gateway
+  const mapFailure = (reason: string) =>
+    Promise.resolve({
+      kind: 'error' as const,
+      scope: 'operation' as const,
+      code: 'github-unavailable' as const,
+      reason,
+      sharedWrite: 'none' as const,
+      evidence: [],
+    })
   const writer = {
     readIssueEvidence: gateway.readIssueEvidence,
     writer: {
       async writeIssueComment(locator: Parameters<typeof baseWriter.writeIssueComment>[0], body: string) {
+        if (locator.number === MAP_NUMBER) {
+          if (store.mapScript.writeCommentFails !== undefined) {
+            return mapFailure(store.mapScript.writeCommentFails)
+          }
+          const outcome = await baseWriter.writeIssueComment(locator, body)
+          if (outcome.kind === 'ok') store.observed.mapCommentCalls += 1
+          return outcome
+        }
         const outcome = await baseWriter.writeIssueComment(locator, body)
         if (outcome.kind === 'ok') store.observed.commentCalls += 1
         return outcome
       },
       async closeIssue(locator: Parameters<typeof baseWriter.closeIssue>[0]) {
+        if (locator.number === MAP_NUMBER) {
+          if (store.mapScript.closeFails !== undefined) {
+            return mapFailure(store.mapScript.closeFails)
+          }
+          const outcome = await baseWriter.closeIssue(locator)
+          if (outcome.kind === 'ok') store.observed.mapCloseCalls += 1
+          return outcome
+        }
         const outcome = await baseWriter.closeIssue(locator)
         if (outcome.kind === 'ok') store.observed.closeCalls += 1
         return outcome
       },
       async reopenIssue(locator: Parameters<typeof baseWriter.reopenIssue>[0]) {
+        if (locator.number === MAP_NUMBER) {
+          if (store.mapScript.reopenFails !== undefined) {
+            return mapFailure(store.mapScript.reopenFails)
+          }
+          const outcome = await baseWriter.reopenIssue(locator)
+          if (outcome.kind === 'ok') store.observed.mapReopenCalls += 1
+          return outcome
+        }
         const outcome = await baseWriter.reopenIssue(locator)
         if (outcome.kind === 'ok') store.observed.reopenCalls += 1
         return outcome
@@ -408,8 +482,8 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
     },
   }
 
-  const runner = fakeRunRunner(store, options.reviewer)
-  const commands = fakeShipCommands()
+  const runner = fakeRunRunner(store, options.reviewer, options.completionReviewer)
+  const commands = fakeShipCommands(options.commandScript)
   const gitAdapter: GitRepositoryAdapter = {
     async resolveRoot(cwd: string) {
       return { kind: 'ok' as const, value: cwd === repo.root ? repo.root : repo.root }
@@ -490,6 +564,9 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
         planShipReviewer: () => () => ({
           argv: ['pi', '--tools', 'read,grep,find,ls,norn_complete'],
         }),
+        planMapCompletionReviewer: () => () => ({
+          argv: ['pi', '--tools', 'read,grep,find,ls,norn_complete'],
+        }),
         newShipInvocationId: () => `ship-rev-${++shipInvocation}`,
       },
       targetLockFor: (home, branch) => osTargetLock(home, branch, { waitMs: 5_000 }),
@@ -535,13 +612,23 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
     async run() {
       return runMap(buildDeps(), MAP_URL)
     },
-    craftRunningState(processes: readonly ProcessGroupCheckpoint[] = []): RunState {
+    craftRunningState(
+      processes: readonly ProcessGroupCheckpoint[] = [],
+      options: { readonly completed?: readonly string[] } = {},
+    ): RunState {
       const evaluation = evaluateTaskMapLoad(loadOf(store))
       if (!evaluation.valid) {
         throw new Error(`fixture map is invalid: ${JSON.stringify(evaluation.findings)}`)
       }
       const snapshot = evaluation.snapshot
       const payload = snapshotMapPayload(snapshot)
+      const completed = options.completed ?? []
+      const tickets: Record<string, RunState['tickets'][string]> = {}
+      for (const ticket of snapshot.tickets) {
+        tickets[ticket.ref.issueId] = completed.includes(ticket.ref.issueId)
+          ? { phase: 'completed', deliveryId: `sha256:${'0'.repeat(64)}`, integratedSha: `sha1:${'0'.repeat(40)}` }
+          : { phase: 'waiting' }
+      }
       return {
         schema: 'norn-run-state:v1',
         runId: 'run-crafted',
@@ -552,7 +639,7 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
         status: 'running',
         wave: 0,
         parkedTickets: [],
-        tickets: {},
+        tickets,
         activeProcesses: [...processes],
       }
     },
@@ -577,4 +664,122 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
     throw new Error('fixture repository setup failed')
   }
   return harness
+}
+
+// ---------------------------------------------------------------------------
+// Map-completion checkpoint crafting (§13.1, §13.4)
+// ---------------------------------------------------------------------------
+
+/** The sealed evidence gate of the fixture Run Config (§14, §15). */
+export function fixtureGate(): EvidenceGateV1 {
+  return {
+    worker: {
+      provider: 'provider-a',
+      model: 'provider-a/model-x',
+      family: 'provider-a',
+      thinking: 'medium',
+    },
+    reviewer: {
+      provider: 'provider-b',
+      model: 'provider-b/model-y',
+      family: 'provider-b',
+      thinking: 'high',
+    },
+    tests: [{ argv: ['npm', 'test'], timeoutMs: 60_000 }],
+  }
+}
+
+/** One map-completion `TestEvidence` list bound to the fixture gate (§10.3). */
+function completionTestEvidence(completionSha: string, treeOid: string): TestEvidence[] {
+  return [
+    {
+      phase: 'map-completion',
+      testIndex: 0,
+      argv: ['npm', 'test'],
+      timeoutMs: 60_000,
+      baseSha: completionSha,
+      treeOid,
+      exitCode: 0,
+      outputDigest: canonicalJsonDigest({ fixture: 'completion-test-output' } as never),
+    },
+  ]
+}
+
+/**
+ * Craft one integrity-valid `MapCompletionCheckpoint` for the harness's
+ * current map world and remote target (§13.1): the sealed gates of one
+ * completion attempt at the exact remote tip.
+ */
+export function craftCompletionCheckpoint(
+  harness: RunHarness,
+  init: {
+    readonly stage?: MapCompletionCheckpoint['stage']
+    readonly mapRevision: string
+    readonly completionAttemptId?: string
+    readonly timelineAnchorEventId?: string | null
+    readonly closingEventId?: string
+  },
+): MapCompletionCheckpoint {
+  const completionSha = harness.remoteMainSha()
+  const treeHex = gitText(harness.remote.path, ['rev-parse', 'main^{tree}'])
+  const treeOid = `sha1:${treeHex}`
+  const completionAttemptId = init.completionAttemptId ?? 'run-crafted-mc1'
+  const tests = completionTestEvidence(completionSha, treeOid)
+  return {
+    stage: init.stage ?? 'gated',
+    completionAttemptId,
+    timelineAnchorEventId: init.timelineAnchorEventId ?? null,
+    workspace: {
+      kind: 'map-completion',
+      repositoryId: REPOSITORY_ID,
+      runId: 'run-crafted',
+      path: join(
+        harness.repositoryHome,
+        'runs',
+        'run-crafted',
+        'workspaces',
+        'map',
+        completionAttemptId,
+      ),
+      completionAttemptId,
+    },
+    mapRevision: init.mapRevision,
+    completionSha,
+    treeOid,
+    gate: fixtureGate(),
+    tests,
+    review: {
+      phase: 'map-completion',
+      provider: 'provider-b',
+      model: 'provider-b/model-y',
+      family: 'provider-b',
+      thinking: 'high',
+      verdict: 'pass',
+      mapRevision: init.mapRevision,
+      completionSha,
+      treeOid,
+      testEvidenceDigest: canonicalJsonDigest(tests as never),
+    },
+    ...(init.closingEventId === undefined ? {} : { closingEventId: init.closingEventId }),
+  }
+}
+
+/** The map-completion workspace paths that currently exist under any run. */
+export function completionWorkspacePaths(harness: RunHarness): readonly string[] {
+  const runs = join(harness.repositoryHome, 'runs')
+  const found: string[] = []
+  try {
+    for (const run of readdirSync(runs, { withFileTypes: true })) {
+      if (!run.isDirectory()) continue
+      const mapDir = join(runs, run.name, 'workspaces', 'map')
+      try {
+        for (const workspace of readdirSync(mapDir)) found.push(join(mapDir, workspace))
+      } catch {
+        // no completion workspaces for this run
+      }
+    }
+  } catch {
+    return []
+  }
+  return found.filter((path) => existsSync(path))
 }

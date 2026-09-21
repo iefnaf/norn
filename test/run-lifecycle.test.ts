@@ -550,20 +550,26 @@ describe('no eligible frontier', () => {
     }
   })
 
-  it('warns when a fresh run finds every member already completed', async () => {
+  it('closes the map without new work when a fresh run finds every member completed', async () => {
     const harness = await makeRunHarness({ label: 'precompleted', members: [ticketA()] })
     try {
       const first = await harness.run()
       assert.equal(first.kind, 'ok')
+      assert.equal(harness.store.issues.get(6)!.state, 'CLOSED')
 
+      // §7.4: an extension observed after the run reached terminal state
+      // belongs to a new run; the operator must reopen the map first.
+      harness.store.issues.get(6)!.state = 'OPEN'
       const second = await harness.run()
       assert.equal(second.kind, 'ok')
       assert.equal(second.value.label, 'passed')
       assert.equal(second.value.runId, 'run-2') // a new run ID after terminal
       assert.deepEqual(harness.workedTickets().slice(1), []) // no new Work
-      assert.ok(
-        second.value.warnings.some((warning) => warning.includes('no shared write')),
-      )
+      // The second run still performed its own completion protocol: it
+      // re-ran the gates, closed the map, and wrote a fresh record.
+      assert.equal(harness.store.issues.get(6)!.state, 'CLOSED')
+      assert.equal(harness.store.observed.completionReviewerLaunches, 2)
+      assert.match(second.value.completionSha ?? '', /^sha1:[0-9a-f]{40}$/)
     } finally {
       harness.cleanup()
     }

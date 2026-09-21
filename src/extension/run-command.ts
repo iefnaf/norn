@@ -26,6 +26,7 @@ import { HerdrAgentRunner } from '../agents/herdr-runner.ts'
 import { fsControlStore } from '../control/control-store.ts'
 import { resolveNornHome } from '../config/paths.ts'
 import { piShipReviewerLaunch } from '../ship/reconcile.ts'
+import { piMapCompletionReviewerLaunch } from '../run/completion.ts'
 import { runMap } from '../run/lifecycle.ts'
 import type { RunLifecycleDeps } from '../run/lifecycle.ts'
 import { piReadOnlyReviewerLaunch, piWorkerLaunch } from '../work/round-gate.ts'
@@ -118,6 +119,15 @@ export function productionLaunchPlans(): RunLifecycleDeps['launches'] {
         thinking: reviewer.thinking,
         extensionPath: COMPLETION_EXTENSION_PATH,
         piSessionId: `ship-rev-${planned}-pi`,
+      })
+    },
+    planMapCompletionReviewer: (reviewer) => (input) => {
+      planned += 1
+      return piMapCompletionReviewerLaunch(input, {
+        model: reviewer.model,
+        thinking: reviewer.thinking,
+        extensionPath: COMPLETION_EXTENSION_PATH,
+        piSessionId: `map-completion-rev-${planned}-pi`,
       })
     },
     newShipInvocationId: () => {
