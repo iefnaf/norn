@@ -7,8 +7,15 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { commandSummary, parseNornInvocation } from '../runner/commands.ts'
+import { executeCheckCommand } from './check-command.ts'
 import { executeInitCommand } from './init-command.ts'
-import { renderInitTakesNoArguments, renderPending, renderSummary, renderUnknown } from './render.ts'
+import {
+  renderCheckTakesOneMapUrl,
+  renderInitTakesNoArguments,
+  renderPending,
+  renderSummary,
+  renderUnknown,
+} from './render.ts'
 
 export default function (pi: ExtensionAPI): void {
   pi.registerCommand('norn', {
@@ -35,6 +42,12 @@ export default function (pi: ExtensionAPI): void {
               ui: ctx.ui,
               modelRegistry: ctx.modelRegistry,
             })
+          } else if (invocation.subcommand.name === 'check') {
+            if (invocation.args === '') {
+              ctx.ui.notify(renderCheckTakesOneMapUrl(), 'warning')
+              return
+            }
+            await executeCheckCommand({ cwd: ctx.cwd, ui: ctx.ui }, invocation.args)
           } else {
             ctx.ui.notify(renderPending(invocation.subcommand), 'info')
           }

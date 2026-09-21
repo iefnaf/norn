@@ -90,11 +90,11 @@ describe('subcommand routing before implementation', () => {
     const pi = registeredNorn()
     const { ctx, notifications } = fakeCtx(true)
 
-    await pi.commands[0]!.def.handler('check https://github.com/o/r/issues/1', ctx)
+    await pi.commands[0]!.def.handler('run https://github.com/o/r/issues/1', ctx)
 
     assert.equal(notifications.length, 1)
     assert.match(notifications[0]!.message, /not implemented yet/)
-    assert.match(notifications[0]!.message, /check/)
+    assert.match(notifications[0]!.message, /run/)
   })
 
   it('shows the summary again after unknown input', async () => {

@@ -1,10 +1,16 @@
 /**
  * The GitHub gateway seam (design.md §6, §2.2): resolve stable GitHub
- * identities from local facts. `/norn init` uses it to turn a chosen remote
- * into the stable repository identity (node IDs, not owner/name) and to learn
- * the authenticated actor.
+ * identities from local facts, and load complete Task Map issue graphs
+ * (§7.2) with every pagination cursor followed.
  *
- * The built-in production adapter shells out to the `gh` CLI, inheriting the
+ * `/norn init` uses the identity half to turn a chosen remote into the stable
+ * repository identity (node IDs, not owner/name) and to learn the
+ * authenticated actor. `/norn check` and `run` use the map-loading half —
+ * `ghApiTaskMapLoader` — to read the map issue, its complete direct
+ * sub-issue set, and every member's native `blockedBy`, parent, and
+ * sub-issue relationships.
+ *
+ * The built-in production adapters shell out to the `gh` CLI, inheriting the
  * operator's authenticated GitHub sessions. Tests inject a runner with canned
  * responses — no network, no clock.
  */
@@ -13,6 +19,19 @@ import { promisify } from 'node:util'
 
 import { blocked, error, ok } from '../core/outcome.ts'
 import type { Outcome } from '../core/outcome.ts'
+import type { MapIssueLocator } from '../map/issue-url.ts'
+import { parseIssueUrl } from '../map/issue-url.ts'
+import type {
+  RawIssueRef,
+  RawIssueState,
+  RawMapIssue,
+  RawMemberIssue,
+  RawTaskMapLoad,
+  TaskMapLoadBlockCode,
+  TaskMapLoadErrorCode,
+  TaskMapLoadOutcome,
+  TaskMapLoader,
+} from '../map/loader.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -194,6 +213,453 @@ export function ghCliGateway(run: GhCommandRunner = runGh): GitHubGatewayAdapter
         })
       }
       return ok({ id: user.node_id, login: user.login })
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Task Map loading (design.md §7.2): one complete graph read per call.
+// ---------------------------------------------------------------------------
+
+/** Page size for every paginated connection. */
+const MAP_PAGE_SIZE = 100
+
+/**
+ * The identity fields every connection node carries. `repository.id` makes
+ * cross-repository members detectable without a second lookup.
+ */
+const REF_FIELDS = 'id number url repository { id }'
+
+const MAP_CORE_QUERY = `
+query NornMapCore($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    id
+    issue(number: $number) {
+      id number url title body state
+      parent { ${REF_FIELDS} }
+    }
+  }
+}`
+
+const MAP_BLOCKED_BY_QUERY = `
+query NornMapBlockedBy($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      blockedBy(first: ${MAP_PAGE_SIZE}, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { ${REF_FIELDS} }
+      }
+    }
+  }
+}`
+
+const MAP_SUB_ISSUES_QUERY = `
+query NornMapSubIssues($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: ${MAP_PAGE_SIZE}, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { ${REF_FIELDS} }
+      }
+    }
+  }
+}`
+
+const MEMBER_CORE_QUERY = `
+query NornMemberCore($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    id
+    issue(number: $number) {
+      id number url title body state
+      parent { ${REF_FIELDS} }
+    }
+  }
+}`
+
+const MEMBER_SUB_ISSUES_QUERY = `
+query NornMemberSubIssues($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: ${MAP_PAGE_SIZE}, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { ${REF_FIELDS} }
+      }
+    }
+  }
+}`
+
+const MEMBER_BLOCKED_BY_QUERY = `
+query NornMemberBlockedBy($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      blockedBy(first: ${MAP_PAGE_SIZE}, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { ${REF_FIELDS} }
+      }
+    }
+  }
+}`
+
+type GraphQLVariables = Readonly<Record<string, string | number>>
+
+type LoadStepOutcome<T> = Outcome<T, TaskMapLoadBlockCode, TaskMapLoadErrorCode>
+
+/**
+ * Classify one failed `gh api graphql` invocation. Resolution failures are
+ * trustworthy facts about the addressed repository or issue; everything else
+ * means the facts could not be established.
+ */
+function classifyGraphQLFailure(
+  message: string,
+): Outcome<never, TaskMapLoadBlockCode, TaskMapLoadErrorCode> {
+  if (/could not resolve to an? issue/i.test(message)) {
+    return blocked({
+      scope: 'operation',
+      code: 'issue-not-found',
+      reason: message,
+      sharedWrite: 'none',
+    })
+  }
+  if (/could not resolve to an? repositor/i.test(message) || /HTTP 40[04]/.test(message)) {
+    return blocked({
+      scope: 'operation',
+      code: 'repository-not-found',
+      reason: message,
+      sharedWrite: 'none',
+    })
+  }
+  if (/auth/i.test(message) && /login|token|credential/i.test(message)) {
+    return blocked({
+      scope: 'operation',
+      code: 'github-unauthenticated',
+      reason: message,
+      sharedWrite: 'none',
+    })
+  }
+  return error({ scope: 'operation', code: 'github-unavailable', reason: message })
+}
+
+function unavailable(reason: string): Outcome<never, never, TaskMapLoadErrorCode> {
+  return error({ scope: 'operation', code: 'github-unavailable', reason })
+}
+
+type GraphQLData = { readonly data?: unknown }
+
+async function runGraphQL(
+  run: GhCommandRunner,
+  host: string,
+  query: string,
+  variables: GraphQLVariables,
+): Promise<LoadStepOutcome<unknown>> {
+  const args = ['api', '--hostname', host, 'graphql', '-f', `query=${query.trim()}`]
+  for (const [name, value] of Object.entries(variables)) {
+    if (typeof value === 'number') args.push('-F', `${name}=${String(value)}`)
+    else args.push('-f', `${name}=${value}`)
+  }
+  const result = await run(args)
+  if (!result.ok) return classifyGraphQLFailure(result.message.trim())
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(result.stdout)
+  } catch {
+    return unavailable('gh api graphql returned a non-JSON response')
+  }
+  if (typeof parsed !== 'object' || parsed === null) {
+    return unavailable('gh api graphql returned an unexpected response shape')
+  }
+  const envelope = parsed as { data?: unknown; errors?: unknown }
+  if (envelope.errors !== undefined) {
+    const message = describeGraphQLErrors(envelope.errors)
+    const issueMissing = Array.isArray(envelope.errors) && envelope.errors.length > 0 &&
+      envelope.errors.every((entry) => {
+        if (typeof entry !== 'object' || entry === null) return false
+        const path = (entry as { path?: unknown }).path
+        return Array.isArray(path) && path[path.length - 1] === 'issue'
+      })
+    if (issueMissing) {
+      return blocked({
+        scope: 'operation',
+        code: 'issue-not-found',
+        reason: message,
+        sharedWrite: 'none',
+      })
+    }
+    return unavailable(`gh api graphql reported errors: ${message}`)
+  }
+  return ok(envelope.data)
+}
+
+function describeGraphQLErrors(errors: unknown): string {
+  if (!Array.isArray(errors)) return String(errors)
+  return errors
+    .map((entry) => {
+      if (typeof entry === 'object' && entry !== null && typeof (entry as { message?: unknown }).message === 'string') {
+        return (entry as { message: string }).message
+      }
+      return String(entry)
+    })
+    .join('; ')
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** The repository node of a response, classified as a block when absent. */
+function repositoryNode(data: unknown): LoadStepOutcome<Record<string, unknown>> {
+  if (!isRecord(data)) return unavailable('graphql data is not an object')
+  const repository = data.repository
+  if (repository === null) {
+    return blocked({
+      scope: 'operation',
+      code: 'repository-not-found',
+      reason: 'GitHub could not resolve the repository',
+      sharedWrite: 'none',
+    })
+  }
+  if (!isRecord(repository)) return unavailable('graphql repository node is malformed')
+  return ok(repository)
+}
+
+/** The issue node under a repository node, classified as a block when absent. */
+function issueNode(repository: Record<string, unknown>): LoadStepOutcome<Record<string, unknown>> {
+  const issue = repository.issue
+  if (issue === null) {
+    return blocked({
+      scope: 'operation',
+      code: 'issue-not-found',
+      reason: 'GitHub could not resolve the issue',
+      sharedWrite: 'none',
+    })
+  }
+  if (!isRecord(issue)) return unavailable('graphql issue node is malformed')
+  return ok(issue)
+}
+
+function issueState(value: unknown): RawIssueState | undefined {
+  return value === 'OPEN' || value === 'CLOSED' ? value : undefined
+}
+
+/** Validate one `{ id number url repository { id } }` node into a raw ref. */
+function rawRef(host: string, node: unknown): RawIssueRef | undefined {
+  if (!isRecord(node)) return undefined
+  const repository = node.repository
+  if (
+    typeof node.id !== 'string' || node.id === '' ||
+    typeof node.number !== 'number' || !Number.isInteger(node.number) ||
+    typeof node.url !== 'string' || node.url === '' ||
+    !isRecord(repository) || typeof repository.id !== 'string' || repository.id === ''
+  ) {
+    return undefined
+  }
+  return {
+    githubHost: host,
+    repositoryId: repository.id,
+    issueId: node.id,
+    number: node.number,
+    url: node.url,
+  }
+}
+
+type ConnectionPage = {
+  readonly nodes: readonly unknown[]
+  readonly hasNextPage: boolean
+  readonly endCursor: string | null
+}
+
+/** Read one paginated connection off an issue node. */
+function connectionOf(issue: Record<string, unknown>, field: 'subIssues' | 'blockedBy'): ConnectionPage | undefined {
+  const connection = issue[field]
+  if (!isRecord(connection)) return undefined
+  const pageInfo = connection.pageInfo
+  const nodes = connection.nodes
+  if (!isRecord(pageInfo) || !Array.isArray(nodes)) return undefined
+  const hasNextPage = pageInfo.hasNextPage === true
+  const endCursor =
+    typeof pageInfo.endCursor === 'string' ? pageInfo.endCursor : null
+  return { nodes, hasNextPage, endCursor }
+}
+
+/** The issue node reached by `data.repository.issue` for field `field`. */
+function connectionIssue(data: unknown, field: 'subIssues' | 'blockedBy'):
+  LoadStepOutcome<{ readonly issue: Record<string, unknown>; readonly field: 'subIssues' | 'blockedBy' }> {
+  const repository = repositoryNode(data)
+  if (repository.kind !== 'ok') return repository
+  const issue = issueNode(repository.value)
+  if (issue.kind !== 'ok') return issue
+  if (connectionOf(issue.value, field) === undefined) {
+    return unavailable(`graphql ${field} connection is malformed`)
+  }
+  return ok({ issue: issue.value, field })
+}
+
+/**
+ * Collect every node of one paginated issue connection, following the
+ * `endCursor` until `hasNextPage` is false. One GraphQL request per page.
+ */
+async function collectConnectionRefs(
+  run: GhCommandRunner,
+  host: string,
+  query: string,
+  variables: GraphQLVariables,
+  field: 'subIssues' | 'blockedBy',
+): Promise<LoadStepOutcome<readonly RawIssueRef[]>> {
+  const refs: RawIssueRef[] = []
+  let after: string | undefined
+  for (;;) {
+    const pageVariables: Record<string, string | number> = { ...variables }
+    if (after !== undefined) pageVariables.after = after
+    const outcome = await runGraphQL(run, host, query, pageVariables)
+    if (outcome.kind !== 'ok') return outcome
+    const reached = connectionIssue(outcome.value, field)
+    if (reached.kind !== 'ok') return reached
+    const page = connectionOf(reached.value.issue, field)!
+    for (const node of page.nodes) {
+      const ref = rawRef(host, node)
+      if (ref === undefined) return unavailable(`graphql ${field} node is malformed`)
+      refs.push(ref)
+    }
+    if (!page.hasNextPage || page.endCursor === null) return ok(refs)
+    after = page.endCursor
+  }
+}
+
+/** The `repository.id` + issue core fields of one issue. */
+type IssueCore = {
+  readonly ref: RawIssueRef
+  readonly title: string
+  readonly body: string | null
+  readonly state: RawIssueState
+  readonly parent: RawIssueRef | undefined
+}
+
+async function loadIssueCore(
+  run: GhCommandRunner,
+  host: string,
+  query: string,
+  variables: GraphQLVariables,
+): Promise<LoadStepOutcome<IssueCore>> {
+  const outcome = await runGraphQL(run, host, query, variables)
+  if (outcome.kind !== 'ok') return outcome
+  const repository = repositoryNode(outcome.value)
+  if (repository.kind !== 'ok') return repository
+  const issue = issueNode(repository.value)
+  if (issue.kind !== 'ok') return issue
+  const node = issue.value
+  const state = issueState(node.state)
+  const parentRef = node.parent === null ? undefined : rawRef(host, node.parent)
+  if (
+    typeof repository.value.id !== 'string' || repository.value.id === '' ||
+    typeof node.id !== 'string' || node.id === '' ||
+    typeof node.number !== 'number' || !Number.isInteger(node.number) ||
+    typeof node.url !== 'string' || node.url === '' ||
+    typeof node.title !== 'string' ||
+    (node.body !== null && typeof node.body !== 'string') ||
+    state === undefined ||
+    (node.parent !== null && parentRef === undefined)
+  ) {
+    return unavailable('graphql issue node lacks the required fields')
+  }
+  return ok({
+    ref: {
+      githubHost: host,
+      repositoryId: repository.value.id,
+      issueId: node.id,
+      number: node.number,
+      url: node.url,
+    },
+    title: node.title,
+    body: node.body,
+    state,
+    parent: parentRef,
+  })
+}
+
+/**
+ * The built-in production Task Map loader over the authenticated `gh` CLI.
+ * Each call performs one complete graph read: the map issue core and parent,
+ * the map's own blockers, its complete direct sub-issue set, and every
+ * member's core, parent, sub-issues, and blockers — every connection followed
+ * page by page until its cursor is exhausted (§7.2). Reads only.
+ */
+export function ghApiTaskMapLoader(run: GhCommandRunner = runGh): TaskMapLoader {
+  return {
+    async loadTaskMap(locator: MapIssueLocator): Promise<TaskMapLoadOutcome> {
+      const host = locator.githubHost
+      const base = { owner: locator.owner, name: locator.name, number: locator.number }
+
+      const mapCore = await loadIssueCore(run, host, MAP_CORE_QUERY, base)
+      if (mapCore.kind !== 'ok') return mapCore
+
+      const mapBlockers = await collectConnectionRefs(
+        run,
+        host,
+        MAP_BLOCKED_BY_QUERY,
+        base,
+        'blockedBy',
+      )
+      if (mapBlockers.kind !== 'ok') return mapBlockers
+
+      const memberRefs = await collectConnectionRefs(
+        run,
+        host,
+        MAP_SUB_ISSUES_QUERY,
+        base,
+        'subIssues',
+      )
+      if (memberRefs.kind !== 'ok') return memberRefs
+
+      const members: RawMemberIssue[] = []
+      for (const memberRef of memberRefs.value) {
+        // The member URL carries its own repository locator: cross-repository
+        // members are queried through their own owner/name, not the map's.
+        const memberLocator = parseIssueUrl(memberRef.url)
+        if (memberLocator === undefined) {
+          return unavailable(`member issue URL "${memberRef.url}" is not a full GitHub issue URL`)
+        }
+        const memberBase = {
+          owner: memberLocator.owner,
+          name: memberLocator.name,
+          number: memberLocator.number,
+        }
+        const core = await loadIssueCore(run, host, MEMBER_CORE_QUERY, memberBase)
+        if (core.kind !== 'ok') return core
+        const subIssues = await collectConnectionRefs(
+          run,
+          host,
+          MEMBER_SUB_ISSUES_QUERY,
+          memberBase,
+          'subIssues',
+        )
+        if (subIssues.kind !== 'ok') return subIssues
+        const blockers = await collectConnectionRefs(
+          run,
+          host,
+          MEMBER_BLOCKED_BY_QUERY,
+          memberBase,
+          'blockedBy',
+        )
+        if (blockers.kind !== 'ok') return blockers
+        members.push({
+          ref: core.value.ref,
+          title: core.value.title,
+          body: core.value.body,
+          state: core.value.state,
+          parents: core.value.parent === undefined ? [] : [core.value.parent],
+          subIssues: subIssues.value,
+          blockers: blockers.value,
+        })
+      }
+
+      const map: RawMapIssue = {
+        ref: mapCore.value.ref,
+        title: mapCore.value.title,
+        body: mapCore.value.body,
+        state: mapCore.value.state,
+        parents: mapCore.value.parent === undefined ? [] : [mapCore.value.parent],
+        blockers: mapBlockers.value,
+      }
+      return ok({ map, members })
     },
   }
 }
