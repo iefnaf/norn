@@ -2,14 +2,13 @@
  * Norn's Pi extension: the sole production operator adapter (design.md §2.1, §6).
  *
  * It parses command syntax, renders typed runner events, and returns operator
- * responses. It owns no scheduling, retry, evidence, or side-effect policy,
- * and this scaffold performs no reads or writes beyond loading the extension
- * (design.md §2.3).
+ * responses. It owns no scheduling, retry, evidence, or side-effect policy.
  */
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { commandSummary, parseNornInvocation } from '../runner/commands.ts'
-import { renderPending, renderSummary, renderUnknown } from './render.ts'
+import { executeInitCommand } from './init-command.ts'
+import { renderInitTakesNoArguments, renderPending, renderSummary, renderUnknown } from './render.ts'
 
 export default function (pi: ExtensionAPI): void {
   pi.registerCommand('norn', {
@@ -26,7 +25,19 @@ export default function (pi: ExtensionAPI): void {
           ctx.ui.notify(renderUnknown(invocation.input, commandSummary()), 'info')
           break
         case 'subcommand':
-          ctx.ui.notify(renderPending(invocation.subcommand), 'info')
+          if (invocation.subcommand.name === 'init') {
+            if (invocation.args !== '') {
+              ctx.ui.notify(renderInitTakesNoArguments(), 'warning')
+              return
+            }
+            await executeInitCommand({
+              cwd: ctx.cwd,
+              ui: ctx.ui,
+              modelRegistry: ctx.modelRegistry,
+            })
+          } else {
+            ctx.ui.notify(renderPending(invocation.subcommand), 'info')
+          }
           break
       }
     },
