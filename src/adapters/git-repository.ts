@@ -12,6 +12,7 @@ import { promisify } from 'node:util'
 
 import { error, ok } from '../core/outcome.ts'
 import type { Outcome } from '../core/outcome.ts'
+import type { DeliveryCommitFacts, DeliveryFactsErrorCode } from '../evidence/delivery.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -189,4 +190,137 @@ function parseOwnerName(path: string): { owner: string; name: string } | undefin
 export function normalizeHost(host: string): string {
   const lowercase = host.toLowerCase()
   return lowercase.endsWith(':443') ? lowercase.slice(0, -':443'.length) : lowercase
+}
+
+// ---------------------------------------------------------------------------
+// Delivery target facts (design.md §14 predicate 9)
+// ---------------------------------------------------------------------------
+
+/**
+ * A single git CLI invocation that also reports the process exit status, so
+ * `commitFacts` and `isAncestorOfTarget` can distinguish a proved absence
+ * (exit 1) from an infrastructure failure.
+ */
+export type GitFactsCommandResult =
+  | { readonly ok: true; readonly stdout: string }
+  | { readonly ok: false; readonly exitCode: number | undefined; readonly message: string }
+
+export type GitFactsCommandRunner = (
+  args: readonly string[],
+  cwd: string,
+) => Promise<GitFactsCommandResult>
+
+async function runGitDetailed(args: readonly string[], cwd: string): Promise<GitFactsCommandResult> {
+  try {
+    const { stdout } = await execFileAsync('git', args, { cwd, timeout: GIT_TIMEOUT_MS })
+    return { ok: true, stdout }
+  } catch (cause) {
+    if (cause !== null && typeof cause === 'object' && (cause as { code?: unknown }).code === 'ENOENT') {
+      return { ok: false, exitCode: undefined, message: 'the git CLI is not installed or not on PATH' }
+    }
+    const exitCode = (cause as { code?: unknown }).code
+    return {
+      ok: false,
+      exitCode: typeof exitCode === 'number' ? exitCode : undefined,
+      message: describe(cause),
+    }
+  }
+}
+
+function factsUnavailable(cause: string): Outcome<never, never, DeliveryFactsErrorCode> {
+  return error({ scope: 'operation', code: 'git-unavailable', reason: cause })
+}
+
+function factsFailed(reason: string): Outcome<never, never, DeliveryFactsErrorCode> {
+  return error({ scope: 'operation', code: 'git-failed', reason })
+}
+
+/** Read-only Git facts about the fetched remote target branch (§14). */
+export type GitDeliveryFactsAdapter = {
+  /** Fetch the remote target branch so later reads see current remote truth. */
+  fetchTarget(
+    root: string,
+    remote: string,
+    branch: string,
+  ): Promise<Outcome<void, never, DeliveryFactsErrorCode>>
+  /** The fetched tip SHA of `refs/remotes/<remote>/<branch>`. */
+  targetSha(
+    root: string,
+    remote: string,
+    branch: string,
+  ): Promise<Outcome<string, never, DeliveryFactsErrorCode>>
+  /** Commit tree and parents, or `undefined` when the object is absent. */
+  commitFacts(
+    root: string,
+    sha: string,
+  ): Promise<Outcome<DeliveryCommitFacts | undefined, never, DeliveryFactsErrorCode>>
+  /** Whether `sha` is an ancestor of the fetched target branch tip. */
+  isAncestorOfTarget(
+    root: string,
+    remote: string,
+    branch: string,
+    sha: string,
+  ): Promise<Outcome<boolean, never, DeliveryFactsErrorCode>>
+}
+
+/**
+ * The built-in production adapter over the `git` CLI. Each method is a
+ * read-only query; `fetchTarget` performs the one fetch that makes the
+ * object database current before shape and ancestry decisions (§13.3, §14).
+ */
+export function gitCliDeliveryFacts(
+  run: GitFactsCommandRunner = runGitDetailed,
+): GitDeliveryFactsAdapter {
+  return {
+    async fetchTarget(root, remote, branch) {
+      const result = await run(['fetch', remote, branch], root)
+      if (!result.ok) {
+        if (result.exitCode === undefined) return factsUnavailable(result.message)
+        return factsFailed(`git fetch ${remote} ${branch} failed: ${result.message}`)
+      }
+      return ok(undefined)
+    },
+
+    async targetSha(root, remote, branch) {
+      const ref = `refs/remotes/${remote}/${branch}`
+      const result = await run(['rev-parse', ref], root)
+      if (!result.ok) {
+        if (result.exitCode === undefined) return factsUnavailable(result.message)
+        return factsFailed(`git rev-parse ${ref} failed: ${result.message}`)
+      }
+      const sha = result.stdout.trim()
+      if (sha === '') return factsFailed(`git rev-parse ${ref} produced no output`)
+      return ok(sha)
+    },
+
+    async commitFacts(root, sha) {
+      const probe = await run(['rev-parse', '--verify', '--quiet', `${sha}^{commit}`], root)
+      if (!probe.ok) {
+        if (probe.exitCode === undefined) return factsUnavailable(probe.message)
+        if (probe.exitCode === 1) return ok(undefined) // proved absence, quiet flag
+        return factsFailed(`resolving ${sha} failed: ${probe.message}`)
+      }
+      const show = await run(['show', '-s', '--format=%T%n%P', sha], root)
+      if (!show.ok) {
+        if (show.exitCode === undefined) return factsUnavailable(show.message)
+        return factsFailed(`reading commit facts of ${sha} failed: ${show.message}`)
+      }
+      const [treeLine = '', parentLine = ''] = show.stdout.trimEnd().split('\n')
+      const treeOid = treeLine.trim()
+      if (treeOid === '') return factsFailed(`commit facts of ${sha} lack a tree`)
+      const parents = parentLine.split(' ').filter((parent) => parent !== '')
+      return ok({ treeOid, parents })
+    },
+
+    async isAncestorOfTarget(root, remote, branch, sha) {
+      const ref = `refs/remotes/${remote}/${branch}`
+      const result = await run(['merge-base', '--is-ancestor', sha, ref], root)
+      if (!result.ok) {
+        if (result.exitCode === undefined) return factsUnavailable(result.message)
+        if (result.exitCode === 1) return ok(false) // proved non-ancestry
+        return factsFailed(`git merge-base --is-ancestor ${sha} ${ref} failed: ${result.message}`)
+      }
+      return ok(true)
+    },
+  }
 }

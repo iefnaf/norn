@@ -8,9 +8,12 @@ import nornExtension from '../src/extension/index.ts'
 import { executeCheckCommand } from '../src/extension/check-command.ts'
 import type { CheckCommandAdapters } from '../src/extension/check-command.ts'
 import { fsControlStore } from '../src/control/control-store.ts'
-import type { GitRemote } from '../src/adapters/git-repository.ts'
+import type { GitRemote, GitDeliveryFactsAdapter } from '../src/adapters/git-repository.ts'
 import type { ResolvedGitHubRepository } from '../src/adapters/github-gateway.ts'
 import type { TaskMapLoadOutcome } from '../src/map/loader.ts'
+import type { IssueEvidenceReader } from '../src/evidence/read.ts'
+import type { ModelCatalogAdapter } from '../src/adapters/model-catalog.ts'
+import { makeDeliveryRecord, recordComment, fixtureTimeline, evidenceRead, BASE_SHA, BASE_TREE, DELIVERED_TREE, INTEGRATED_SHA } from './helpers/delivery-fixtures.ts'
 import { HOST, MAP_URL, REPO, member, memberA, memberB, rawLoad, rawRef } from './helpers/map-fixtures.ts'
 
 type RegisteredCommand = {
@@ -46,7 +49,21 @@ function notifyOnlyUi() {
 
 function fakeCtx(cwd: string, hasUI = true) {
   const { notifications, ui } = notifyOnlyUi()
-  return { notifications, ctx: { cwd, hasUI, ui } }
+  return {
+    notifications,
+    ctx: {
+      cwd,
+      hasUI,
+      ui,
+      modelRegistry: {
+        async refresh() {},
+        getAvailable: () => [
+          { id: 'model-x', name: 'Model X', provider: 'provider-a' },
+          { id: 'model-y', name: 'Model Y', provider: 'provider-b' },
+        ],
+      },
+    },
+  }
 }
 
 const REPOSITORY: ResolvedGitHubRepository = {
@@ -72,8 +89,16 @@ const VALID_CONFIG = `${JSON.stringify(
 
 const REMOTES: readonly GitRemote[] = [{ name: 'origin', url: 'https://github.com/acme/widget.git' }]
 
-function fakeAdapters(nornHome: string, readonlyScript: readonly TaskMapLoadOutcome[] = []): CheckCommandAdapters {
+function fakeAdapters(
+  nornHome: string,
+  readonlyScript: readonly TaskMapLoadOutcome[] = [],
+  options: { catalogModels?: readonly { id: string; family: string }[] } = {},
+): CheckCommandAdapters {
   const script = [...readonlyScript]
+  const catalogModels = options.catalogModels ?? [
+    { id: 'provider-a/model-x', family: 'provider-a' },
+    { id: 'provider-b/model-y', family: 'provider-b' },
+  ]
   return {
     git: {
       async resolveRoot(cwd: string) {
@@ -98,6 +123,44 @@ function fakeAdapters(nornHome: string, readonlyScript: readonly TaskMapLoadOutc
         return outcome
       },
     },
+    catalog: {
+      async listModels() {
+        return {
+          kind: 'ok' as const,
+          value: catalogModels.map((model) => ({
+            id: model.id,
+            family: model.family,
+            displayName: model.id,
+            thinkingLevels: ['off'] as const,
+          })),
+        }
+      },
+    } satisfies ModelCatalogAdapter,
+    evidence: {
+      async loadIssueEvidence() {
+        return { kind: 'ok' as const, value: { comments: [], timeline: [] } }
+      },
+    } satisfies IssueEvidenceReader,
+    gitFacts: {
+      async fetchTarget() {
+        return { kind: 'ok' as const, value: undefined }
+      },
+      async targetSha() {
+        return { kind: 'ok' as const, value: `sha1:${'f'.repeat(40)}` }
+      },
+      async commitFacts(_root: string, sha: string) {
+        if (sha === INTEGRATED_SHA) {
+          return { kind: 'ok' as const, value: { treeOid: DELIVERED_TREE, parents: [BASE_SHA] } }
+        }
+        if (sha === BASE_SHA) {
+          return { kind: 'ok' as const, value: { treeOid: BASE_TREE, parents: [] } }
+        }
+        return { kind: 'ok' as const, value: undefined }
+      },
+      async isAncestorOfTarget(_root: string, _remote: string, _branch: string, sha: string) {
+        return { kind: 'ok' as const, value: sha === INTEGRATED_SHA || sha === BASE_SHA }
+      },
+    } satisfies GitDeliveryFactsAdapter,
     store: fsControlStore(nornHome),
   }
 }
@@ -196,6 +259,88 @@ describe('executeCheckCommand — rendering the typed outcome', () => {
         await executeCheckCommand(ctx, MAP_URL, adapters)
         assert.equal(notifications[0]?.level, 'warning')
         assert.match(notifications[0]!.message, /Norn check error \(github-unavailable\)/)
+      } finally {
+        rmSync(repo, { recursive: true, force: true })
+      }
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('renders the closed-member delivery-evidence finding with its violations and remedies', async () => {
+    const { nornHome, cleanup } = await initializedHome()
+    try {
+      const repo = mkdtempSync(join(tmpdir(), 'norn-check-cwd-'))
+      try {
+        const closedA = { ...memberA(), state: 'CLOSED' as const }
+        const load = rawLoad([closedA, memberB()])
+        const adapters = fakeAdapters(nornHome, [okLoad(load), okLoad(load)])
+        const { notifications, ctx } = fakeCtx(repo)
+        await executeCheckCommand(ctx, MAP_URL, adapters)
+        const message = notifications[0]!.message
+        assert.match(message, /member #1 \[closed\] fails delivery-evidence validation/)
+        assert.match(message, /no valid Norn delivery record exists for this closed ticket/)
+        assert.match(message, /operator remedies: reopen the ticket for fresh Work; or remove the cancelled ticket from the map; or restore the recorded facts/)
+      } finally {
+        rmSync(repo, { recursive: true, force: true })
+      }
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('renders the open-member-with-record finding with its specific remedies', async () => {
+    const { nornHome, cleanup } = await initializedHome()
+    try {
+      const repo = mkdtempSync(join(tmpdir(), 'norn-check-cwd-'))
+      try {
+        const load = rawLoad([memberA(), memberB()])
+        const record = makeDeliveryRecord({ actorId: 'MDQ6VXlcjIxMzY3' })
+        const adapters = {
+          ...fakeAdapters(nornHome, [okLoad(load), okLoad(load)]),
+          evidence: {
+            async loadIssueEvidence(locator: { url: string }) {
+              if (locator.url.endsWith('/issues/1')) {
+                return {
+                  kind: 'ok' as const,
+                  value: evidenceRead(
+                    [recordComment(record, { authorId: 'MDQ6VXlcjIxMzY3' })],
+                    fixtureTimeline(['C1']),
+                  ),
+                }
+              }
+              return { kind: 'ok' as const, value: { comments: [], timeline: [] } }
+            },
+          },
+        }
+        const { notifications, ctx } = fakeCtx(repo)
+        await executeCheckCommand(ctx, MAP_URL, adapters)
+        const message = notifications[0]!.message
+        assert.match(message, /member #1 is open but carries otherwise-valid delivery evidence/)
+        assert.match(message, /blocked, not silently re-worked/)
+        assert.match(message, /operator remedies: reclose the ticket; or change the ticket specification before new Work/)
+      } finally {
+        rmSync(repo, { recursive: true, force: true })
+      }
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('renders model-availability findings for both configured models', async () => {
+    const { nornHome, cleanup } = await initializedHome()
+    try {
+      const repo = mkdtempSync(join(tmpdir(), 'norn-check-cwd-'))
+      try {
+        const load = rawLoad([memberA(), memberB()])
+        const adapters = fakeAdapters(nornHome, [okLoad(load), okLoad(load)], {
+          catalogModels: [{ id: 'provider-a/model-x', family: 'provider-a' }],
+        })
+        const { notifications, ctx } = fakeCtx(repo)
+        await executeCheckCommand(ctx, MAP_URL, adapters)
+        const message = notifications[0]!.message
+        assert.match(message, /Norn check found 1 finding\(s\)/)
+        assert.match(message, /the reviewer model "provider-b\/model-y" is not in the authenticated model catalog/)
       } finally {
         rmSync(repo, { recursive: true, force: true })
       }

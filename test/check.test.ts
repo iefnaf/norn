@@ -5,9 +5,11 @@ import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
 import { isBlocked, isError, isOk, blocked, error } from '../src/core/outcome.ts'
-import type { GitRemote, GitRepositoryAdapter } from '../src/adapters/git-repository.ts'
+import type { GitRemote, GitRepositoryAdapter, GitDeliveryFactsAdapter } from '../src/adapters/git-repository.ts'
 import type { GitHubGatewayAdapter } from '../src/adapters/github-gateway.ts'
 import type { ResolvedGitHubRepository } from '../src/adapters/github-gateway.ts'
+import type { ModelCatalogAdapter } from '../src/adapters/model-catalog.ts'
+import type { IssueEvidenceReader, IssueEvidenceReadOutcome } from '../src/evidence/read.ts'
 import type { TaskMapLoader, TaskMapLoadOutcome } from '../src/map/loader.ts'
 import type { LocalControlStore } from '../src/control/control-store.ts'
 import { fsControlStore } from '../src/control/control-store.ts'
@@ -132,6 +134,73 @@ function readOnlyStore(store: LocalControlStore): LocalControlStore & { writes: 
   }
 }
 
+/** A catalog containing exactly the two models the valid config names. */
+function fakeCatalog(models: readonly { id: string; family: string }[] = [
+  { id: 'provider-a/model-x', family: 'provider-a' },
+  { id: 'provider-b/model-y', family: 'provider-b' },
+]): ModelCatalogAdapter & { models: readonly { id: string; family: string }[] } {
+  return {
+    models,
+    async listModels() {
+      return {
+        kind: 'ok' as const,
+        value: models.map((model) => ({
+          id: model.id,
+          family: model.family,
+          displayName: model.id,
+          thinkingLevels: ['off', 'medium', 'high'] as const,
+        })),
+      }
+    },
+  }
+}
+
+/** An evidence reader answering from per-issue scripts; empty by default. */
+function fakeEvidenceReader(
+  reads: ReadonlyMap<string, IssueEvidenceReadOutcome> = new Map(),
+): IssueEvidenceReader & { requested: string[] } {
+  const requested: string[] = []
+  return {
+    requested,
+    async loadIssueEvidence(locator) {
+      requested.push(locator.url)
+      const outcome = reads.get(locator.url)
+      if (outcome !== undefined) return outcome
+      return { kind: 'ok' as const, value: { comments: [], timeline: [] } }
+    },
+  }
+}
+
+/** Git delivery facts answering from plain data; nothing fetched by default. */
+function fakeGitFacts(
+  data: {
+    targetSha?: string
+    commits?: Record<string, { treeOid: string; parents: readonly string[] }>
+    ancestors?: readonly string[]
+  } = {},
+): GitDeliveryFactsAdapter & { fetched: string[] } {
+  const fetched: string[] = []
+  const commits = new Map(Object.entries(data.commits ?? {}))
+  const ancestors = new Set(data.ancestors ?? [])
+  return {
+    fetched,
+    async fetchTarget(_root, remote, branch) {
+      fetched.push(`${remote}/${branch}`)
+      return { kind: 'ok' as const, value: undefined }
+    },
+    async targetSha(_root, _remote, branch) {
+      return { kind: 'ok' as const, value: data.targetSha ?? `sha1:${'f'.repeat(40)}` }
+    },
+    async commitFacts(_root, sha) {
+      const facts = commits.get(sha)
+      return { kind: 'ok' as const, value: facts }
+    },
+    async isAncestorOfTarget(_root, _remote, _branch, sha) {
+      return { kind: 'ok' as const, value: ancestors.has(sha) }
+    },
+  }
+}
+
 type Harness = {
   cwd: string
   nornHome: string
@@ -139,6 +208,9 @@ type Harness = {
   gateway: GitHubGatewayAdapter & { calls: number }
   loader: TaskMapLoader & { calls: number }
   store: LocalControlStore & { writes: string[] }
+  catalog: ModelCatalogAdapter
+  evidence: IssueEvidenceReader
+  gitFacts: GitDeliveryFactsAdapter
   readonly filesBefore: readonly string[]
   cleanup: () => void
 }
@@ -149,6 +221,9 @@ async function setup(options: {
   gateway?: 'ok' | 'not-found' | 'unauthenticated' | 'unavailable'
   git?: GitRepositoryAdapter
   loaderScript?: readonly TaskMapLoadOutcome[]
+  catalog?: ModelCatalogAdapter
+  evidence?: IssueEvidenceReader
+  gitFacts?: GitDeliveryFactsAdapter
 } = {}): Promise<Harness> {
   const nornHome = mkdtempSync(join(tmpdir(), 'norn-check-home-'))
   const cwd = mkdtempSync(join(tmpdir(), 'norn-check-cwd-'))
@@ -178,6 +253,9 @@ async function setup(options: {
     gateway,
     loader,
     store,
+    catalog: options.catalog ?? fakeCatalog(),
+    evidence: options.evidence ?? fakeEvidenceReader(),
+    gitFacts: options.gitFacts ?? fakeGitFacts(),
     filesBefore,
     cleanup: () => {
       rmSync(nornHome, { recursive: true, force: true })

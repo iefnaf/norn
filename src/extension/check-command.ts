@@ -8,8 +8,10 @@
  */
 import { homedir } from 'node:os'
 
-import { ghCliGateway, ghApiTaskMapLoader } from '../adapters/github-gateway.ts'
-import { gitCliRepository } from '../adapters/git-repository.ts'
+import { ghApiEvidenceReader, ghCliGateway, ghApiTaskMapLoader } from '../adapters/github-gateway.ts'
+import { gitCliDeliveryFacts, gitCliRepository } from '../adapters/git-repository.ts'
+import { registryModelCatalog } from '../adapters/model-catalog.ts'
+import type { ModelRegistryLike } from '../adapters/model-catalog.ts'
 import { fsControlStore } from '../control/control-store.ts'
 import { resolveNornHome } from '../config/paths.ts'
 import { checkMap } from '../runner/check.ts'
@@ -21,6 +23,7 @@ import { renderCheckOutcome } from './render.ts'
 export type CheckCommandContext = {
   readonly cwd: string
   readonly ui: Pick<DialogUi, 'notify'>
+  readonly modelRegistry: ModelRegistryLike
 }
 
 /** The adapter half of `CheckMapDeps`. */
@@ -28,14 +31,18 @@ export type CheckCommandAdapters = Omit<CheckMapDeps, 'cwd'>
 
 /**
  * Build the built-in production adapters: the `git` and `gh` CLIs, the
- * GraphQL-backed Task Map loader, and the filesystem Local control store
- * under Norn home, honoring `PI_CODING_AGENT_DIR` (design.md §2.2).
+ * GraphQL-backed Task Map loader and evidence reader, the Pi model registry,
+ * read-only Git delivery facts, and the filesystem Local control store under
+ * Norn home, honoring `PI_CODING_AGENT_DIR` (design.md §2.2).
  */
-export function productionCheckAdapters(): CheckCommandAdapters {
+export function productionCheckAdapters(ctx: CheckCommandContext): CheckCommandAdapters {
   return {
     git: gitCliRepository(),
     gateway: ghCliGateway(),
     loader: ghApiTaskMapLoader(),
+    catalog: registryModelCatalog(ctx.modelRegistry),
+    evidence: ghApiEvidenceReader(),
+    gitFacts: gitCliDeliveryFacts(),
     store: fsControlStore(resolveNornHome(process.env, homedir())),
   }
 }
@@ -48,7 +55,7 @@ export function productionCheckAdapters(): CheckCommandAdapters {
 export async function executeCheckCommand(
   ctx: CheckCommandContext,
   mapUrl: string,
-  adapters: CheckCommandAdapters = productionCheckAdapters(),
+  adapters: CheckCommandAdapters = productionCheckAdapters(ctx),
 ): Promise<void> {
   const outcome = await checkMap({ cwd: ctx.cwd, ...adapters }, mapUrl)
   ctx.ui.notify(renderCheckOutcome(outcome), outcome.kind === 'ok' ? 'info' : 'warning')

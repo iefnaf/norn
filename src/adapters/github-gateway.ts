@@ -19,6 +19,13 @@ import { promisify } from 'node:util'
 
 import { blocked, error, ok } from '../core/outcome.ts'
 import type { Outcome } from '../core/outcome.ts'
+import type {
+  IssueEvidenceComment,
+  IssueEvidenceRead,
+  IssueEvidenceReadOutcome,
+  IssueEvidenceReader,
+  IssueTimelineEvent,
+} from '../evidence/read.ts'
 import type { MapIssueLocator } from '../map/issue-url.ts'
 import { parseIssueUrl } from '../map/issue-url.ts'
 import type {
@@ -660,6 +667,161 @@ export function ghApiTaskMapLoader(run: GhCommandRunner = runGh): TaskMapLoader 
         blockers: mapBlockers.value,
       }
       return ok({ map, members })
+    },
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Issue evidence reads (design.md §14): complete comments plus timeline.
+// ---------------------------------------------------------------------------
+
+const ACTOR_ID_FIELDS = '... on User { id } ... on Bot { id } ... on Organization { id }'
+
+const ISSUE_COMMENTS_QUERY = `
+query NornIssueComments($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      comments(first: ${MAP_PAGE_SIZE}, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id body author { ${ACTOR_ID_FIELDS} } }
+      }
+    }
+  }
+}`
+
+const ISSUE_TIMELINE_QUERY = `
+query NornIssueTimeline($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      timelineItems(first: ${MAP_PAGE_SIZE}, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          __typename
+          ... on IssueComment { id }
+          ... on ClosedEvent { id actor { ${ACTOR_ID_FIELDS} } }
+          ... on ReopenedEvent { id actor { ${ACTOR_ID_FIELDS} } }
+        }
+      }
+    }
+  }
+}`
+
+/** The node ID of an `author`/`actor` selection, or `null` when absent. */
+function actorNodeId(node: unknown): string | null {
+  if (!isRecord(node)) return null
+  return typeof node.id === 'string' && node.id !== '' ? node.id : null
+}
+
+/** One `{ id body author { id } }` comment node into an evidence comment. */
+function evidenceComment(node: unknown): IssueEvidenceComment | undefined {
+  if (!isRecord(node)) return undefined
+  if (typeof node.id !== 'string' || node.id === '' || typeof node.body !== 'string') {
+    return undefined
+  }
+  return { commentId: node.id, authorId: actorNodeId(node.author), body: node.body }
+}
+
+/** One timeline node into the evidence event vocabulary. */
+function evidenceTimelineEvent(node: unknown): IssueTimelineEvent | undefined {
+  if (!isRecord(node)) return undefined
+  const eventId = typeof node.id === 'string' ? node.id : ''
+  switch (node.__typename) {
+    case 'IssueComment':
+      return typeof node.id === 'string' && node.id !== ''
+        ? { kind: 'commented', eventId: node.id, commentId: node.id }
+        : undefined
+    case 'ClosedEvent':
+      return { kind: 'closed', eventId, actorId: actorNodeId(node.actor) }
+    case 'ReopenedEvent':
+      return { kind: 'reopened', eventId, actorId: actorNodeId(node.actor) }
+    default:
+      return { kind: 'other', eventId }
+  }
+}
+
+type EvidenceLoadStep<T> = Outcome<T, 'repository-not-found' | 'issue-not-found' | 'github-unauthenticated', 'github-unavailable'>
+
+/**
+ * Collect every node of the issue's `comments` or `timelineItems`
+ * connection, following the `endCursor` until `hasNextPage` is false. One
+ * GraphQL request per page; uniqueness and chronology are decided by the
+ * caller only over the complete result (§14).
+ */
+async function collectEvidenceNodes(
+  run: GhCommandRunner,
+  host: string,
+  query: string,
+  base: { owner: string; name: string; number: number },
+  field: 'comments' | 'timelineItems',
+): Promise<EvidenceLoadStep<readonly unknown[]>> {
+  const nodes: unknown[] = []
+  let after: string | undefined
+  for (;;) {
+    const variables: Record<string, string | number> = { ...base }
+    if (after !== undefined) variables.after = after
+    const outcome = await runGraphQL(run, host, query, variables)
+    if (outcome.kind !== 'ok') return outcome
+    const repository = repositoryNode(outcome.value)
+    if (repository.kind !== 'ok') return repository
+    const issue = issueNode(repository.value)
+    if (issue.kind !== 'ok') return issue
+    const connection = issue.value[field]
+    if (!isRecord(connection) || !isRecord(connection.pageInfo) || !Array.isArray(connection.nodes)) {
+      return unavailable(`graphql ${field} connection is malformed`)
+    }
+    nodes.push(...connection.nodes)
+    const hasNextPage = connection.pageInfo.hasNextPage === true
+    const endCursor = typeof connection.pageInfo.endCursor === 'string' ? connection.pageInfo.endCursor : null
+    if (!hasNextPage || endCursor === null) return ok(nodes)
+    after = endCursor
+  }
+}
+
+/**
+ * The built-in production evidence reader over the authenticated `gh` CLI:
+ * one complete comments read plus one complete timeline read per call, every
+ * pagination cursor followed. Reads only — no shared writes.
+ */
+export function ghApiEvidenceReader(run: GhCommandRunner = runGh): IssueEvidenceReader {
+  return {
+    async loadIssueEvidence(locator): Promise<IssueEvidenceReadOutcome> {
+      const url = parseIssueUrl(locator.url)
+      if (url === undefined || url.number !== locator.number) {
+        return unavailable(`issue URL "${locator.url}" is not a full GitHub issue URL`)
+      }
+      const base = { owner: url.owner, name: url.name, number: url.number }
+
+      const commentNodes = await collectEvidenceNodes(
+        run,
+        locator.githubHost,
+        ISSUE_COMMENTS_QUERY,
+        base,
+        'comments',
+      )
+      if (commentNodes.kind !== 'ok') return commentNodes
+      const comments: IssueEvidenceComment[] = []
+      for (const node of commentNodes.value) {
+        const comment = evidenceComment(node)
+        if (comment === undefined) return unavailable('graphql comment node is malformed')
+        comments.push(comment)
+      }
+
+      const timelineNodes = await collectEvidenceNodes(
+        run,
+        locator.githubHost,
+        ISSUE_TIMELINE_QUERY,
+        base,
+        'timelineItems',
+      )
+      if (timelineNodes.kind !== 'ok') return timelineNodes
+      const timeline: IssueTimelineEvent[] = []
+      for (const node of timelineNodes.value) {
+        const event = evidenceTimelineEvent(node)
+        if (event === undefined) return unavailable('graphql timeline node is malformed')
+        timeline.push(event)
+      }
+
+      return ok({ comments, timeline })
     },
   }
 }

@@ -49,7 +49,10 @@ export default function (pi: ExtensionAPI): void {
               ctx.ui.notify(renderCheckTakesOneMapUrl(), 'warning')
               return
             }
-            await executeCheckCommand({ cwd: ctx.cwd, ui: ctx.ui }, invocation.args)
+            await executeCheckCommand(
+              { cwd: ctx.cwd, ui: ctx.ui, modelRegistry: ctx.modelRegistry },
+              invocation.args,
+            )
           } else if (invocation.subcommand.name === 'status') {
             if (invocation.args === '' || /\s/.test(invocation.args)) {
               ctx.ui.notify(renderStatusTakesMapUrl(), 'warning')

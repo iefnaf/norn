@@ -5,6 +5,7 @@ import type { NornCommandSummary, NornSubcommandInfo } from '../runner/commands.
 import type { InitOutcome } from '../runner/init.ts'
 import type { CheckMapFinding, CheckMapOutcome } from '../runner/check.ts'
 import type { TopologyFinding } from '../map/snapshot.ts'
+import type { DeliveryEvidenceFinding, DeliveryRemedy } from '../evidence/delivery.ts'
 import type { StatusOutcome } from '../runner/status.ts'
 import type { RunState, TicketRunState } from '../runstate/types.ts'
 import { isSha256Digest } from '../core/digest.ts'
@@ -78,6 +79,61 @@ export function renderCheckTakesOneMapUrl(): string {
   ].join('\n')
 }
 
+function renderDeliveryFinding(finding: DeliveryEvidenceFinding): string {
+  switch (finding.code) {
+    case 'invalid-envelope':
+      return `comment ${finding.commentId}: invalid norn:record envelope — ${finding.reason}`
+    case 'invalid-record':
+      return `comment ${finding.commentId}: invalid norn-delivery:v1 record — ${finding.problems.join('; ')}`
+    case 'delivery-id-mismatch':
+      return `comment ${finding.commentId}: deliveryId does not recompute from the sealed record`
+    case 'divergent-duplicate':
+      return `deliveryId ${finding.deliveryId} appears with divergent content in comments ${finding.commentIds.join(', ')}`
+    case 'ambiguous-records':
+      return `distinct valid delivery records exist (${finding.deliveryIds.join(', ')}) for the current ticket revision`
+    case 'no-valid-record':
+      return 'no valid Norn delivery record exists for this closed ticket'
+    case 'stale-ticket-revision':
+      return `the ticket revision changed since delivery (current ${finding.currentRevision}; recorded ${finding.recordedRevisions.join(', ')})`
+    case 'ticket-open':
+      return 'the ticket is open but a delivery record exists that satisfies every other predicate'
+    case 'identity-mismatch':
+      return `the record ${finding.detail === 'map' ? 'names a different map' : finding.detail === 'ticket' ? 'names a different ticket' : finding.detail === 'repository' ? 'names a different repository' : 'names a different target branch'} (expected ${finding.expected}, recorded ${finding.recorded})`
+    case 'author-mismatch':
+      return `the record comment author (${finding.commentAuthorId ?? 'none'}) does not equal the recorded actor ${finding.actorId}`
+    case 'untrusted-author':
+      return `the recorded actor ${finding.actorId} is not in trustedEvidenceAuthorIds`
+    case 'missing-closing-event':
+      return 'the timeline shows no current closing event for this closed ticket'
+    case 'record-not-in-timeline':
+      return `comment ${finding.commentId} does not appear in the issue timeline`
+    case 'record-after-close':
+      return `the delivery record comment follows the current closing event ${finding.closingEventId}`
+    case 'invalid-gate':
+      return `the sealed evidence gate is invalid — ${finding.problems.join('; ')}`
+    case 'reviewer-gate-mismatch':
+      return 'the passing review does not exactly match the gate reviewer'
+    case 'review-binding-mismatch':
+      return `the review binds a different ${finding.detail} than the record`
+    case 'tests-gate-mismatch':
+      return `the ordered test evidence does not realize the sealed gate tests — ${finding.problems.join('; ')}`
+    case 'wrong-integration-shape':
+      return `the integrated commit has the wrong shape — ${finding.detail}`
+    case 'integrated-commit-absent':
+      return `the integrated commit ${finding.integratedSha} is absent from the fetched history`
+    case 'not-target-ancestor':
+      return `the integrated commit ${finding.integratedSha} is not an ancestor of the current target branch (${finding.targetSha})`
+  }
+}
+
+const DELIVERY_REMEDY_LABELS: Readonly<Record<DeliveryRemedy, string>> = {
+  'reopen-for-fresh-work': 'reopen the ticket for fresh Work',
+  'remove-from-map': 'remove the cancelled ticket from the map',
+  'restore-recorded-facts': 'restore the recorded facts',
+  'reclose-ticket': 'reclose the ticket',
+  'change-ticket-specification': 'change the ticket specification before new Work',
+}
+
 function renderTopologyFinding(finding: TopologyFinding): string {
   switch (finding.code) {
     case 'map-has-no-members':
@@ -132,6 +188,33 @@ function renderCheckFinding(finding: CheckMapFinding): string {
       ].join('\n')
     case 'changed-input':
       return 'the Task Map kept changing across complete reads (changed-input); retry once edits settle'
+    case 'model-unavailable':
+      return `the ${finding.role} model "${finding.model}" is not in the authenticated model catalog`
+    case 'model-family-conflict':
+      return `worker (${finding.workerModel}) and reviewer (${finding.reviewerModel}) must resolve to different provider families (both are "${finding.family}")`
+    case 'delivery-evidence': {
+      const onlyOpenRecord =
+        finding.ticketState === 'OPEN' &&
+        finding.findings.length === 1 &&
+        finding.findings[0]!.code === 'ticket-open'
+      const header = onlyOpenRecord
+        ? `member #${finding.ticket.number} is open but carries otherwise-valid delivery evidence; it is blocked, not silently re-worked:`
+        : `member #${finding.ticket.number} [${finding.ticketState.toLowerCase()}] fails delivery-evidence validation:`
+      const lines = [header]
+      for (const violation of finding.findings) {
+        lines.push(`  - ${renderDeliveryFinding(violation)}`)
+      }
+      lines.push(
+        `  operator remedies: ${finding.remedies.map((remedy) => DELIVERY_REMEDY_LABELS[remedy]).join('; or ')}`,
+      )
+      return lines.join('\n')
+    }
+    case 'state-not-resumable':
+      return `existing run state (${finding.runId}) is not resumable by this invocation: ${finding.mismatches.join(' and ')} differ; restore them or abort the run before starting a new one`
+    case 'ticket-claimed-by-active-run':
+      return `member ticket(s) ${finding.ticketIssueIds.join(', ')} are already claimed by active run ${finding.runId} (map #${finding.mapNumber})`
+    case 'incompatible-active-run':
+      return `active run ${finding.runId} (map #${finding.mapNumber}) uses a different ${finding.mismatches.join(' and ')}; all concurrent runs in a repository must share them`
   }
 }
 
