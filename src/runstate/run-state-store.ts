@@ -882,7 +882,9 @@ function checkRunReport(value: unknown, where: string, violations: string[]): vo
         violations.push(`${where}.tickets[${index}] must be an object`)
         return
       }
-      checkKeys(entry, ['ticket', 'state'], `${where}.tickets[${index}]`, violations)
+      checkKeys(entry, ['ticket', 'state'], `${where}.tickets[${index}]`, violations, {
+        allowOptional: ['code'],
+      })
       checkStableIssueRef(entry.ticket, 'ticket', `${where}.tickets[${index}].ticket`, violations)
       checkEnum(
         entry.state,

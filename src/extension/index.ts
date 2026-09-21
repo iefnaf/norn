@@ -9,11 +9,13 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 import { commandSummary, parseNornInvocation } from '../runner/commands.ts'
 import { executeCheckCommand } from './check-command.ts'
 import { executeInitCommand } from './init-command.ts'
+import { executeRunCommand } from './run-command.ts'
 import { executeStatusCommand } from './status-command.ts'
 import {
   renderCheckTakesOneMapUrl,
   renderInitTakesNoArguments,
   renderPending,
+  renderRunTakesOneMapUrl,
   renderStatusTakesMapUrl,
   renderSummary,
   renderUnknown,
@@ -50,6 +52,15 @@ export default function (pi: ExtensionAPI): void {
               return
             }
             await executeCheckCommand(
+              { cwd: ctx.cwd, ui: ctx.ui, modelRegistry: ctx.modelRegistry },
+              invocation.args,
+            )
+          } else if (invocation.subcommand.name === 'run') {
+            if (invocation.args === '' || /\s/.test(invocation.args)) {
+              ctx.ui.notify(renderRunTakesOneMapUrl(), 'warning')
+              return
+            }
+            await executeRunCommand(
               { cwd: ctx.cwd, ui: ctx.ui, modelRegistry: ctx.modelRegistry },
               invocation.args,
             )

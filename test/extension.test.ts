@@ -93,11 +93,13 @@ describe('subcommand routing before implementation', () => {
     const pi = registeredNorn()
     const { ctx, notifications } = fakeCtx(true)
 
-    await pi.commands[0]!.def.handler('run https://github.com/o/r/issues/1', ctx)
+    // `run` is implemented (ticket #13); `abort` is the remaining pending
+    // subcommand.
+    await pi.commands[0]!.def.handler('abort https://github.com/o/r/issues/1', ctx)
 
     assert.equal(notifications.length, 1)
     assert.match(notifications[0]!.message, /not implemented yet/)
-    assert.match(notifications[0]!.message, /run/)
+    assert.match(notifications[0]!.message, /abort/)
   })
 
   it('shows the summary again after unknown input', async () => {

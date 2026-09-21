@@ -393,6 +393,15 @@ export async function checkMap(deps: CheckMapDeps, mapUrl: string): Promise<Chec
         if (repositoryRoot !== undefined && matchingRemoteName !== undefined) {
           const targetBranch = report.config.config.targetBranch
           let targetFetched = false
+          // Records store object-format-prefixed Git OIDs (§10.3) while the
+          // adapter speaks raw hex: strip inputs and re-prefix outputs so the
+          // §14 comparisons bind exactly.
+          const stripOid = (oid: string): string => {
+            const separator = oid.indexOf(':')
+            return separator === -1 ? oid : oid.slice(separator + 1)
+          }
+          const reprefix = (sample: string, value: string): string =>
+            /:/.test(value) ? value : `${sample.slice(0, sample.indexOf(':'))}:${value}`
           const facts: DeliveryTargetFacts = {
             async targetSha(branch) {
               if (!targetFetched) {
@@ -402,9 +411,16 @@ export async function checkMap(deps: CheckMapDeps, mapUrl: string): Promise<Chec
               }
               return deps.gitFacts.targetSha(repositoryRoot, matchingRemoteName, branch)
             },
-            commitFacts: (sha) => deps.gitFacts.commitFacts(repositoryRoot, sha),
+            commitFacts: async (sha) => {
+              const read = await deps.gitFacts.commitFacts(repositoryRoot, stripOid(sha))
+              if (read.kind !== 'ok' || read.value === undefined) return read
+              return ok({
+                treeOid: reprefix(sha, read.value.treeOid),
+                parents: read.value.parents.map((parent) => reprefix(sha, parent)),
+              })
+            },
             isAncestorOfTarget: (sha, branch) =>
-              deps.gitFacts.isAncestorOfTarget(repositoryRoot, matchingRemoteName, branch, sha),
+              deps.gitFacts.isAncestorOfTarget(repositoryRoot, matchingRemoteName, branch, stripOid(sha)),
           }
 
           for (const ticket of report.snapshot.tickets) {

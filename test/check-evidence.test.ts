@@ -169,6 +169,9 @@ async function setup(options: TestSetup = {}): Promise<Harness & CheckMapDepsLik
 
   const gitFactsCalls: string[] = []
   const ancestors = new Set(options.gitFacts?.ancestors ?? [INTEGRATED_SHA, BASE_SHA, TIP_SHA])
+  // The fixture data is keyed by object-format-prefixed OIDs; canonicalize
+  // incoming OIDs so both prefixed and raw-hex callers find it.
+  const canon = (oid: string): string => (oid.includes(':') ? oid : `sha1:${oid}`)
   const gitFacts: GitDeliveryFactsAdapter = {
     async fetchTarget(_root, remote, branch) {
       gitFactsCalls.push(`fetch:${remote}/${branch}`)
@@ -177,7 +180,8 @@ async function setup(options: TestSetup = {}): Promise<Harness & CheckMapDepsLik
     async targetSha() {
       return { kind: 'ok' as const, value: TIP_SHA }
     },
-    async commitFacts(_root, sha) {
+    async commitFacts(_root, rawSha) {
+      const sha = canon(rawSha)
       gitFactsCalls.push(`commit:${sha}`)
       if (sha === INTEGRATED_SHA) {
         return { kind: 'ok' as const, value: { treeOid: DELIVERED_TREE, parents: [BASE_SHA] } }
@@ -187,7 +191,8 @@ async function setup(options: TestSetup = {}): Promise<Harness & CheckMapDepsLik
       }
       return { kind: 'ok' as const, value: undefined }
     },
-    async isAncestorOfTarget(_root, _remote, _branch, sha) {
+    async isAncestorOfTarget(_root, _remote, _branch, rawSha) {
+      const sha = canon(rawSha)
       gitFactsCalls.push(`ancestor:${sha}`)
       return { kind: 'ok' as const, value: ancestors.has(sha) }
     },

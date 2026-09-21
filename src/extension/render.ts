@@ -7,7 +7,8 @@ import type { CheckMapFinding, CheckMapOutcome } from '../runner/check.ts'
 import type { TopologyFinding } from '../map/snapshot.ts'
 import type { DeliveryEvidenceFinding, DeliveryRemedy } from '../evidence/delivery.ts'
 import type { StatusOutcome } from '../runner/status.ts'
-import type { RunState, TicketRunState } from '../runstate/types.ts'
+import type { RunMapOutcome } from '../run/lifecycle.ts'
+import type { RunReport, RunState, TicketRunState } from '../runstate/types.ts'
 import { isSha256Digest } from '../core/digest.ts'
 
 export function renderSummary(summary: NornCommandSummary): string {
@@ -371,4 +372,59 @@ export function renderStatusOutcome(outcome: StatusOutcome): string {
     return `Norn status blocked (${outcome.code}): ${outcome.reason}`
   }
   return `Norn status error (${outcome.code}): ${outcome.reason}`
+}
+
+/** `/norn run` takes exactly one full map URL. */
+export function renderRunTakesOneMapUrl(): string {
+  return [
+    '/norn run takes exactly one full GitHub issue URL:',
+    '/norn run https://<host>/<owner>/<repository>/issues/<number>',
+  ].join('\n')
+}
+
+function renderReportTickets(report: RunReport): string[] {
+  const lines: string[] = []
+  for (const entry of report.tickets) {
+    lines.push(
+      `  #${entry.ticket.number} [${entry.state}${entry.code === undefined ? '' : ` (${entry.code})`}]`,
+    )
+  }
+  return lines
+}
+
+/** Render the typed `/norn run` outcome: the terminal RunReport for the operator. */
+export function renderRunOutcome(outcome: RunMapOutcome): string {
+  if (outcome.kind === 'error') {
+    const recoverable = outcome.sharedWrite !== 'none'
+    return [
+      `Norn run error (${outcome.code}): ${outcome.reason}`,
+      recoverable
+        ? `sharedWrite ${outcome.sharedWrite}: the run remains "running" and resumable — the next compatible /norn run resumes the same run ID`
+        : 'sharedWrite none: the run recorded a terminal error report',
+    ].join('\n')
+  }
+  const report: RunReport | undefined =
+    outcome.kind === 'ok' ? outcome.value : (outcome.evidence[0] as RunReport | undefined)
+  if (report === undefined || typeof report.runId !== 'string') {
+    return outcome.kind === 'ok'
+      ? 'Norn run passed.'
+      : `Norn run blocked (${(outcome as { readonly code: string }).code}): ${(outcome as { readonly reason: string }).reason}`
+  }
+  const lines = [
+    `Norn run ${report.label}${report.code === undefined ? '' : ` (${report.code})`} — run ${report.runId}`,
+    `Map revisions: ${report.initialMapRevision} → ${report.finalMapRevision} (${report.acceptedExtensions.length} accepted extension(s))`,
+    `sharedWrite: ${report.sharedWrite}${report.completionSha === undefined ? '' : ` · completionSha ${report.completionSha}`}`,
+    `Tickets (${report.tickets.length}):`,
+    ...renderReportTickets(report),
+  ]
+  if (report.retainedWorkspace !== undefined) {
+    lines.push(`Retained workspace: ${report.retainedWorkspace.path}`)
+  }
+  if (report.warnings.length > 0) {
+    lines.push(`Warnings: ${report.warnings.join(' | ')}`)
+  }
+  if (outcome.kind === 'blocked') {
+    lines.push(`Reason: ${outcome.reason}`)
+  }
+  return lines.join('\n')
 }

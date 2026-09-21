@@ -148,7 +148,8 @@ function fakeAdapters(
       async targetSha() {
         return { kind: 'ok' as const, value: `sha1:${'f'.repeat(40)}` }
       },
-      async commitFacts(_root: string, sha: string) {
+      async commitFacts(_root: string, rawSha: string) {
+        const sha = rawSha.includes(':') ? rawSha : `sha1:${rawSha}`
         if (sha === INTEGRATED_SHA) {
           return { kind: 'ok' as const, value: { treeOid: DELIVERED_TREE, parents: [BASE_SHA] } }
         }
@@ -157,7 +158,8 @@ function fakeAdapters(
         }
         return { kind: 'ok' as const, value: undefined }
       },
-      async isAncestorOfTarget(_root: string, _remote: string, _branch: string, sha: string) {
+      async isAncestorOfTarget(_root: string, _remote: string, _branch: string, rawSha: string) {
+        const sha = rawSha.includes(':') ? rawSha : `sha1:${rawSha}`
         return { kind: 'ok' as const, value: sha === INTEGRATED_SHA || sha === BASE_SHA }
       },
     } satisfies GitDeliveryFactsAdapter,
