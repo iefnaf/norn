@@ -12,18 +12,11 @@
  * clock dependence. Later tickets extend this seam with locks, slot
  * accounting, and Run State persistence at the same interface.
  */
-import { randomUUID } from 'node:crypto'
 import {
-  closeSync,
-  fsyncSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
 } from 'node:fs'
-import { dirname } from 'node:path'
 
 import { blocked, error, ok } from '../core/outcome.ts'
 import type { Outcome } from '../core/outcome.ts'
@@ -40,6 +33,7 @@ import {
   runStatePath,
 } from '../config/paths.ts'
 import type { RepositoryIdentity } from '../config/paths.ts'
+import { writeDocumentAtomic } from '../runstate/atomic-write.ts'
 
 export const REPOSITORY_METADATA_SCHEMA = 'norn-repository-metadata:v1' as const
 
@@ -172,8 +166,8 @@ export function fsControlStore(nornHome: string): LocalControlStore {
     async writeRepositorySetup(home, files) {
       try {
         mkdirSync(home, { recursive: true })
-        writeFileAtomic(metadataFilePath(home), files.metadataJson)
-        writeFileAtomic(configFilePath(home), files.configJson)
+        writeDocumentAtomic(metadataFilePath(home), files.metadataJson)
+        writeDocumentAtomic(configFilePath(home), files.configJson)
         return ok(undefined)
       } catch (cause) {
         return controlStoreError('writing repository setup', cause)
@@ -240,37 +234,4 @@ function controlStoreError(what: string, cause: unknown): Outcome<never, never, 
     code: 'control-store',
     reason: `local control store failed while ${what}: ${cause instanceof Error ? cause.message : String(cause)}`,
   })
-}
-
-/**
- * Write one file atomically: a unique temporary file in the target directory,
- * flushed to disk, renamed over the target, and the directory flushed
- * (design.md §13.1).
- */
-function writeFileAtomic(path: string, text: string): void {
-  const temporary = `${path}.tmp-${randomUUID()}`
-  writeFileSync(temporary, text, 'utf8')
-  const handle = openSync(temporary, 'r+')
-  try {
-    fsyncSync(handle)
-  } finally {
-    closeSync(handle)
-  }
-  renameSync(temporary, path)
-  syncDirectory(dirname(path))
-}
-
-/** Directory flush after rename (design.md §13.1); best effort only. */
-function syncDirectory(directory: string): void {
-  try {
-    const handle = openSync(directory, 'r')
-    try {
-      fsyncSync(handle)
-    } finally {
-      closeSync(handle)
-    }
-  } catch {
-    // Unsupported on some platforms; the atomic rename already guarantees the
-    // file content.
-  }
 }

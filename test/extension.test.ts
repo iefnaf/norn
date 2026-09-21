@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
 import nornExtension from '../src/extension/index.ts'
@@ -120,5 +123,46 @@ describe('modes without UI', () => {
     await pi.commands[0]!.def.handler('init', ctx)
 
     assert.equal(notifications.length, 0)
+  })
+})
+
+describe('/norn status routing in the registered extension', () => {
+  it('requires exactly one map URL argument', async () => {
+    const pi = registeredNorn()
+    const { ctx, notifications } = fakeCtx(true)
+
+    await pi.commands[0]!.def.handler('status', ctx)
+    assert.match(notifications[0]!.message, /takes exactly one/)
+
+    await pi.commands[0]!.def.handler('status https://github.com/o/r/issues/1 extra', ctx)
+    assert.match(notifications[1]!.message, /takes exactly one/)
+  })
+
+  it('routes a full map URL through the runner and renders the typed outcome', async () => {
+    const agentDir = mkdtempSync(join(tmpdir(), 'norn-status-agent-dir-'))
+    const previous = process.env.PI_CODING_AGENT_DIR
+    process.env.PI_CODING_AGENT_DIR = agentDir
+    try {
+      const pi = registeredNorn()
+      const { ctx, notifications } = fakeCtx(true)
+
+      // No repository home under this Norn home: a typed blocked outcome.
+      await pi.commands[0]!.def.handler('status https://github.com/o/r/issues/1', ctx)
+
+      assert.equal(notifications.length, 1)
+      assert.equal(notifications[0]!.level, 'warning')
+      assert.match(notifications[0]!.message, /no-repository-home/)
+    } finally {
+      if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR
+      else process.env.PI_CODING_AGENT_DIR = previous
+      rmSync(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  it('does nothing without a UI surface', async () => {
+    const pi = registeredNorn()
+    const { ctx, notifications } = fakeCtx(false)
+    await pi.commands[0]!.def.handler('status https://github.com/o/r/issues/1', ctx)
+    assert.deepEqual(notifications, [])
   })
 })

@@ -5,12 +5,17 @@ import { join } from 'node:path'
 
 import {
   configFilePath,
+  controlLockPath,
   encodePathSegment,
+  locksDir,
+  mapLockPath,
   mapsDir,
   metadataFilePath,
   repositoryHomeDir,
   resolveNornHome,
   runStatePath,
+  targetLockPath,
+  workSlotRegistryPath,
 } from '../src/config/paths.ts'
 
 describe('resolveNornHome', () => {
@@ -94,5 +99,36 @@ describe('repository home layout', () => {
     assert.equal(runStatePath(home, 'I_9'), join(home, 'maps', 'I_9', 'run-state.json'))
     assert.equal(metadataFilePath(home), join(home, 'metadata.json'))
     assert.equal(configFilePath(home), join(home, 'config.json'))
+  })
+})
+
+describe('lock and slot registry paths', () => {
+  const home = repositoryHomeDir('/norn', { githubHost: 'github.com', repositoryId: 'R_kgDOB123' })
+
+  it('places every lock and the slot registry under repository home locks/', () => {
+    assert.equal(locksDir(home), join(home, 'locks'))
+    assert.equal(mapLockPath(home, 'I_map'), join(home, 'locks', 'map-I_map.lock'))
+    assert.equal(controlLockPath(home), join(home, 'locks', 'control.lock'))
+    assert.equal(targetLockPath(home, 'main'), join(home, 'locks', 'target-main.lock'))
+    assert.equal(workSlotRegistryPath(home), join(home, 'locks', 'work-slots.json'))
+  })
+
+  it('encodes map issue IDs and branches injectively into lock file names', () => {
+    assert.equal(mapLockPath(home, 'a/b'), join(home, 'locks', 'map-a%2Fb.lock'))
+    assert.equal(targetLockPath(home, 'a/b'), join(home, 'locks', 'target-a%2Fb.lock'))
+    assert.notEqual(mapLockPath(home, 'a%2Fb'), mapLockPath(home, 'a/b'))
+  })
+
+  it('keeps run state, locks, and slots inside repository home, never the working tree', () => {
+    for (const path of [
+      runStatePath(home, 'I_map'),
+      locksDir(home),
+      mapLockPath(home, 'I_map'),
+      controlLockPath(home),
+      targetLockPath(home, 'main'),
+      workSlotRegistryPath(home),
+    ]) {
+      assert.ok(path.startsWith(home), path)
+    }
   })
 })

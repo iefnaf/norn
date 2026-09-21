@@ -71,6 +71,31 @@ export function runStatePath(repositoryHome: string, encodedIssueId: string): st
   return join(mapsDir(repositoryHome), encodedIssueId, 'run-state.json')
 }
 
+/** Directory holding every lock and the Work-slot registry (§16). */
+export function locksDir(repositoryHome: string): string {
+  return join(repositoryHome, 'locks')
+}
+
+/** OS-backed map lock file: one live coordinator per Task Map (§16). */
+export function mapLockPath(repositoryHome: string, encodedIssueId: string): string {
+  return join(locksDir(repositoryHome), `map-${encodePathSegment(encodedIssueId)}.lock`)
+}
+
+/** Short-held repository control lock file (§16). */
+export function controlLockPath(repositoryHome: string): string {
+  return join(locksDir(repositoryHome), 'control.lock')
+}
+
+/** OS-backed target lock file: Ship serialized per repository and branch (§16). */
+export function targetLockPath(repositoryHome: string, branch: string): string {
+  return join(locksDir(repositoryHome), `target-${encodePathSegment(branch)}.lock`)
+}
+
+/** The repository-wide Work-slot registry document (§8, §16). */
+export function workSlotRegistryPath(repositoryHome: string): string {
+  return join(locksDir(repositoryHome), 'work-slots.json')
+}
+
 export const METADATA_FILE_NAME = 'metadata.json'
 export const CONFIG_FILE_NAME = 'config.json'
 

@@ -5,6 +5,8 @@ import type { NornCommandSummary, NornSubcommandInfo } from '../runner/commands.
 import type { InitOutcome } from '../runner/init.ts'
 import type { CheckMapFinding, CheckMapOutcome } from '../runner/check.ts'
 import type { TopologyFinding } from '../map/snapshot.ts'
+import type { StatusOutcome } from '../runner/status.ts'
+import type { RunState, TicketRunState } from '../runstate/types.ts'
 import { isSha256Digest } from '../core/digest.ts'
 
 export function renderSummary(summary: NornCommandSummary): string {
@@ -163,4 +165,127 @@ export function renderCheckOutcome(outcome: CheckMapOutcome): string {
     return [header, ...lines].join('\n')
   }
   return `Norn check error (${outcome.code}): ${outcome.reason}`
+}
+
+/** `/norn status` takes exactly one full map URL. */
+export function renderStatusTakesMapUrl(): string {
+  return [
+    '/norn status takes exactly one full GitHub issue URL:',
+    '/norn status https://<host>/<owner>/<repository>/issues/<number>',
+  ].join('\n')
+}
+
+function formatTicketLine(issueId: string, ticket: TicketRunState): string {
+  switch (ticket.phase) {
+    case 'waiting':
+      return `  ${issueId}: waiting${ticket.wave === undefined ? '' : ` (last wave ${ticket.wave})`}`
+    case 'working':
+      return `  ${issueId}: working in wave ${ticket.wave} (attempt ${ticket.attempt.workAttemptId}, round ${ticket.attempt.round}, slot ${ticket.attempt.slot})`
+    case 'parked':
+      return `  ${issueId}: parked in wave ${ticket.wave} (${ticket.outcome.kind} ${ticket.outcome.code})`
+    case 'shippable':
+      return `  ${issueId}: shippable from wave ${ticket.wave} (tree ${ticket.change.candidateTreeOid})`
+    case 'shipping':
+      return `  ${issueId}: shipping (stage ${ticket.checkpoint.stage}, push attempts ${ticket.checkpoint.pushAttempts}, ${ticket.checkpoint.zeroDelta ? 'zero-delta' : 'new commit'})`
+    case 'completed':
+      return `  ${issueId}: completed (delivery ${ticket.deliveryId}, integrated ${ticket.integratedSha})`
+  }
+}
+
+function renderRunState(state: RunState): string[] {
+  const lines: string[] = [
+    `Run: ${state.runId} — ${state.status}`,
+    `Norn version: ${state.nornVersion} · configRevision: ${state.configRevision}`,
+  ]
+
+  const lineage = state.acceptedMapRevisions
+  const first = lineage[0]
+  const last = lineage.at(-1)
+  lines.push(
+    `Accepted Map revisions: ${lineage.length} (initial ${first?.revision ?? '—'} → current ${last?.revision ?? '—'})`,
+  )
+  for (const entry of lineage.slice(1)) {
+    lines.push(
+      `  extension ${entry.revision} <- ${entry.extension?.fromRevision ?? '—'} (+${(entry.extension?.addedTicketIssueIds ?? []).join(', ')})`,
+    )
+  }
+
+  if (state.activeWave === undefined) {
+    lines.push(`Current Wave: none (last wave number ${state.wave})`)
+  } else {
+    const wave = state.activeWave
+    lines.push(
+      `Current Wave: ${wave.number} on ${wave.mapRevision} at ${wave.target.branch}@${wave.target.baseSha} (next ship index ${wave.nextShipIndex} of ${wave.shipQueueTicketIssueIds.length})`,
+    )
+    if (wave.frontierTicketIssueIds.length > 0) {
+      lines.push(`  frontier: ${wave.frontierTicketIssueIds.join(', ')}`)
+    }
+    if (wave.shipQueueTicketIssueIds.length > 0) {
+      lines.push(`  ship queue: ${wave.shipQueueTicketIssueIds.join(', ')}`)
+    }
+  }
+
+  if (state.mapCompletion !== undefined) {
+    const completion = state.mapCompletion
+    lines.push(
+      `Map completion in progress: stage ${completion.stage} at ${completion.completionSha} (attempt ${completion.completionAttemptId}, revision ${completion.mapRevision})`,
+    )
+  }
+
+  const tickets = Object.entries(state.tickets)
+  if (tickets.length > 0) {
+    lines.push(`Tickets (${tickets.length}):`)
+    for (const [issueId, ticket] of tickets) lines.push(formatTicketLine(issueId, ticket))
+  } else {
+    lines.push('Tickets: none recorded')
+  }
+
+  if (state.parkedTickets.length > 0) {
+    lines.push(`Parked: ${state.parkedTickets.map((ref) => ref.issueId).join(', ')}`)
+  }
+
+  const report = state.report
+  if (report === undefined) {
+    lines.push('Terminal report: none yet (the run has not reached a terminal state)')
+    lines.push('Retained workspace: none')
+  } else {
+    lines.push(
+      `Terminal report: ${report.label}${report.code === undefined ? '' : ` (${report.code})`} · sharedWrite ${report.sharedWrite}${report.completionSha === undefined ? '' : ` · completionSha ${report.completionSha}`}`,
+    )
+    if (report.retainedWorkspace !== undefined) {
+      lines.push(`Retained workspace: ${report.retainedWorkspace.path}`)
+    } else {
+      lines.push('Retained workspace: none')
+    }
+    if (report.warnings.length > 0) {
+      lines.push(`Warnings: ${report.warnings.join(' | ')}`)
+    }
+  }
+  return lines
+}
+
+/** Render the typed `/norn status` outcome: persisted local facts only. */
+export function renderStatusOutcome(outcome: StatusOutcome): string {
+  if (outcome.kind === 'ok') {
+    const { value } = outcome
+    const lines = [
+      `Norn status — ${value.requested.githubHost}/${value.requested.owner}/${value.requested.name}#${value.requested.number}`,
+      'Local truth only: GitHub issues, Ticket states, and the target branch are not consulted; current remote facts may differ.',
+      `Repository home: ${value.repositoryHome}`,
+      `Map lock: ${value.mapLockHeldByLiveCoordinator ? 'held by a live coordinator' : 'not held'}`,
+    ]
+    if (value.runState === undefined) {
+      lines.push('Run State: none exists for this map under repository home.')
+    } else {
+      lines.push(...renderRunState(value.runState))
+      if (!isSha256Digest(value.runState.configRevision)) {
+        lines.push('warning: configRevision is not digest-shaped')
+      }
+    }
+    return lines.join('\n')
+  }
+  if (outcome.kind === 'blocked') {
+    return `Norn status blocked (${outcome.code}): ${outcome.reason}`
+  }
+  return `Norn status error (${outcome.code}): ${outcome.reason}`
 }
