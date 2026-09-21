@@ -588,8 +588,11 @@ function gitFactsFailure(reason: string): Outcome<never, never, 'git-failed'> {
 function failingMarkStage(store: ShipCheckpointStore): ShipCheckpointStore {
   return {
     load: store.load,
+    loadCompleted: store.loadCompleted,
     prepare: store.prepare,
     incrementPushAttempts: store.incrementPushAttempts,
+    complete: store.complete,
+    markCleanedUp: store.markCleanedUp,
     async markStage() {
       return {
         kind: 'error',

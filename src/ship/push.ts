@@ -99,6 +99,7 @@ import type {
   ShipCheckpoint,
   TestEvidence,
   TicketRef,
+  WorkspaceRef,
 } from '../runstate/types.ts'
 import { formatGitObjectOid, parseGitObjectOid } from '../work/workspace.ts'
 import type { GitObjectFormat } from '../work/workspace.ts'
@@ -220,6 +221,21 @@ export type LoadedShipState = {
   readonly checkpoint: ShipCheckpoint
 }
 
+/** The persisted `completed` state of one ticket (§13.1). */
+export type LoadedCompletedTicket = {
+  readonly deliveryId: string
+  readonly integratedSha: string
+  readonly cleanupWorkspace?: WorkspaceRef
+}
+
+/** Everything the atomic `completed` update of §11.3 persists. */
+export type ShipCompleteInput = {
+  readonly deliveryId: string
+  readonly integratedSha: string
+  /** Retained until cleanup succeeded or its failure was warned (§13.1). */
+  readonly cleanupWorkspace?: WorkspaceRef
+}
+
 /** Everything one `prepare` atomically persists as stage `prepared`. */
 export type ShipPrepareInput = {
   readonly wave: number
@@ -255,7 +271,18 @@ export type ShipCheckpointStore = {
    */
   incrementPushAttempts(): Promise<Outcome<number, never, ShipStoreErrorCode>>
   /** Persist a remotely confirmed stage transition of the checkpoint. */
-  markStage(stage: 'push-verified'): Promise<Outcome<ShipCheckpoint, never, ShipStoreErrorCode>>
+  markStage(stage: ShipCheckpoint['stage']): Promise<Outcome<ShipCheckpoint, never, ShipStoreErrorCode>>
+  /** The persisted `completed` state of the ticket, or `undefined` (§13.1). */
+  loadCompleted(): Promise<Outcome<LoadedCompletedTicket | undefined, never, ShipStoreErrorCode>>
+  /**
+   * Atomically persist the post-close-validated Completed Ticket (§11.3,
+   * §13.1): only a successfully persisted validation may complete the
+   * Ticket, and the sealed `deliveryId` and `integratedSha` must mirror the
+   * checkpoint that was validated.
+   */
+  complete(input: ShipCompleteInput): Promise<Outcome<void, never, ShipStoreErrorCode>>
+  /** Drop the retained cleanup workspace after successful cleanup (§13.1). */
+  markCleanedUp(): Promise<Outcome<void, never, ShipStoreErrorCode>>
 }
 
 /**
@@ -277,6 +304,21 @@ export function runStateShipCheckpointStore(options: {
       const ticket = loaded.value.tickets[ticketIssueId]
       if (ticket === undefined || ticket.phase !== 'shipping') return ok(undefined)
       return ok({ wave: ticket.wave, change: ticket.change, checkpoint: ticket.checkpoint })
+    },
+
+    async loadCompleted() {
+      const loaded = loadRunState(repositoryHome, encodedMapIssueId)
+      if (loaded.kind !== 'ok') return loaded
+      if (loaded.value === undefined) return ok(undefined)
+      const ticket = loaded.value.tickets[ticketIssueId]
+      if (ticket === undefined || ticket.phase !== 'completed') return ok(undefined)
+      return ok({
+        deliveryId: ticket.deliveryId,
+        integratedSha: ticket.integratedSha,
+        ...(ticket.cleanupWorkspace !== undefined
+          ? { cleanupWorkspace: ticket.cleanupWorkspace }
+          : {}),
+      })
     },
 
     async prepare(input) {
@@ -386,6 +428,66 @@ export function runStateShipCheckpointStore(options: {
             },
           },
           result: checkpoint,
+        })
+      })
+    },
+
+    async complete(input) {
+      return updateCheckpoint(repositoryHome, encodedMapIssueId, (state) => {
+        const ticket = state.tickets[ticketIssueId]
+        if (ticket === undefined || ticket.phase !== 'shipping') {
+          return integrityError(`ticket ${ticketIssueId} has no shipping checkpoint to complete`)
+        }
+        if (ticket.checkpoint.stage !== 'ticket-closed') {
+          return integrityError(
+            `the shipping checkpoint of ticket ${ticketIssueId} is at stage ` +
+              `"${ticket.checkpoint.stage}"; only a post-close validation (§11.3) may complete`,
+          )
+        }
+        if (
+          input.deliveryId !== ticket.checkpoint.delivery.deliveryId ||
+          input.integratedSha !== ticket.checkpoint.integratedSha
+        ) {
+          return integrityError(
+            `the completed ticket ${ticketIssueId} must mirror the validated checkpoint`,
+          )
+        }
+        return ok({
+          state: {
+            ...state,
+            tickets: {
+              ...state.tickets,
+              [ticketIssueId]: {
+                phase: 'completed' as const,
+                deliveryId: input.deliveryId,
+                integratedSha: input.integratedSha,
+                ...(input.cleanupWorkspace !== undefined
+                  ? { cleanupWorkspace: input.cleanupWorkspace }
+                  : {}),
+              },
+            },
+          },
+          result: undefined,
+        })
+      })
+    },
+
+    async markCleanedUp() {
+      return updateCheckpoint(repositoryHome, encodedMapIssueId, (state) => {
+        const ticket = state.tickets[ticketIssueId]
+        if (ticket === undefined || ticket.phase !== 'completed') {
+          return integrityError(`ticket ${ticketIssueId} is not completed and has no cleanup record`)
+        }
+        if (ticket.cleanupWorkspace === undefined) {
+          return integrityError(`completed ticket ${ticketIssueId} retains no cleanup workspace`)
+        }
+        const { cleanupWorkspace: _retained, ...completed } = ticket
+        return ok({
+          state: {
+            ...state,
+            tickets: { ...state.tickets, [ticketIssueId]: completed },
+          },
+          result: undefined,
         })
       })
     },

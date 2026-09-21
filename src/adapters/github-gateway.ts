@@ -20,6 +20,7 @@ import { promisify } from 'node:util'
 import { blocked, error, ok } from '../core/outcome.ts'
 import type { Outcome } from '../core/outcome.ts'
 import type {
+  EvidenceIssueLocator,
   IssueEvidenceComment,
   IssueEvidenceRead,
   IssueEvidenceReadOutcome,
@@ -669,6 +670,159 @@ export function ghApiTaskMapLoader(run: GhCommandRunner = runGh): TaskMapLoader 
       return ok({ map, members })
     },
   }
+}
+
+// ---------------------------------------------------------------------------
+// Issue writes (design.md §11.3): the record comment, close, and reopen.
+// ---------------------------------------------------------------------------
+
+export type GitHubIssueWriteErrorCode = 'github-unavailable'
+
+/** The freshly written issue comment, addressed by its immutable node ID. */
+export type WrittenIssueComment = {
+  readonly commentId: string
+}
+
+/**
+ * The injectable issue-write seam of the §11.3 close protocol. Writes only
+ * ever run in coordinator code paths; each operation either confirms its
+ * exact remote effect (`ok`) or leaves the remote state unproved — an error
+ * is an *unknown* write result the caller must treat as recoverable, never
+ * as proof the mutation did not happen.
+ */
+export type GitHubIssueWriter = {
+  /** Add one comment to the addressed issue; returns its immutable node ID. */
+  writeIssueComment(
+    locator: EvidenceIssueLocator,
+    body: string,
+  ): Promise<Outcome<WrittenIssueComment, never, GitHubIssueWriteErrorCode>>
+  /** Close the addressed issue. */
+  closeIssue(
+    locator: EvidenceIssueLocator,
+  ): Promise<Outcome<void, never, GitHubIssueWriteErrorCode>>
+  /** Reopen the addressed issue. */
+  reopenIssue(
+    locator: EvidenceIssueLocator,
+  ): Promise<Outcome<void, never, GitHubIssueWriteErrorCode>>
+}
+
+/** The owner/name/number locator of an issue URL, or an unavailable error. */
+function issueApiBase(
+  locator: EvidenceIssueLocator,
+): Outcome<{ owner: string; name: string; number: number }, never, GitHubIssueWriteErrorCode> {
+  const parsed = parseIssueUrl(locator.url)
+  if (parsed === undefined || parsed.number !== locator.number) {
+    return error({
+      scope: 'operation',
+      code: 'github-unavailable',
+      reason: `issue URL "${locator.url}" is not a full GitHub issue URL`,
+    })
+  }
+  return ok({ owner: parsed.owner, name: parsed.name, number: parsed.number })
+}
+
+/** Parse one `gh api` JSON response, or fail as unavailable. */
+function parseJsonResponse(
+  stdout: string,
+  what: string,
+): Outcome<Record<string, unknown>, never, GitHubIssueWriteErrorCode> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(stdout)
+  } catch {
+    return error({
+      scope: 'operation',
+      code: 'github-unavailable',
+      reason: `gh api returned a non-JSON ${what} response`,
+    })
+  }
+  if (!isRecord(parsed)) {
+    return error({
+      scope: 'operation',
+      code: 'github-unavailable',
+      reason: `gh api returned an unexpected ${what} response shape`,
+    })
+  }
+  return ok(parsed)
+}
+
+/**
+ * The built-in production issue writer over the authenticated `gh` CLI:
+ * one REST call per write — the comment `POST`, and the `PATCH`es that
+ * close and reopen the issue. The exact resulting state is confirmed from
+ * each response before the operation answers `ok`.
+ */
+export function ghApiIssueWriter(run: GhCommandRunner = runGh): GitHubIssueWriter {
+  return {
+    async writeIssueComment(locator, body) {
+      const base = issueApiBase(locator)
+      if (base.kind !== 'ok') return base
+      const result = await run([
+        'api',
+        '--hostname',
+        locator.githubHost,
+        '--method',
+        'POST',
+        `repos/${base.value.owner}/${base.value.name}/issues/${base.value.number}/comments`,
+        '-f',
+        `body=${body}`,
+      ])
+      if (!result.ok) {
+        return error({ scope: 'operation', code: 'github-unavailable', reason: result.message })
+      }
+      const parsed = parseJsonResponse(result.stdout, 'comment')
+      if (parsed.kind !== 'ok') return parsed
+      if (typeof parsed.value.node_id !== 'string' || parsed.value.node_id === '') {
+        return error({
+          scope: 'operation',
+          code: 'github-unavailable',
+          reason: 'gh api comment response lacks node_id',
+        })
+      }
+      return ok({ commentId: parsed.value.node_id })
+    },
+
+    async closeIssue(locator) {
+      return setIssueState(run, locator, 'closed')
+    },
+
+    async reopenIssue(locator) {
+      return setIssueState(run, locator, 'open')
+    },
+  }
+}
+
+/** `PATCH repos/{owner}/{name}/issues/{number}` to the requested state. */
+async function setIssueState(
+  run: GhCommandRunner,
+  locator: EvidenceIssueLocator,
+  state: 'open' | 'closed',
+): Promise<Outcome<void, never, GitHubIssueWriteErrorCode>> {
+  const base = issueApiBase(locator)
+  if (base.kind !== 'ok') return base
+  const result = await run([
+    'api',
+    '--hostname',
+    locator.githubHost,
+    '--method',
+    'PATCH',
+    `repos/${base.value.owner}/${base.value.name}/issues/${base.value.number}`,
+    '-f',
+    `state=${state}`,
+  ])
+  if (!result.ok) {
+    return error({ scope: 'operation', code: 'github-unavailable', reason: result.message })
+  }
+  const parsed = parseJsonResponse(result.stdout, 'issue')
+  if (parsed.kind !== 'ok') return parsed
+  if (parsed.value.state !== state) {
+    return error({
+      scope: 'operation',
+      code: 'github-unavailable',
+      reason: `gh api issue response reports state "${String(parsed.value.state)}" after requesting "${state}"`,
+    })
+  }
+  return ok(undefined)
 }
 
 // ---------------------------------------------------------------------------
