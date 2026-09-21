@@ -1,0 +1,30 @@
+{
+  "name": "norn",
+  "version": "0.1.0",
+  "description": "Weave the graph. Prove the outcome. A deterministic runner for GitHub Task Maps.",
+  "keywords": [
+    "pi-package"
+  ],
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit",
+    "test": "node --test \"test/*.test.ts\""
+  },
+  "pi": {
+    "extensions": [
+      "./src/extension"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.86.1",
+    "@types/node": "^26.0.0",
+    "typescript": "^5.9.0"
+  },
+  "engines": {
+    "node": ">=22.6"
+  }
+}

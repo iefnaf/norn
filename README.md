@@ -22,3 +22,15 @@ The design deliberately starts with one concrete runner rather than a generic wo
 - [Domain language](CONTEXT.md)
 
 Initial private validation fixture (authenticated access required): [`iefnaf/taskflow-dag-demo#6`](https://github.com/iefnaf/taskflow-dag-demo/issues/6).
+
+## Development
+
+The implementation is TypeScript; Pi loads extensions directly, so there is no build output to ship.
+
+```bash
+npm install
+npm run build   # typecheck
+npm test
+```
+
+To try the package in a Pi session without installing it: `pi -e /path/to/norn`. To install: `pi install git:github.com/iefnaf/norn`.
