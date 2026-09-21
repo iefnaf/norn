@@ -1,8 +1,10 @@
 /**
  * The Git repository seam (design.md §6): identify the local repository and
- * its remotes without touching the working tree. The built-in production
- * adapter shells out to the `git` CLI; tests inject a runner with canned
- * output, or use a temporary repository for the real adapter.
+ * its remotes without touching the working tree, plus the delivery facts and
+ * push of §11.3–§14. The built-in production adapter shells out to the `git`
+ * CLI; tests inject a runner with canned output, or use a temporary
+ * repository — with a local bare remote as the fake GitHub target — for the
+ * real adapter.
  *
  * Everything here is read-only: Norn creates nothing inside the target
  * repository's working tree during init.
@@ -238,6 +240,91 @@ export async function runGitDetailed(args: readonly string[], cwd: string): Prom
           ? { stdout: rawStdout.toString('utf8') }
           : {}),
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The push seam (design.md §11.3)
+// ---------------------------------------------------------------------------
+
+/** The typed outcome of one non-force push of the exact integration commit. */
+export type GitPushOutcome =
+  | { readonly kind: 'pushed' }
+  /** The remote rejected the push as non-fast-forward: the target advanced. */
+  | { readonly kind: 'target-advanced'; readonly message: string }
+  /** Authentication or branch policy refused the write outright. */
+  | {
+      readonly kind: 'rejected'
+      readonly detail: 'authentication' | 'branch-policy' | 'other'
+      readonly message: string
+    }
+  /** The process or network left the remote state unprovable either way. */
+  | { readonly kind: 'unknown'; readonly message: string }
+
+/** One push request: the exact integration commit, never a force push. */
+export type GitPushRequest = {
+  /** Repository root the push runs from. */
+  readonly root: string
+  readonly remote: string
+  readonly branch: string
+  /** Raw-hex integration commit pushed to `refs/heads/<branch>`. */
+  readonly sha: string
+}
+
+/** The injectable push seam; every actual call consumes one persisted attempt. */
+export type GitPushSeam = (request: GitPushRequest) => Promise<GitPushOutcome>
+
+const NON_FAST_FORWARD_PATTERN = /(?:non-fast-forward|fetch first)/
+const BRANCH_POLICY_PATTERN =
+  /(?:GH006|protected branch|branch protection|pre-receive hook declined|hook declined)/i
+const AUTHENTICATION_PATTERN =
+  /(?:permission denied|authentication failed|invalid username or password|access denied|\b403\b|fatal:\s*authentication)/i
+const REMOTE_REJECTED_PATTERN = /\[(?:remote )?rejected\]/
+
+/**
+ * Classify one `git push <remote> <sha>:refs/heads/<branch>` result (§11.3):
+ * exit 0 is `pushed`; a non-fast-forward rejection means the target advanced
+ * and the optimistic-concurrency retry protocol applies; authentication and
+ * branch-policy refusals are `rejected`; anything whose remote effect cannot
+ * be proven — no exit status, an unrecognized failure, or a transport error
+ * that is not a proven permission refusal — is `unknown`, never a guess.
+ */
+export function classifyPushResult(result: GitFactsCommandResult): GitPushOutcome {
+  if (result.ok) return { kind: 'pushed' }
+  const message = result.message
+  if (result.exitCode === undefined) {
+    return { kind: 'unknown', message }
+  }
+  if (NON_FAST_FORWARD_PATTERN.test(message)) {
+    return { kind: 'target-advanced', message }
+  }
+  if (BRANCH_POLICY_PATTERN.test(message)) {
+    return { kind: 'rejected', detail: 'branch-policy', message }
+  }
+  if (AUTHENTICATION_PATTERN.test(message)) {
+    return { kind: 'rejected', detail: 'authentication', message }
+  }
+  if (REMOTE_REJECTED_PATTERN.test(message)) {
+    return { kind: 'rejected', detail: 'other', message }
+  }
+  return { kind: 'unknown', message }
+}
+
+/**
+ * The built-in production push adapter over the `git` CLI. The push is never
+ * forced: the remote's own fast-forward check is Norn's final optimistic-
+ * concurrency guard (§11.3). A timeout or unclassifiable failure is reported
+ * as `unknown` so the bounded stable-fetch protocol decides what happened.
+ */
+export function gitCliPush(
+  run: GitFactsCommandRunner = runGitDetailed,
+): GitPushSeam {
+  return async (request) => {
+    const result = await run(
+      ['push', request.remote, `${request.sha}:refs/heads/${request.branch}`],
+      request.root,
+    )
+    return classifyPushResult(result)
   }
 }
 

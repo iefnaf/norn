@@ -715,8 +715,11 @@ export async function reconcileFinalCandidate(
 // §11.1 helpers
 // ---------------------------------------------------------------------------
 
-/** Evaluate one blocker's Completed Ticket evidence; a value means: return it. */
-async function evaluateBlockerCompletion(
+/** Evaluate one blocker's Completed Ticket evidence; a value means: return it.
+ *
+ * Exported so the §11.3 push stages revalidate blocker completion evidence
+ * (§11.1, §13.3 step 2) through exactly the same rules as reconciliation. */
+export async function evaluateBlockerCompletion(
   deps: ShipReconcileDeps,
   params: ShipReconcileParams,
   blocker: TaskMapSnapshot['tickets'][number],
@@ -812,9 +815,10 @@ async function readTarget(
  * Synthesize the snapshot shape the §7.4 classifier consumes from one
  * accepted lineage entry (§13.1 stores the canonical payload, not the full
  * snapshot). Display locators are unused by classification and borrow the
- * current snapshot's values.
+ * current snapshot's values. Exported so the §11.3 push stages classify the
+ * current snapshot against the same accepted-lineage view.
  */
-function acceptedSnapshotFrom(entry: AcceptedMapRevision, currentRef: MapRef): TaskMapSnapshot {
+export function acceptedSnapshotFrom(entry: AcceptedMapRevision, currentRef: MapRef): TaskMapSnapshot {
   const payload = entry.payload
   const mapRef: MapRef = {
     role: 'map',

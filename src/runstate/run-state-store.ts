@@ -1195,11 +1195,24 @@ function checkRunStateInvariants(state: RunState, violations: string[]): void {
         `tickets[${issueId}].checkpoint.zeroDelta must agree with baseSha and integratedSha`,
       )
     }
-    if (checkpoint.baseSha !== change.baseSha) {
-      violations.push(`tickets[${issueId}].checkpoint.baseSha must equal the change base`)
-    }
-    if (checkpoint.treeOid !== change.candidateTreeOid) {
-      violations.push(`tickets[${issueId}].checkpoint.treeOid must equal the change tree`)
+    if (checkpoint.baseSha !== change.baseSha || checkpoint.treeOid !== change.candidateTreeOid) {
+      // Reused Work evidence is valid only against the unchanged Work base
+      // and tree (§11.2), so a work-phase checkpoint must agree with the
+      // sealed change. Fresh ship evidence after target movement (§11.3)
+      // may bind an advanced base and a replayed tree while the change stays
+      // sealed, so only the work-evidence case is constrained.
+      if (checkpoint.review.phase === 'work') {
+        if (checkpoint.baseSha !== change.baseSha) {
+          violations.push(
+            `tickets[${issueId}].checkpoint.baseSha must equal the change base while it reuses Work evidence`,
+          )
+        }
+        if (checkpoint.treeOid !== change.candidateTreeOid) {
+          violations.push(
+            `tickets[${issueId}].checkpoint.treeOid must equal the change tree while it reuses Work evidence`,
+          )
+        }
+      }
     }
     const delivery = checkpoint.delivery as unknown as Unknown
     if (
