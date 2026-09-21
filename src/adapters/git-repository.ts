@@ -199,18 +199,26 @@ export function normalizeHost(host: string): string {
 /**
  * A single git CLI invocation that also reports the process exit status, so
  * `commitFacts` and `isAncestorOfTarget` can distinguish a proved absence
- * (exit 1) from an infrastructure failure.
+ * (exit 1) from an infrastructure failure. The failure variant carries the
+ * captured `stdout` when the process produced any, so callers such as the
+ * Ship replay plumbing can read conflict details from a non-zero exit.
  */
 export type GitFactsCommandResult =
   | { readonly ok: true; readonly stdout: string }
-  | { readonly ok: false; readonly exitCode: number | undefined; readonly message: string }
+  | {
+      readonly ok: false
+      readonly exitCode: number | undefined
+      readonly message: string
+      readonly stdout?: string
+    }
 
 export type GitFactsCommandRunner = (
   args: readonly string[],
   cwd: string,
 ) => Promise<GitFactsCommandResult>
 
-async function runGitDetailed(args: readonly string[], cwd: string): Promise<GitFactsCommandResult> {
+/** The built-in exit-code-aware `git` invocation (exported for Ship plumbing). */
+export async function runGitDetailed(args: readonly string[], cwd: string): Promise<GitFactsCommandResult> {
   try {
     const { stdout } = await execFileAsync('git', args, { cwd, timeout: GIT_TIMEOUT_MS })
     return { ok: true, stdout }
@@ -219,10 +227,16 @@ async function runGitDetailed(args: readonly string[], cwd: string): Promise<Git
       return { ok: false, exitCode: undefined, message: 'the git CLI is not installed or not on PATH' }
     }
     const exitCode = (cause as { code?: unknown }).code
+    const rawStdout = (cause as { stdout?: unknown }).stdout
     return {
       ok: false,
       exitCode: typeof exitCode === 'number' ? exitCode : undefined,
       message: describe(cause),
+      ...(typeof rawStdout === 'string'
+        ? { stdout: rawStdout }
+        : Buffer.isBuffer(rawStdout)
+          ? { stdout: rawStdout.toString('utf8') }
+          : {}),
     }
   }
 }
