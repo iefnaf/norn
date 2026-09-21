@@ -43,7 +43,8 @@ export type GitCommandRunner = (
   cwd: string,
 ) => Promise<GitCommandResult>
 
-async function runGit(args: readonly string[], cwd: string): Promise<GitCommandResult> {
+/** The built-in `git` CLI invocation the production adapter defaults to. */
+export async function runGit(args: readonly string[], cwd: string): Promise<GitCommandResult> {
   try {
     const { stdout } = await execFileAsync('git', args, { cwd, timeout: GIT_TIMEOUT_MS })
     return { ok: true, stdout }
