@@ -152,6 +152,27 @@ export function dialogInitInteraction(ui: DialogUi): InitInteraction {
       return parseNumber(answer, suggested)
     },
 
+    async chooseAgentEnvironment() {
+      const entries = new Map<string, string>()
+      ui.notify(
+        'Optional child agent environment entries are applied to every Worker and Reviewer pane. GitHub tokens and push credentials are forbidden.',
+        'info',
+      )
+      while (
+        await ui.confirm(
+          `Add child agent environment variable #${entries.size + 1}?`,
+          'Optional — use this for per-run values such as HTTP_PROXY, HTTPS_PROXY, or NO_PROXY.',
+        )
+      ) {
+        const name = await ui.input('Child agent environment variable name', 'HTTPS_PROXY')
+        if (name === undefined) return undefined
+        const value = await ui.input(`Value for ${name.trim() || '(empty name)'}`, 'http://127.0.0.1:7897')
+        if (value === undefined) return undefined
+        entries.set(name.trim(), value)
+      }
+      return Object.fromEntries(entries)
+    },
+
     async chooseTrustedEvidenceAuthors(actor) {
       ui.notify(
         `Authenticated GitHub actor ${actor.login} (${actor.id}) is always a trusted evidence author.`,

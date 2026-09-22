@@ -58,6 +58,9 @@ import type { AgentRoleInput, CommandSpecInput, InitInteraction } from '../src/r
 // The explicit operator choices for the fixture (ticket #18 instructions)
 // ---------------------------------------------------------------------------
 
+const e2eProxy = process.env.NORN_E2E_HTTP_PROXY?.trim()
+const e2eNoProxy = process.env.NORN_E2E_NO_PROXY?.trim()
+
 const CHOICES = {
   targetBranch: 'main',
   /** The fixture package.json has zero dependencies; `npm install` would
@@ -80,6 +83,12 @@ const CHOICES = {
   maxWorkRounds: Number(process.env.NORN_E2E_MAX_WORK_ROUNDS ?? 3),
   maxPushRetries: 2,
   concurrency: 2,
+  agentEnv: {
+    ...(e2eProxy === undefined || e2eProxy === ''
+      ? {}
+      : { HTTP_PROXY: e2eProxy, HTTPS_PROXY: e2eProxy }),
+    ...(e2eNoProxy === undefined || e2eNoProxy === '' ? {} : { NO_PROXY: e2eNoProxy }),
+  },
 } as const
 
 // ---------------------------------------------------------------------------
@@ -164,6 +173,10 @@ function scriptedInteraction(): InitInteraction {
       const value = CHOICES[field]
       console.log(`${field}: ${value} (suggested ${suggested})`)
       return Promise.resolve(value)
+    },
+    chooseAgentEnvironment() {
+      console.log(`child agent environment: ${JSON.stringify(CHOICES.agentEnv)}`)
+      return Promise.resolve(CHOICES.agentEnv)
     },
     chooseTrustedEvidenceAuthors(actor) {
       console.log(`trusted evidence authors: just the authenticated actor ${actor.login}`)

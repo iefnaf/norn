@@ -18,7 +18,7 @@ import { describe, it } from 'node:test'
 
 import { error, ok } from '../src/core/outcome.ts'
 import { isProcessGroupAlive } from '../src/agents/process-group.ts'
-import { LocalProcessAgentRunner } from '../src/agents/local-runner.ts'
+import { LocalProcessAgentRunner, childEnvironment } from '../src/agents/local-runner.ts'
 import {
   type AgentSettlementOutcome,
   type OwnedInvocationState,
@@ -92,6 +92,20 @@ async function waitUntil(predicate: () => Promise<boolean>, timeoutMs: number): 
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 20))
   }
 }
+
+describe('local agent child environment', () => {
+  it('keeps explicit extras but strips GitHub tokens and push credentials', () => {
+    const environment = childEnvironment({
+      HTTPS_PROXY: 'http://127.0.0.1:7897',
+      GITHUB_TOKEN: 'secret',
+      SSH_AUTH_SOCK: '/tmp/agent.sock',
+    })
+
+    assert.equal(environment.HTTPS_PROXY, 'http://127.0.0.1:7897')
+    assert.equal('GITHUB_TOKEN' in environment, false)
+    assert.equal('SSH_AUTH_SOCK' in environment, false)
+  })
+})
 
 describe('a launched worker invocation settles', () => {
   it('produces exactly one valid sidecar and settles with the typed handoff', async () => {

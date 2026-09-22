@@ -1,13 +1,13 @@
 /**
- * The coordinator-defined command environment (design.md §3, §6, §8).
+ * The coordinator-defined child-process environment policy (design.md §3,
+ * §6, §8).
  *
- * Configured commands are argument arrays with no environment of their own;
- * the Command runner supplies the active gate workspace as working directory
- * and an environment built by the coordinator. That environment excludes the
- * credentials Norn itself holds: GitHub tokens supplied by the Pi extension
- * at invocation, and push credentials such as the SSH agent socket or a git
- * askpass helper. The exclusion is a policy guardrail that keeps ordinary
- * mistakes from leaking the coordinator's authority into test commands —
+ * Configured commands receive a coordinator-built environment, while agent
+ * panes may receive only the explicit extras in Run Config. Both paths exclude
+ * the credentials Norn itself holds: GitHub tokens supplied by the Pi
+ * extension at invocation, and push credentials such as the SSH agent socket
+ * or a git askpass helper. The exclusion is a policy guardrail that keeps
+ * ordinary mistakes from leaking the coordinator's authority into children —
  * not an operating-system security boundary (§3).
  *
  * The sanitizer is pure: the caller passes the source environment as data.
@@ -46,7 +46,7 @@ const DENIED_NAME_PATTERNS: readonly RegExp[] = [/^GH_[A-Z0-9_]*_TOKEN$/, /^GITH
  * `GIT_CONFIG_VALUE_n` pairs enabled by `GIT_CONFIG_COUNT`. */
 const DENIED_NAME_PREFIXES: readonly string[] = ['GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_']
 
-/** Whether `name` is one of the credentials excluded from command environments. */
+/** Whether `name` is one of the credentials excluded from child environments. */
 export function isDeniedEnvironmentName(name: string): boolean {
   if (DENIED_EXACT_NAMES.has(name)) return true
   if (DENIED_NAME_PATTERNS.some((pattern) => pattern.test(name))) return true
@@ -54,7 +54,7 @@ export function isDeniedEnvironmentName(name: string): boolean {
 }
 
 /**
- * Build the command environment from `source`: every entry is kept except
+ * Build a child environment from `source`: every entry is kept except
  * the denied credential names. The result is a fresh object — never an alias
  * of the source — so callers cannot re-introduce removed entries by mutation.
  */

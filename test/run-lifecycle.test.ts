@@ -97,6 +97,39 @@ const configRevisionOfFixture = (() => {
 })()
 
 // ---------------------------------------------------------------------------
+// Run Config child-agent environment
+// ---------------------------------------------------------------------------
+
+describe('resolved child agent environment', () => {
+  it('applies every explicit extra to Work, Ship, and map-completion panes', async () => {
+    const harness = await makeRunHarness({
+      label: 'agent-env',
+      members: [ticketA(), ticketB()],
+    })
+    try {
+      const config = JSON.parse(RUN_CONFIG_JSON) as Record<string, unknown>
+      config.agentEnv = {
+        HTTPS_PROXY: 'http://127.0.0.1:7897',
+        NO_PROXY: 'localhost,127.0.0.1',
+      }
+      writeFileSync(join(harness.repositoryHome, 'config.json'), `${JSON.stringify(config)}\n`)
+
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+      assert.ok(harness.runner.launches.some((launch) => launch.phase === 'work'))
+      assert.ok(harness.runner.launches.some((launch) => launch.phase === 'ship'))
+      assert.ok(harness.runner.launches.some((launch) => launch.phase === 'map-completion'))
+      for (const launch of harness.runner.launches) {
+        assert.equal(launch.env.HTTPS_PROXY, 'http://127.0.0.1:7897')
+        assert.equal(launch.env.NO_PROXY, 'localhost,127.0.0.1')
+      }
+    } finally {
+      harness.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
 // AC1: multi-wave execution with parked tickets, waiting descendants, and
 // independent branches reaches the correct terminal report.
 // ---------------------------------------------------------------------------

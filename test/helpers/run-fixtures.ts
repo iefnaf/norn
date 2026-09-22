@@ -274,6 +274,7 @@ export type AgentLaunchRecord = {
   readonly ticketIssueId: string | undefined
   readonly round: number | null
   readonly cwd: string
+  readonly env: Readonly<Record<string, string>>
 }
 
 export type FakeRunAgents = VisibleAgentRunner & {
@@ -304,6 +305,7 @@ export function fakeRunRunner(
         ticketIssueId: context.ticket?.issueId,
         round: context.work?.round ?? null,
         cwd: request.cwd,
+        env: request.env ?? {},
       })
       if (context.role === 'worker') store.observed.workerLaunches += 1
       else if (context.phase === 'work') store.observed.workReviewerLaunches += 1
