@@ -3,7 +3,7 @@
  *
  * The pure `plan*` functions are asserted against the exact Herdr CLI
  * surface so no Herdr server is needed; the adapter behavior (launch parse,
- * liveness, exit polling, terminate) is exercised through an injected fake
+ * liveness, exit waiting, terminate) is exercised through an injected fake
  * executor. A live-pane test exists for environments that explicitly opt in
  * with NORN_TEST_HERDR=1 and have the Herdr binary — CI and machines without
  * Herdr run the fakes only.
@@ -12,19 +12,26 @@ import assert from 'node:assert/strict'
 import { readdir } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 
-import { HerdrAgentRunner, type HerdrPlan, decodeHerdrHandle, encodeHerdrHandle, herdrAgentName, nornAgentContextEnv, planAgentPiArgv, planHerdrAgentGet, planHerdrAgentStart, planHerdrPaneClose } from '../src/agents/herdr-runner.ts'
+import { HerdrAgentRunner, type HerdrPlan, decodeHerdrHandle, encodeHerdrHandle, herdrAgentName, nornAgentContextEnv, planAgentPiArgv, planHerdrAgentGet, planHerdrAgentStart, planHerdrAgentWait, planHerdrPaneClose } from '../src/agents/herdr-runner.ts'
 import { settleAgentInvocation } from '../src/agents/runner.ts'
 import { buildContext, createRunArea, defaultWorkerCandidate, fakeAgentLaunch } from './helpers/agent-fixtures.ts'
 
 function execRecorder(
   script: Array<{ readonly stdout?: string; readonly reject?: Error }>,
-): { plans: HerdrPlan[]; exec: (plan: HerdrPlan) => Promise<string> } {
+): {
+  plans: HerdrPlan[]
+  executionTimeouts: Array<number | undefined>
+  exec: (plan: HerdrPlan, executionTimeoutMs?: number) => Promise<string>
+} {
   const plans: HerdrPlan[] = []
+  const executionTimeouts: Array<number | undefined> = []
   let call = 0
   return {
     plans,
-    exec: (plan) => {
+    executionTimeouts,
+    exec: (plan, executionTimeoutMs) => {
       plans.push(plan)
+      executionTimeouts.push(executionTimeoutMs)
       const step = script[Math.min(call, script.length - 1)]
       call += 1
       if (step.reject !== undefined) return Promise.reject(step.reject)
@@ -41,6 +48,10 @@ const AGENT_GONE =
   '{"error":{"code":"agent_not_found","message":"agent target w10:p2 not found"},"id":"cli:agent:get"}\n'
 const AGENT_DONE =
   '{"id":"cli:agent:get","result":{"agent":{"pane_id":"w10:p2","agent_status":"done"},"type":"agent_info"}}\n'
+const AGENT_WAIT_DONE =
+  '{"id":"cli:agent:wait","result":{"agent":{"pane_id":"w10:p2","agent_status":"done"},"type":"agent_info"}}\n'
+const AGENT_WAIT_TIMEOUT =
+  '{"error":{"code":"timeout","message":"timed out waiting for agent status"},"id":"cli:agent:wait"}\n'
 
 describe('herdr CLI plans', () => {
   it('starts a visible named pane with the agent argv and context env', () => {
@@ -69,11 +80,19 @@ describe('herdr CLI plans', () => {
     })
   })
 
-  it('probes liveness and closes the pane by id', () => {
+  it('probes liveness, waits for done, and closes the pane by id', () => {
     assert.deepEqual(planHerdrAgentGet('w10:p2'), {
       file: 'herdr',
       args: ['agent', 'get', 'w10:p2'],
     })
+    assert.deepEqual(planHerdrAgentWait('w10:p2', 60_000), {
+      file: 'herdr',
+      args: ['agent', 'wait', 'w10:p2', '--until', 'done', '--timeout', '60000'],
+    })
+    // An elapsed budget still yields a positive Herdr-side timeout so the
+    // CLI evaluates the current state instead of rejecting the argument.
+    assert.equal(planHerdrAgentWait('w10:p2', 0).args.at(-1), '1')
+    assert.equal(planHerdrAgentWait('w10:p2', 149.9).args.at(-1), '149')
     assert.deepEqual(planHerdrPaneClose('w10:p2'), {
       file: 'herdr',
       args: ['pane', 'close', 'w10:p2'],
@@ -176,22 +195,36 @@ describe('HerdrAgentRunner against a scripted CLI', () => {
     await assert.rejects(() => broken.launch({ context, argv: ['pi'], cwd: area.workspacePath }), /non-JSON/)
   })
 
-  it('waits for exit by polling liveness', async () => {
-    const { exec, plans } = execRecorder([
+  it('waits for exit with one bounded Herdr wait process', async () => {
+    const { exec, plans, executionTimeouts } = execRecorder([
       { stdout: AGENT_STARTED },
-      { stdout: AGENT_INFO },
-      { stdout: AGENT_INFO },
-      { stdout: AGENT_GONE },
+      { stdout: AGENT_WAIT_DONE },
     ])
     const runner = new HerdrAgentRunner(exec)
     const area = await createRunArea('scripted')
     const context = buildContext(area, { role: 'worker', phase: 'work' })
     const handle = await runner.launch({ context, argv: ['pi'], cwd: area.workspacePath })
 
-    assert.equal(await runner.waitForExit(handle, 5_000), 'exited')
-    assert.equal(plans.filter((p) => p.args[1] === 'get').length, 3)
+    assert.equal(await runner.waitForExit(handle, 60_000), 'exited')
+    assert.deepEqual(plans[1], planHerdrAgentWait('w10:p2', 60_000))
+    assert.equal(plans.filter((p) => p.args[1] === 'wait').length, 1)
+    assert.equal(plans.filter((p) => p.args[1] === 'get').length, 0)
+    assert.ok((executionTimeouts[1] ?? 0) > 60_000)
+  })
 
-    const timeoutRunner = new HerdrAgentRunner(execRecorder([{ stdout: AGENT_STARTED }, { stdout: AGENT_INFO }]).exec)
+  it('preserves missing-agent and timeout settlement results from Herdr wait', async () => {
+    const area = await createRunArea('scripted')
+    const context = buildContext(area, { role: 'worker', phase: 'work' })
+
+    const goneRunner = new HerdrAgentRunner(
+      execRecorder([{ stdout: AGENT_STARTED }, { stdout: AGENT_GONE }]).exec,
+    )
+    const gone = await goneRunner.launch({ context, argv: ['pi'], cwd: area.workspacePath })
+    assert.equal(await goneRunner.waitForExit(gone, 150), 'exited')
+
+    const timeoutRunner = new HerdrAgentRunner(
+      execRecorder([{ stdout: AGENT_STARTED }, { stdout: AGENT_WAIT_TIMEOUT }]).exec,
+    )
     const hanging = await timeoutRunner.launch({ context, argv: ['pi'], cwd: area.workspacePath })
     assert.equal(await timeoutRunner.waitForExit(hanging, 150), 'timeout')
   })
@@ -211,7 +244,11 @@ describe('HerdrAgentRunner against a scripted CLI', () => {
     assert.deepEqual(plans[1], { file: 'herdr', args: ['pane', 'close', 'w10:p2'] })
 
     const stuckRunner = new HerdrAgentRunner(
-      execRecorder([{ stdout: AGENT_STARTED }, { stdout: '{"id":"cli:pane:close","result":{"type":"ok"}}' }, { stdout: AGENT_INFO }]).exec,
+      execRecorder([
+        { stdout: AGENT_STARTED },
+        { stdout: '{"id":"cli:pane:close","result":{"type":"ok"}}' },
+        { stdout: AGENT_WAIT_TIMEOUT },
+      ]).exec,
       200,
     )
     const stuck = await stuckRunner.launch({ context, argv: ['pi'], cwd: area.workspacePath })
