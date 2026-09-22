@@ -230,6 +230,49 @@ export type ProcessGroupCheckpoint = {
   readonly state: 'launch-intent' | 'running' | 'settled'
 }
 
+/**
+ * One structured feedback entry accumulated across a Work attempt's rounds
+ * (§10.2, §13.1). Feedback only: it informs later worker rounds — including
+ * the first round of a later run for a previously parked Ticket — and is
+ * never evidence. The command-failure shapes and reviewer iterate prose are
+ * the only payloads that travel; a `terminal` entry records how a parked
+ * attempt ended.
+ */
+export type ReworkFeedback =
+  | {
+      readonly kind: 'setup'
+      /** Round the failure belongs to; 0 marks the attempt's initial setup. */
+      readonly round: number
+      readonly origin: 'initial' | 'candidate'
+      readonly argv: readonly string[]
+      readonly cause: 'non-zero-exit' | 'timeout-terminated'
+      readonly exitCode: number | null
+      readonly stdout: string
+      readonly stderr: string
+    }
+  | {
+      readonly kind: 'tests'
+      readonly round: number
+      readonly testIndex: number
+      readonly argv: readonly string[]
+      readonly cause: 'non-zero-exit' | 'timeout-terminated'
+      readonly exitCode: number | null
+      readonly stdout: string
+      readonly stderr: string
+    }
+  | {
+      readonly kind: 'review'
+      readonly round: number
+      readonly feedback: string
+    }
+  | {
+      /** How the parked attempt ended; the terminal entry of its feedback. */
+      readonly kind: 'terminal'
+      readonly outcome: 'blocked' | 'error'
+      readonly code: string
+      readonly reason: string
+    }
+
 /** The persisted `awaiting-reservation → reserved` slot handshake (§13.1, §16). */
 export type WorkAttemptCheckpoint = {
   readonly workAttemptId: string
@@ -239,6 +282,12 @@ export type WorkAttemptCheckpoint = {
   readonly round: number
   readonly slot: 'awaiting-reservation' | 'reserved' | 'released'
   readonly processGroupIds: readonly string[]
+  /**
+   * Feedback accumulated so far, in order. Optional on load so a document
+   * written before this vocabulary existed still resumes; it can never be
+   * reconstructed from a workspace or from earlier evidence.
+   */
+  readonly feedback?: readonly ReworkFeedback[]
 }
 
 /** The exact persisted Wave queue, preserving issue-number Ship order (§12, §13.1). */
@@ -266,12 +315,23 @@ export type ShipCheckpoint = {
 
 /** The discriminated Ticket phase union (§13.1). */
 export type TicketRunState =
-  | { readonly phase: 'waiting'; readonly wave?: number }
+  | {
+      readonly phase: 'waiting'
+      readonly wave?: number
+      /**
+       * Terminal feedback of the previous run's parked attempt, carried into
+       * this run's first Work round (§10.2). Present only when the previous
+       * run parked this Ticket with feedback; read from persisted Run State.
+       */
+      readonly carriedFeedback?: readonly ReworkFeedback[]
+    }
   | { readonly phase: 'working'; readonly wave: number; readonly attempt: WorkAttemptCheckpoint }
   | {
       readonly phase: 'parked'
       readonly wave: number
       readonly workspace?: WorkspaceRef
+      /** The attempt's accumulated feedback plus its terminal entry (§10.2). */
+      readonly feedback?: readonly ReworkFeedback[]
       readonly outcome: {
         readonly kind: 'blocked' | 'error'
         readonly code: string

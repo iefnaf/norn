@@ -90,6 +90,7 @@ import type {
   EffectiveTicketSpec,
   ProcessGroupCheckpoint,
   ReviewEvidence,
+  ReworkFeedback,
   ShippableChange,
   TestEvidence,
   TicketRef,
@@ -153,41 +154,24 @@ export type WorkOutcome = Outcome<ShippableChange, WorkBlockCode, WorkErrorCode>
 // Launch planning: what each agent invocation receives
 // ---------------------------------------------------------------------------
 
-/** One structured feedback entry accumulated across rounds (§10.2). */
-export type RoundFeedback =
-  | {
-      readonly kind: 'setup'
-      /** Round the failure belongs to; 0 marks the attempt's initial setup. */
-      readonly round: number
-      readonly origin: 'initial' | 'candidate'
-      readonly argv: readonly string[]
-      readonly cause: 'non-zero-exit' | 'timeout-terminated'
-      readonly exitCode: number | null
-      readonly stdout: string
-      readonly stderr: string
-    }
-  | {
-      readonly kind: 'tests'
-      readonly round: number
-      readonly testIndex: number
-      readonly argv: readonly string[]
-      readonly cause: 'non-zero-exit' | 'timeout-terminated'
-      readonly exitCode: number | null
-      readonly stdout: string
-      readonly stderr: string
-    }
-  | {
-      readonly kind: 'review'
-      readonly round: number
-      readonly feedback: string
-    }
+/**
+ * One structured feedback entry accumulated across rounds (§10.2). The
+ * persisted vocabulary lives in `runstate/types.ts` so that a parked
+ * attempt's terminal feedback can cross a run boundary through Run State.
+ */
+export type RoundFeedback = ReworkFeedback
 
 /** What the worker invocation is launched with, beyond its bound context. */
 export type WorkerLaunchInput = {
   readonly round: number
   /** The previous round's clean candidate commit, or null at the base. */
   readonly previousCandidateCommit: GitObjectOid | null
-  /** Every structured feedback entry accumulated so far, in order. */
+  /**
+   * Every structured feedback entry accumulated so far, in order: carried
+   * from a previous run's parked attempt when this attempt is the first
+   * round of a new run, then this attempt's own setup, test, and review
+   * feedback. Entries keep the round numbers they were recorded under.
+   */
   readonly feedback: readonly RoundFeedback[]
 }
 
@@ -279,11 +263,19 @@ function renderWorkerPrompt(input: WorkerLaunchInput): string {
     previousCandidateCommit: input.previousCandidateCommit,
     feedback: input.feedback,
   }
+  // A terminal entry exists only on feedback carried from a parked attempt,
+  // so its presence tells the worker that the list spans run boundaries.
+  const carried = input.feedback.some((entry) => entry.kind === 'terminal')
   return (
     'You are the Norn Worker for this Ticket. The launch context bound in NORN_AGENT_CONTEXT ' +
     'carries the Effective Ticket Spec and the exact target base. Amend the attempt-owned ' +
     'branch in this workspace; finish with the norn_complete tool, handing off either your ' +
-    'candidate commit and tree OIDs or a typed block. Round briefing (JSON):\n' +
+    'candidate commit and tree OIDs or a typed block. ' +
+    (carried
+      ? "The feedback below was carried from a previous run's parked attempt for this Ticket; " +
+        'entries keep the round numbers they were recorded under. '
+      : '') +
+    'Round briefing (JSON):\n' +
     canonicalJson(brief as CanonicalJsonValue)
   )
 }
@@ -395,6 +387,8 @@ export type WorkAttemptTerminal =
       readonly kind: 'parked'
       readonly ticket: TicketRef
       readonly workspace?: WorkspaceRef
+      /** The attempt's accumulated feedback plus its terminal entry (§10.2). */
+      readonly feedback: readonly ReworkFeedback[]
       readonly outcome: {
         readonly kind: 'blocked' | 'error'
         readonly code: string
@@ -455,6 +449,12 @@ export type RoundGateDeps = {
 export type WorkAttemptParams = {
   readonly input: WorkInput
   readonly workAttemptId: string
+  /**
+   * Terminal feedback of the previous run's parked attempt for this Ticket
+   * (§10.2). Seeds this attempt's accumulated feedback when it starts fresh;
+   * ignored when a persisted attempt already carries its own feedback.
+   */
+  readonly carriedFeedback?: readonly RoundFeedback[]
   /** Identity of the Task Map the Ticket belongs to (sidecar binding, §17). */
   readonly map: AgentMapBinding
   readonly repositoryRoot: string
@@ -558,6 +558,7 @@ export function runStateWorkAttemptStore(options: {
               phase: 'parked' as const,
               wave,
               ...(terminal.workspace === undefined ? {} : { workspace: terminal.workspace }),
+              feedback: terminal.feedback,
               outcome: terminal.outcome,
             }
       const alreadyParked = state.parkedTickets.some((ref) => ref.issueId === ticketIssueId)
@@ -750,6 +751,13 @@ type GateState = {
   readonly processes: Map<string, ProcessGroupCheckpoint>
   reserved: boolean
   readonly workspace: TicketWorkspaceRef
+  /**
+   * The attempt's accumulated structured feedback, in order (§10.2): carried
+   * from a previous run's parked attempt plus this attempt's own entries.
+   * Every persisted attempt checkpoint writes it; a park persists it with
+   * its terminal entry so a later run can carry it again.
+   */
+  readonly feedback: ReworkFeedback[]
 }
 
 /**
@@ -833,6 +841,13 @@ export async function runWorkAttempt(
   const processes = new Map<string, ProcessGroupCheckpoint>(
     (loaded.value?.processes ?? []).map((group) => [group.id, group]),
   )
+  // The attempt's accumulated structured feedback (§10.2): a persisted
+  // attempt owns its list; a fresh attempt seeds it with the previous run's
+  // carried terminal feedback, never with anything read from a workspace or
+  // an earlier run's evidence.
+  const feedback: ReworkFeedback[] = [
+    ...(loaded.value?.attempt.feedback ?? params.carriedFeedback ?? []),
+  ]
   const state: GateState = {
     record: {
       attempt: {
@@ -843,12 +858,14 @@ export async function runWorkAttempt(
         round: loaded.value?.attempt.round ?? 0,
         slot: loaded.value?.attempt.slot ?? 'awaiting-reservation',
         processGroupIds: [...processes.keys()],
+        feedback: [...feedback],
       },
       processes: [...processes.values()],
     },
     processes,
     reserved: loaded.value?.attempt.slot === 'reserved',
     workspace: workspaceRef,
+    feedback,
   }
 
   // --- record the attempt, then reserve one slot (§10.1, §16) ------------
@@ -967,7 +984,6 @@ export async function runWorkAttempt(
 
   // --- initial setup at the base; a clean non-pass is worker feedback ----
 
-  const feedback: RoundFeedback[] = []
   if (state.record.attempt.round === 0) {
     const setup = await runGateCommandList(gateDeps, {
       commands: params.setup,
@@ -980,7 +996,7 @@ export async function runWorkAttempt(
     })
     if (setup.kind !== 'ok') return finishAttempt(deps, state, setup)
     const initial = initialSetupFeedback(setup.value)
-    if (initial !== undefined) feedback.push(initial)
+    if (initial !== undefined) state.feedback.push(initial)
   }
 
   // --- the rounds ---------------------------------------------------------
@@ -998,7 +1014,7 @@ export async function runWorkAttempt(
     const result = await runRound(deps, params, state, {
       round,
       previousCandidate,
-      feedback,
+      feedback: state.feedback,
       gateDeps,
       newInvocationId,
       launchIntentHandle,
@@ -1016,7 +1032,7 @@ export async function runWorkAttempt(
     // Continue: the next round starts from this round's clean candidate
     // commit, with the accumulated feedback (§10.2).
     previousCandidate = result.candidateCommit
-    feedback.push(...result.feedback)
+    state.feedback.push(...result.feedback)
   }
 
   return finishAttempt(deps, state, blocked({
@@ -1027,7 +1043,11 @@ export async function runWorkAttempt(
       'setup, test, and review gate',
     sharedWrite: 'none',
     evidence: [
-      { workAttemptId: params.workAttemptId, rounds: params.maxWorkRounds, feedback: [...feedback] },
+      {
+        workAttemptId: params.workAttemptId,
+        rounds: params.maxWorkRounds,
+        feedback: [...state.feedback],
+      },
     ],
   }))
 }
@@ -1836,7 +1856,11 @@ async function persistWorking(
   state: GateState,
 ): Promise<Outcome<void, never, 'control-store'>> {
   state.record = {
-    attempt: { ...state.record.attempt, processGroupIds: [...state.processes.keys()] },
+    attempt: {
+      ...state.record.attempt,
+      processGroupIds: [...state.processes.keys()],
+      feedback: [...state.feedback],
+    },
     processes: [...state.processes.values()],
   }
   const saved = await store.saveWorking(state.record)
@@ -1875,12 +1899,27 @@ async function finishAttempt(
   if (outcome.kind === 'ok') return finishSealed(deps, state, outcome.value)
   if (outcome.scope === 'run') return outcome
 
+  // The parked Ticket keeps the attempt's accumulated feedback plus one
+  // terminal entry describing how it ended, so a later run for this map can
+  // carry that context into its first Work round (§10.2). This is feedback,
+  // never evidence.
+  const feedback: ReworkFeedback[] = [
+    ...state.feedback,
+    {
+      kind: 'terminal',
+      outcome: outcome.kind === 'blocked' ? 'blocked' : 'error',
+      code: outcome.code,
+      reason: outcome.reason,
+    },
+  ]
+
   const parked = await deps.store.saveTerminal(
     state.record.attempt.workAttemptId,
     {
       kind: 'parked',
       ticket: state.record.attempt.input.ticket,
       ...(options.retainWorkspace === false ? {} : { workspace: state.workspace }),
+      feedback,
       outcome: {
         kind: outcome.kind === 'blocked' ? 'blocked' : 'error',
         code: outcome.code,

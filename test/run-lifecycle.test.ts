@@ -10,17 +10,22 @@
  * criteria map one-to-one onto the describes below.
  */
 import assert from 'node:assert/strict'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, it } from 'node:test'
 
+import type { ReviewerCompletion } from '../src/agents/completion.ts'
 import { resolveRunConfigText } from '../src/config/run-config.ts'
 import { runGit } from '../src/adapters/git-repository.ts'
 import { gitText } from './helpers/round-gate-fixtures.ts'
 import { encodePathSegment } from '../src/config/paths.ts'
 import { acquireMapLock } from '../src/runstate/locks.ts'
 import { saveRunState } from '../src/runstate/run-state-store.ts'
-import type { RunState } from '../src/runstate/types.ts'
+import type {
+  EvidenceGateV1,
+  RunState,
+  ReworkFeedback,
+} from '../src/runstate/types.ts'
 import { createTicketWorkspace } from '../src/work/workspace.ts'
 import { makeRunHarness } from './helpers/run-fixtures.ts'
 import type { MemberSpec, RunHarness } from './helpers/run-fixtures.ts'
@@ -711,6 +716,261 @@ describe('one live coordinator per map', () => {
       // their remote Delivery Records.
       assert.deepEqual(harness.workedTickets().slice(3), ['I_B'])
       assert.equal(ticketStateOf(harness, 'I_B').phase, 'completed')
+    } finally {
+      harness.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Rework context across runs (§10.2): a parked attempt's structured feedback
+// reaches the next run's first Work round through persisted Run State alone —
+// never through the prior run's workspaces, branches, or test/review evidence.
+// ---------------------------------------------------------------------------
+
+/** A reviewer script that iterates once per finding, then passes. */
+function iterateEachThenPass(findings: readonly string[]): () => ReviewerCompletion {
+  let calls = 0
+  return () => {
+    calls += 1
+    if (calls <= findings.length) {
+      return { discriminant: 'iterate', feedback: findings[calls - 1]! }
+    }
+    return { discriminant: 'pass' }
+  }
+}
+
+/**
+ * Craft the state a run leaves when its attempt for ticket A is in flight:
+ * `working` at round 1 with its persisted feedback, no live process group.
+ */
+function craftWorkingAttemptState(
+  harness: RunHarness,
+  options: {
+    readonly status?: 'running' | 'aborted'
+    readonly feedback?: readonly ReworkFeedback[]
+  } = {},
+): RunState {
+  const snapshot = harness.snapshot()
+  const ticket = snapshot.tickets.find((candidate) => candidate.ref.issueId === 'I_A')!
+  const baseSha = `sha1:${gitText(harness.repo.root, ['rev-parse', 'HEAD'])}`
+  const baseTreeOid = `sha1:${gitText(harness.repo.root, ['rev-parse', 'HEAD^{tree}'])}`
+  const workAttemptId = 'wa-w1-t1'
+  const branch = `norn/run-crafted/${ticket.ref.number}/${workAttemptId}`
+  const crafted = harness.craftRunningState()
+  return {
+    ...crafted,
+    ...(options.status === undefined ? {} : { status: options.status }),
+    wave: 1,
+    tickets: {
+      [ticket.ref.issueId]: {
+        phase: 'working',
+        wave: 1,
+        attempt: {
+          workAttemptId,
+          input: {
+            ticket: ticket.ref,
+            spec: {
+              mapTitle: snapshot.title,
+              mapBody: snapshot.body,
+              mapRevision: snapshot.mapRevision,
+              ticketTitle: ticket.title,
+              ticketBody: ticket.body,
+              ticketRevision: ticket.ticketRevision,
+            },
+            target: { branch: 'main', baseSha, baseTreeOid },
+          },
+          branch,
+          workspace: {
+            kind: 'ticket',
+            repositoryId: REPOSITORY_ID,
+            runId: 'run-crafted',
+            path: join(
+              harness.repositoryHome,
+              'runs',
+              'run-crafted',
+              'workspaces',
+              String(ticket.ref.number),
+              workAttemptId,
+            ),
+            branch,
+            workAttemptId,
+          },
+          round: 1,
+          slot: 'released',
+          processGroupIds: [],
+          ...(options.feedback === undefined ? {} : { feedback: options.feedback }),
+        },
+      },
+    },
+  }
+}
+
+describe('rework context across runs', () => {
+  it('carries a parked attempt’s terminal feedback into the next run’s first Work round', async () => {
+    const findings = ['cover the failure path', 'the predicate is still wrong']
+    const harness = await makeRunHarness({
+      label: 'rework-carry',
+      members: [ticketA()],
+      reviewer: iterateEachThenPass(findings),
+    })
+    try {
+      // The fixture budget is 2 rounds: two reviewer iterates exhaust it.
+      const first = await harness.run()
+      assert.equal(first.kind, 'blocked')
+      assert.equal(first.code, 'no-eligible-frontier')
+
+      const parked = ticketStateOf(harness, 'I_A')
+      assert.ok(parked.phase === 'parked', 'the Ticket parked with its feedback')
+      assert.deepEqual(
+        (parked.feedback ?? []).map((entry) => entry.kind),
+        ['review', 'review', 'terminal'],
+      )
+
+      // Remove the parked run's complete run-owned area before the next run:
+      // the carry can only come from the persisted Run State document.
+      rmSync(join(harness.repositoryHome, 'runs', 'run-1'), { recursive: true, force: true })
+
+      const second = await harness.run()
+      assert.equal(second.kind, 'ok', JSON.stringify(second))
+      assert.equal(second.value.label, 'passed')
+      assert.equal(second.value.runId, 'run-2')
+
+      // The next run's first Work round received every prior entry, including
+      // how the parked attempt ended.
+      const brief = harness.workBriefs.at(-1)!
+      assert.equal(brief.round, 1)
+      assert.equal(brief.previousCandidateCommit, null)
+      assert.deepEqual(
+        brief.feedback.map((entry) => entry.kind),
+        ['review', 'review', 'terminal'],
+      )
+      assert.equal(brief.feedback[0]!.kind === 'review' ? brief.feedback[0]!.feedback : '', findings[0])
+      assert.equal(brief.feedback[1]!.kind === 'review' ? brief.feedback[1]!.feedback : '', findings[1])
+      assert.deepEqual(brief.feedback.at(-1), {
+        kind: 'terminal',
+        outcome: 'blocked',
+        code: 'work-rounds-exhausted',
+        reason:
+          'the Work attempt used its 2 worker round(s) without a passing setup, test, and review gate',
+      })
+
+      // The production Worker prompt actually launched carries the same
+      // feedback, so a real Pi worker starts with the prior context.
+      const workerLaunches = harness.runner.launches.filter((entry) => entry.role === 'worker')
+      const prompt = workerLaunches.at(-1)!.argv.at(-1)!
+      assert.match(prompt, /cover the failure path/)
+      assert.match(prompt, /the predicate is still wrong/)
+      assert.match(prompt, /work-rounds-exhausted/)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('carries the in-flight feedback of an aborted run', async () => {
+    const harness = await makeRunHarness({ label: 'rework-abort-working', members: [ticketA()] })
+    try {
+      const saved = saveRunState(
+        harness.repositoryHome,
+        ENCODED_MAP,
+        craftWorkingAttemptState(harness, {
+          status: 'aborted',
+          feedback: [{ kind: 'review', round: 1, feedback: 'an in-flight finding' }],
+        }),
+      )
+      assert.ok(saved.kind === 'ok', `state persist failed: ${JSON.stringify(saved)}`)
+
+      const outcome = await harness.run()
+      assert.ok(outcome.kind === 'ok', `run failed: ${JSON.stringify(outcome)}`)
+      assert.deepEqual(harness.workBriefs.at(-1)!.feedback, [
+        { kind: 'review', round: 1, feedback: 'an in-flight finding' },
+      ])
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('parks an invalidated in-flight attempt with its feedback and terminal entry', async () => {
+    const harness = await makeRunHarness({
+      label: 'rework-invalidate',
+      members: [ticketA(), ticketB()],
+    })
+    try {
+      // Ticket A is mid-attempt with feedback; Ticket B is already parked, so
+      // the run finds no unparked frontier and terminalizes, invalidating A.
+      const snapshot = harness.snapshot()
+      const parkRef = snapshot.tickets.find((candidate) => candidate.ref.issueId === 'I_B')!.ref
+      const crafted = craftWorkingAttemptState(harness, {
+        feedback: [{ kind: 'review', round: 1, feedback: 'an in-flight finding' }],
+      })
+      const saved = saveRunState(harness.repositoryHome, ENCODED_MAP, {
+        ...crafted,
+        tickets: {
+          ...crafted.tickets,
+          [parkRef.issueId]: {
+            phase: 'parked',
+            wave: 1,
+            outcome: { kind: 'blocked', code: 'worker-block', reason: 'scripted', evidence: [] },
+          },
+        },
+        parkedTickets: [parkRef],
+      })
+      assert.ok(saved.kind === 'ok', `state persist failed: ${JSON.stringify(saved)}`)
+
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'blocked')
+      assert.equal(outcome.code, 'no-eligible-frontier')
+
+      const invalidated = ticketStateOf(harness, 'I_A')
+      assert.ok(invalidated.phase === 'parked', 'the in-flight attempt was invalidated')
+      assert.deepEqual(invalidated.feedback, [
+        { kind: 'review', round: 1, feedback: 'an in-flight finding' },
+        {
+          kind: 'terminal',
+          outcome: 'blocked',
+          code: 'no-eligible-frontier',
+          reason: 'the run ended before this result shipped; it was invalidated',
+        },
+      ])
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('carries the parked feedback of an explicitly aborted run', async () => {
+    const findings = ['a finding from the aborted run', 'a second finding']
+    const harness = await makeRunHarness({
+      label: 'rework-abort',
+      members: [ticketA()],
+      reviewer: iterateEachThenPass(findings),
+    })
+    try {
+      const first = await harness.run()
+      assert.equal(first.kind, 'blocked')
+
+      // An abort terminalizes a *running* state as `aborted` and keeps it on
+      // disk; the parked Ticket and its structured feedback survive it. The
+      // fixture run is already terminal, so drop its report to model exactly
+      // the document the abort protocol leaves behind.
+      const parkedState = harness.runState()!
+      const aborted = saveRunState(harness.repositoryHome, ENCODED_MAP, {
+        ...parkedState,
+        status: 'aborted',
+        report: undefined,
+      })
+      assert.ok(aborted.kind === 'ok', `abort persist failed: ${JSON.stringify(aborted)}`)
+
+      const second = await harness.run()
+      assert.ok(second.kind === 'ok', `run 2 failed: ${JSON.stringify(second)}`)
+      const brief = harness.workBriefs.at(-1)!
+      assert.deepEqual(
+        brief.feedback.map((entry) => entry.kind),
+        ['review', 'review', 'terminal'],
+      )
+      assert.equal(
+        brief.feedback[0]!.kind === 'review' ? brief.feedback[0]!.feedback : '',
+        findings[0],
+      )
     } finally {
       harness.cleanup()
     }

@@ -55,6 +55,8 @@ import type { MapOverrides } from './map-fixtures.ts'
 import { osTargetLock } from '../../src/ship/push.ts'
 import { runMap } from '../../src/run/lifecycle.ts'
 import type { RunLifecycleDeps, RunMapOutcome } from '../../src/run/lifecycle.ts'
+import { piWorkerLaunch } from '../../src/work/round-gate.ts'
+import type { WorkerLaunchInput } from '../../src/work/round-gate.ts'
 import { loadRunState } from '../../src/runstate/run-state-store.ts'
 import type {
   EvidenceGateV1,
@@ -274,6 +276,7 @@ export type AgentLaunchRecord = {
   readonly ticketIssueId: string | undefined
   readonly round: number | null
   readonly cwd: string
+  readonly argv: readonly string[]
   readonly env: Readonly<Record<string, string>>
 }
 
@@ -305,6 +308,7 @@ export function fakeRunRunner(
         ticketIssueId: context.ticket?.issueId,
         round: context.work?.round ?? null,
         cwd: request.cwd,
+        argv: [...request.argv],
         env: request.env ?? {},
       })
       if (context.role === 'worker') store.observed.workerLaunches += 1
@@ -390,6 +394,8 @@ export type RunHarness = {
   readonly gateway: FakeGateway
   readonly runner: FakeRunAgents
   readonly commands: FakeShipCommands
+  /** Every worker launch input, in launch order (production planner input). */
+  readonly workBriefs: readonly WorkerLaunchInput[]
   /** The ticket issue IDs that have been worked, in launch order. */
   workedTickets(): readonly string[]
   /** The full lifecycle deps the harness drives `runMap` with. */
@@ -534,6 +540,7 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
 
   let runCounter = 0
   let shipInvocation = 0
+  const workBriefs: WorkerLaunchInput[] = []
 
   const buildDeps = (): RunLifecycleDeps => {
     const realPush = gitCliPush()
@@ -557,9 +564,16 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
       },
       writer: writer.writer,
       launches: {
-        planWorkerFor: () => (input) => {
-          void input
-          return { argv: ['fake-worker'] }
+        planWorkerFor: (workAttemptId, worker) => (input) => {
+          // Exercise the production worker prompt in every lifecycle test:
+          // the round briefing is exactly what a real Pi worker receives.
+          workBriefs.push(input)
+          return piWorkerLaunch(input, {
+            model: worker.model,
+            thinking: worker.thinking,
+            extensionPath: 'fake-extension.ts',
+            piSessionId: `${workAttemptId}-worker-r${input.round}-pi`,
+          })
         },
         planWorkReviewerFor: () => () => ({
           argv: ['pi', '--tools', 'read,grep,find,ls,norn_complete'],
@@ -602,6 +616,7 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
     gateway,
     runner,
     commands,
+    workBriefs,
     workedTickets: () =>
       runner.launches.filter((entry) => entry.role === 'worker').map((entry) => entry.ticketIssueId!),
     deps: buildDeps,

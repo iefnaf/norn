@@ -93,6 +93,7 @@ import { loadAllRunStates, loadRunState, saveRunState } from '../runstate/run-st
 import { reconcileStaleWorkSlots } from '../runstate/slot-registry.ts'
 import type {
   EvidenceGateV1,
+  ReworkFeedback,
   RunReport,
   RunState,
   TicketRunState,
@@ -549,7 +550,7 @@ export async function runMap(deps: RunLifecycleDeps, mapUrl: string): Promise<Ru
         status: 'running',
         wave: 0,
         parkedTickets: [],
-        tickets: {},
+        tickets: carriedTicketRecords(existingRead.value, snapshot),
         activeProcesses: [],
       }
       // Claim this run's complete member set atomically under the repository
@@ -612,6 +613,50 @@ function defaultRunId(): string {
 
 function isTameId(value: string): boolean {
   return /^[a-z0-9][a-z0-9-]{0,127}$/.test(value)
+}
+
+/**
+ * The accumulated feedback a persisted Ticket record owns, wherever the
+ * record sits in the phase union (§10.2): a parked Ticket keeps it with its
+ * terminal entry, a waiting Ticket from its carry, and a live attempt with
+ * its checkpoint. Every other phase has none: a shippable, shipping, or
+ * completed Ticket has already left its rework context behind.
+ */
+function recordFeedback(record: TicketRunState): readonly ReworkFeedback[] | undefined {
+  switch (record.phase) {
+    case 'parked':
+      return record.feedback
+    case 'waiting':
+      return record.carriedFeedback
+    case 'working':
+      return record.attempt.feedback
+    default:
+      return undefined
+  }
+}
+
+/**
+ * The waiting records a new run starts with: one for every member the
+ * previous run's persisted state left with accumulated feedback — parked,
+ * already carrying it, or parked mid-attempt (§10.2, §13.2). Feedback
+ * crosses the run boundary only through this document — never through the
+ * previous run's branches, workspaces, or test and review evidence — and
+ * only into the first Work round of the new attempt.
+ */
+function carriedTicketRecords(
+  previous: RunState | undefined,
+  snapshot: TaskMapSnapshot,
+): Record<string, TicketRunState> {
+  if (previous === undefined) return {}
+  const records: Record<string, TicketRunState> = {}
+  for (const ticket of snapshot.tickets) {
+    const record = previous.tickets[ticket.ref.issueId]
+    if (record === undefined) continue
+    const feedback = recordFeedback(record)
+    if (feedback === undefined || feedback.length === 0) continue
+    records[ticket.ref.issueId] = { phase: 'waiting', carriedFeedback: [...feedback] }
+  }
+  return records
 }
 
 /**
@@ -1540,6 +1585,11 @@ async function runOneWork(
   entry: WorkEntry,
 ) {
   const ticket = snapshot.tickets.find((candidate) => candidate.ref.issueId === entry.ref.issueId)!
+  // A Ticket this run has not started yet may carry the previous run's
+  // parked terminal feedback in its waiting record; a resumed attempt
+  // already owns its persisted feedback (§10.2).
+  const waiting = state.tickets[entry.ref.issueId]
+  const carriedFeedback = waiting?.phase === 'waiting' ? waiting.carriedFeedback : undefined
   const gateDeps: RoundGateDeps = {
     runner: ctx.deps.runner,
     commands: ctx.deps.commands,
@@ -1592,6 +1642,7 @@ async function runOneWork(
       },
     },
     workAttemptId: entry.workAttemptId,
+    ...(carriedFeedback === undefined ? {} : { carriedFeedback }),
     map: {
       githubHost: state.map.githubHost,
       repositoryId: state.map.repositoryId,
@@ -2255,10 +2306,20 @@ function invalidateRemaining(
       record.phase === 'shippable' || record.phase === 'shipping'
         ? record.change.workspace
         : record.attempt.workspace
+    // An invalidated live attempt keeps its accumulated feedback plus this
+    // terminal entry; a later run for the map carries it on (§10.2).
+    const feedback =
+      record.phase === 'working' && record.attempt.feedback !== undefined
+        ? [
+            ...record.attempt.feedback,
+            { kind: 'terminal' as const, outcome: kind, code, reason },
+          ]
+        : undefined
     next = withTicket(next, issueId, {
       phase: 'parked',
       wave: record.wave,
       ...(workspace === undefined ? {} : { workspace }),
+      ...(feedback === undefined ? {} : { feedback }),
       outcome: { kind, code, reason, evidence: [{ invalidated: true, label }] },
     })
     if (!next.parkedTickets.some((entry) => entry.issueId === issueId)) {
