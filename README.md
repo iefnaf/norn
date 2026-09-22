@@ -16,9 +16,10 @@ Norn is designed as a Pi package whose extension exposes one `/norn` command wit
 
 Per-repository configuration and runtime state live under `$PI_CODING_AGENT_DIR/norn` (default `~/.pi/agent/norn`), not inside the target repository. Distinct Task Maps in one repository may Work concurrently with a shared repository-wide capacity; Ship remains serial per target branch. An active Map may append new Tickets through a Compatible Map Extension, provided no existing specification or blocker set changes.
 
-The design deliberately starts with one concrete runner rather than a generic workflow framework. The project is currently in the design phase.
+The design deliberately starts with one concrete runner rather than a generic workflow framework. The implementation is complete; validation now combines the automated suite with live GitHub, Git, Pi, Herdr, and model checks.
 
 - [Design](docs/design.md)
+- [Validation runbook](docs/validation-runbook.md)
 - [Domain language](CONTEXT.md)
 
 Initial private validation fixture (authenticated access required): [`iefnaf/taskflow-dag-demo#6`](https://github.com/iefnaf/taskflow-dag-demo/issues/6).

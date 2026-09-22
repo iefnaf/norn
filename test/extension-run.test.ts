@@ -205,7 +205,10 @@ describe('productionLaunchPlans', () => {
       family: 'provider-b',
     })(reviewerInput)
     const joined = reviewerPlan.argv.join(' ')
-    assert.match(joined, /--tools read,grep,find,ls,norn_complete/)
+    // The reviewer's read-only capability set is owned by the completion
+    // extension; the CLI only removes every write-capable built-in.
+    assert.match(joined, /--no-builtin-tools/)
+    assert.doesNotMatch(joined, /--tools/)
     assert.doesNotMatch(joined, /bash/)
     assert.match(joined, /--session-id wa-w1-t1-reviewer-r1-pi/)
 
@@ -238,7 +241,8 @@ describe('productionLaunchPlans', () => {
       testOutput: [],
     })
     const completionJoined = completionPlan.argv.join(' ')
-    assert.match(completionJoined, /--tools read,grep,find,ls,norn_complete/)
+    assert.match(completionJoined, /--no-builtin-tools/)
+    assert.doesNotMatch(completionJoined, /--tools/)
     assert.match(completionJoined, /--session-id run-x-mc1-rev-pi/)
   })
 })

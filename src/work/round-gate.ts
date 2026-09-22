@@ -68,7 +68,11 @@ import type {
   ReviewerCompletion,
   WorkerCompletion,
 } from '../agents/completion.ts'
-import { NORN_AGENT_CONTEXT_ENV, NORN_COMPLETE_TOOL_NAME } from '../agents/completion-extension.ts'
+import {
+  NORN_AGENT_CONTEXT_ENV,
+  NORN_COMPLETE_TOOL_NAME,
+  NORN_REVIEWER_TOOL_ALLOWLIST,
+} from '../agents/completion-extension.ts'
 import { herdrAgentName, planAgentPiArgv } from '../agents/herdr-runner.ts'
 import { interruptAgentInvocation, settleAgentInvocation } from '../agents/runner.ts'
 import type {
@@ -212,31 +216,35 @@ export type WorkerLaunchPlanner = (input: WorkerLaunchInput) => AgentLaunchPlan
 export type ReviewerLaunchPlanner = (input: ReviewerLaunchInput) => AgentLaunchPlan
 
 /**
- * The read-only tool allowlist of every reviewer invocation (§3, §10.2):
- * read-capable built-ins plus the completion tool the settlement protocol
- * requires. Write-capable built-ins (`bash`, `powershell`, `edit`, `write`)
- * are never present.
+ * The read-only capability allowlist of every reviewer invocation (§3,
+ * §10.2): read-capable inspection plus the completion tool the settlement
+ * protocol requires. Write-capable built-ins (`bash`, `powershell`, `edit`,
+ * `write`) are never present.
+ *
+ * The list is enforced by the completion extension inside the reviewer
+ * process, not by Pi's CLI `--tools` allowlist: that allowlist is resolved
+ * while extensions load, so an extension-contributed name may not be known in
+ * time and a single unknown name empties the whole set. Reviewer launches use
+ * `--no-builtin-tools` instead, which no version of Pi can resolve away.
  */
-export const REVIEWER_READ_ONLY_TOOLS: readonly string[] = [
-  'read',
-  'grep',
-  'find',
-  'ls',
-  NORN_COMPLETE_TOOL_NAME,
-]
+export const REVIEWER_READ_ONLY_TOOLS: readonly string[] = NORN_REVIEWER_TOOL_ALLOWLIST
 
 /** Built-in Pi tools that can modify the repository or the host. */
 export const WRITE_CAPABLE_TOOLS: readonly string[] = ['bash', 'powershell', 'edit', 'write']
 
 /**
- * Whether an agent argv is read-only: it must carry a `--tools` allowlist
- * that contains no write-capable tool and still exposes the completion tool
- * (without which the invocation could never settle). The Work layer owns
- * this policy (§10.2); the agent runner only launches what it is given.
+ * Whether an agent argv exposes only read-only capability. The reviewer
+ * launch form is `--no-builtin-tools`: the completion extension then owns the
+ * reviewer's whole capability set (`REVIEWER_READ_ONLY_TOOLS`). The older
+ * `--tools` form is still accepted when its list carries no write-capable
+ * tool and still exposes the completion tool — without which the invocation
+ * could never settle. The Work layer owns this policy (§10.2); the agent
+ * runner only launches what it is given.
  */
 export function isReadOnlyAgentArgv(argv: readonly string[]): boolean {
   const index = argv.indexOf('--tools')
-  if (index === -1 || index + 1 >= argv.length) return false
+  if (index === -1) return argv.includes('--no-builtin-tools')
+  if (index + 1 >= argv.length) return false
   const tools = argv[index + 1]!
     .split(',')
     .map((tool) => tool.trim())
@@ -302,6 +310,7 @@ export function piWorkerLaunch(
         { model: options.model, thinking: options.thinking },
         { extensionPath: options.extensionPath, piSessionId: options.piSessionId },
       ),
+      '--',
       renderWorkerPrompt(input),
     ],
   }
@@ -334,9 +343,10 @@ function renderReviewerPrompt(input: ReviewerLaunchInput): string {
 
 /**
  * The production reviewer launch plan: the configured Pi model with the
- * completion extension and the strict read-only tool allowlist of §10.2.
- * Write-capable built-ins are absent, so the reviewer cannot modify the
- * repository it judges.
+ * completion extension and the strict read-only capability set of §10.2.
+ * `--no-builtin-tools` removes every write-capable built-in at the CLI, and
+ * the completion extension registers exactly `REVIEWER_READ_ONLY_TOOLS` — so
+ * the reviewer cannot modify the repository it judges.
  */
 export function piReadOnlyReviewerLaunch(
   input: ReviewerLaunchInput,
@@ -353,8 +363,8 @@ export function piReadOnlyReviewerLaunch(
         { model: options.model, thinking: options.thinking },
         { extensionPath: options.extensionPath, piSessionId: options.piSessionId },
       ),
-      '--tools',
-      REVIEWER_READ_ONLY_TOOLS.join(','),
+      '--no-builtin-tools',
+      '--',
       renderReviewerPrompt(input),
     ],
   }

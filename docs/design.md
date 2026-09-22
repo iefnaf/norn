@@ -13,7 +13,7 @@ The design priorities are:
 1. **Evidence** — tests and reviews bind to exact Git trees; agent claims alone are not evidence.
 2. **Determinism** — code, not prompts, controls scheduling, retries, and side effects.
 3. **Recoverability** — a process restart can safely continue a partially completed shipment.
-4. **Visibility** — delegated agents run in Herdr panes the operator can inspect and steer.
+4. **Visibility** — delegated agents run in their own Herdr tabs, which the operator can inspect and steer without crowding one tab.
 5. **Simplicity** — prefer one concrete runner over a speculative framework.
 
 ## 2. Operator interface
@@ -22,7 +22,7 @@ The design priorities are:
 
 Norn is delivered as a Pi package. Its Pi extension registers one `/norn` command with subcommands and calls the Norn runner directly. The current Pi agent does not interpret an orchestration prompt or decide scheduling, retries, or side effects.
 
-The extension renders structured runner events in the operator's current Pi pane. Worker and Reviewer Pi processes run in visible Herdr panes that the operator can inspect and steer.
+The extension renders structured runner events in the operator's current Pi pane. Worker and Reviewer Pi processes run in visible Herdr tabs — one tab per invocation — that the operator can inspect and steer; each tab is closed when its invocation settles.
 
 ### 2.2 Invocation context
 
@@ -196,7 +196,7 @@ The five lower seams isolate external effects. Each has one built-in production 
 
 - **GitHub gateway** — resolve stable repository and issue identities; load Task Maps, Ticket state, topology, timelines, and evidence; write evidence records; close and reopen issues.
 - **Git repository** — identify the local repository; create and inspect workspaces, commits, and trees; reconcile candidates; fetch and push without force.
-- **Visible agent runner** — launch Worker and Reviewer Pi processes in Herdr, settle their complete process groups, and return validated completion sidecars.
+- **Visible agent runner** — launch Worker and Reviewer Pi processes in Herdr tabs, settle their complete process groups, close the tab the invocation owned, and return validated completion sidecars.
 - **Command runner** — execute configured argument arrays with explicit working directories, environments, timeouts, process-group termination, and captured output.
 - **Local control store** — load repository metadata and configuration; atomically persist Run State; enforce map, repository, and target locks; account for Work slots and active process reservations.
 

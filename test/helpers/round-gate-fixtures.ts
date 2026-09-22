@@ -140,12 +140,15 @@ export type LaunchRecord = {
 export type FakeAgents = VisibleAgentRunner & {
   readonly launches: readonly LaunchRecord[]
   readonly terminated: readonly string[]
+  /** Handles whose post-settlement cleanup ran (the runner's `release`). */
+  readonly released: readonly string[]
 }
 
 /**
  * The fake Visible Agent Runner: `launch` runs the script (real git effects,
  * then the completion sidecar through `CompletionStore`), `waitForExit`
- * returns immediately, and `terminate` records the interrupted invocation.
+ * returns immediately, `terminate` records the interrupted invocation, and
+ * `release` records the post-settlement cleanup of a normally exited one.
  * A mode of `hang` or `exit-no-sidecar` launches without writing a sidecar;
  * `waitForExit` then never resolves or resolves with no sidecar present, so
  * the settlement engine reports timeout or protocol-error.
@@ -163,6 +166,7 @@ export function fakeAgentRunner(
 ): FakeAgents {
   const launches: LaunchRecord[] = []
   const terminated: string[] = []
+  const released: string[] = []
   const hangingHandles = new Set<string>()
   let reviewerCalls = 0
   let nextHandle = 0
@@ -171,6 +175,7 @@ export function fakeAgentRunner(
     kind: 'local-process',
     launches,
     terminated,
+    released,
     async launch(request) {
       const role = request.context.role
       const invocationId = request.context.invocationId
@@ -210,7 +215,8 @@ export function fakeAgentRunner(
     },
     attach(adapterHandle: string): AttachedAgentProcess {
       return { kind: 'local-process', adapterHandle }
-    },    async isLive(): Promise<boolean> {
+    },
+    async isLive(): Promise<boolean> {
       return false
     },
     async waitForExit(processRef: AttachedAgentProcess): Promise<'exited' | 'timeout'> {
@@ -222,6 +228,9 @@ export function fakeAgentRunner(
     async terminate(processRef) {
       terminated.push(processRef.adapterHandle)
       return 'terminated'
+    },
+    async release(processRef) {
+      released.push(processRef.adapterHandle)
     },
   }
 }

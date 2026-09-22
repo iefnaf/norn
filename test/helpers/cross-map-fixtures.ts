@@ -335,6 +335,8 @@ export class GatedRunner implements VisibleAgentRunner {
     return 'terminated'
   }
 
+  async release(): Promise<void> {}
+
   /** The real process-group ID behind a crafted local-process handle, if any. */
   private realPgidOf(adapterHandle: string): number | undefined {
     try {

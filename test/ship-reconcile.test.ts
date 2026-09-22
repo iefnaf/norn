@@ -250,6 +250,7 @@ function preconditionHarness(script: PreconditionScript = {}, alreadyShipped = f
       isLive: async () => false,
       waitForExit: async () => 'exited',
       terminate: async () => 'terminated',
+      release: async () => undefined,
     },
     commands: {
       execute: async () => {

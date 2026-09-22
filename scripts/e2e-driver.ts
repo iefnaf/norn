@@ -71,13 +71,19 @@ const CHOICES = {
     { argv: ['npm', 'test'], timeoutMs: SUGGESTED_COMMAND_TIMEOUT_MS },
   ] as readonly CommandSpecInput[],
   worker: {
-    model: 'zai-coding-cn/glm-5.3',
+    model: process.env.NORN_E2E_WORKER_MODEL ?? 'deepseek/deepseek-flash',
     thinking: 'low',
     timeoutMs: SUGGESTED_WORKER_TIMEOUT_MS,
   } satisfies AgentRoleInput,
   reviewer: {
-    model: 'openai-codex/gpt-5.6-luna',
-    thinking: 'minimal',
+    // Provider credentials are the one part of the fixture that varies
+    // between environments: the Reviewer must come from a different provider
+    // family than the Worker, and the level must be one that model supports.
+    // These defaults were verified working when the driver was last run;
+    // override them per environment instead of editing this file
+    // (NORN_E2E_REVIEWER_MODEL / NORN_E2E_REVIEWER_THINKING).
+    model: process.env.NORN_E2E_REVIEWER_MODEL ?? 'zhipu/glm-5.3',
+    thinking: process.env.NORN_E2E_REVIEWER_THINKING ?? 'low',
     timeoutMs: SUGGESTED_REVIEWER_TIMEOUT_MS,
   } satisfies AgentRoleInput,
   maxWorkRounds: Number(process.env.NORN_E2E_MAX_WORK_ROUNDS ?? 3),

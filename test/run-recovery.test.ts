@@ -232,6 +232,7 @@ function recordingRunner(
   return {
     kind: base.kind,
     launch: (request) => base.launch(request),
+    release: (process) => base.release(process),
     attach: (adapterHandle) => {
       events.push(`attach:${adapterHandle}`)
       return base.attach(adapterHandle)

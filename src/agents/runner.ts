@@ -73,6 +73,13 @@ export interface VisibleAgentRunner {
    * unknown and unsets the invocation.
    */
   terminate(process: AttachedAgentProcess): Promise<'terminated' | 'terminate-failed'>
+  /**
+   * Best-effort post-settlement cleanup of any visible surface the adapter
+   * owns — a Herdr tab, for instance, whose agent process already exited.
+   * Implementations must never throw: cleanup is not part of the settlement
+   * protocol and must not change an outcome that is already decided.
+   */
+  release(process: AttachedAgentProcess): Promise<void>
 }
 
 /** Closed outcome codes for the agent settlement protocol (design.md §17). */
@@ -183,6 +190,16 @@ export async function settleAgentInvocation(
       : settlementError('terminate-failed', scope, invocationId, [
           { timeoutMs, processGroup: 'unknown' },
         ])
+  }
+
+  // The agent exited on its own. Close whatever visible surface the adapter
+  // owns before reading the sidecar: a settled invocation must not leave a
+  // shell tab behind for the operator to clean up (ticket #23). Cleanup is
+  // best-effort and never changes the settlement below.
+  try {
+    await runner.release(processRef)
+  } catch {
+    // Contract break by an adapter; the exit proof already holds.
   }
 
   const store = new CompletionStore(context.completionsDir)
