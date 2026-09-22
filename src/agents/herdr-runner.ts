@@ -56,6 +56,16 @@ export function planHerdrAgentGet(paneId: string): HerdrPlan {
   return { file: 'herdr', args: ['agent', 'get', paneId] }
 }
 
+export function planHerdrAgentWait(paneId: string, timeoutMs: number): HerdrPlan {
+  // The budget is a wall-clock deadline, never a zero-length poll: keep the
+  // Herdr-side value positive so an elapsed budget still reads current state.
+  const budgetMs = Math.max(1, Math.floor(timeoutMs))
+  return {
+    file: 'herdr',
+    args: ['agent', 'wait', paneId, '--until', 'done', '--timeout', String(budgetMs)],
+  }
+}
+
 export function planHerdrPaneClose(paneId: string): HerdrPlan {
   return { file: 'herdr', args: ['pane', 'close', paneId] }
 }
@@ -120,12 +130,17 @@ export function nornAgentContextEnv(context: CanonicalJsonValue): HerdrEnvEntry 
   return { key: NORN_AGENT_CONTEXT_ENV, value: canonicalJson(context) }
 }
 
-type HerdrExec = (plan: HerdrPlan) => Promise<string>
+const HERDR_COMMAND_TIMEOUT_MS = 15_000
 
-async function execHerdr(plan: HerdrPlan): Promise<string> {
+type HerdrExec = (plan: HerdrPlan, executionTimeoutMs?: number) => Promise<string>
+
+async function execHerdr(
+  plan: HerdrPlan,
+  executionTimeoutMs = HERDR_COMMAND_TIMEOUT_MS,
+): Promise<string> {
   try {
     const { stdout } = await promisify(execFile)(plan.file, [...plan.args], {
-      timeout: 15_000,
+      timeout: executionTimeoutMs,
       maxBuffer: 4 * 1024 * 1024,
     })
     return stdout
@@ -203,16 +218,29 @@ export class HerdrAgentRunner implements VisibleAgentRunner {
     return agent.agent_status !== 'done'
   }
 
+  /**
+   * Wait for the pane's complete process group to finish (ticket #22). One
+   * bounded `herdr agent wait` process replaces the previous `agent get`
+   * spawn every ≤100 ms, so waiting cost is constant per invocation instead
+   * of growing with the invocation's duration. Only Herdr's `done` status
+   * proves the process is gone; `idle` and `blocked` are live states.
+   */
   async waitForExit(
     processRef: AttachedAgentProcess,
     timeoutMs: number,
   ): Promise<'exited' | 'timeout'> {
-    const deadline = Date.now() + timeoutMs
-    while (await this.isLive(processRef)) {
-      if (Date.now() >= deadline) return 'timeout'
-      await delay(Math.min(100, Math.max(1, deadline - Date.now())))
-    }
-    return 'exited'
+    const { paneId } = decodeHerdrHandle(processRef.adapterHandle)
+    const payload = parseHerdrJson(
+      await this.exec(
+        planHerdrAgentWait(paneId, timeoutMs),
+        Math.max(HERDR_COMMAND_TIMEOUT_MS, timeoutMs + HERDR_COMMAND_TIMEOUT_MS),
+      ),
+      'agent wait',
+    )
+    if (payload.error?.code === 'agent_not_found') return 'exited'
+    if (payload.error?.code === 'timeout') return 'timeout'
+    if (payload.result?.agent?.agent_status === 'done') return 'exited'
+    throw new Error(`herdr agent wait returned an unrecognized response for pane ${paneId}`)
   }
 
   async terminate(processRef: AttachedAgentProcess): Promise<'terminated' | 'terminate-failed'> {
@@ -234,8 +262,4 @@ function parseHerdrJson(stdout: string, what: string): HerdrCliResult {
   } catch {
     throw new Error(`herdr ${what} printed non-JSON output: ${stdout.slice(0, 200)}`)
   }
-}
-
-function delay(ms: number): Promise<void> {
-  return new Promise((resolvePromise) => setTimeout(resolvePromise, ms))
 }

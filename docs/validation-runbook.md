@@ -193,9 +193,10 @@ Process observations:
     feedback, so the fresh worker starts from zero context.
 11. **Pane litter and poll cost** — every invocation opens a new Herdr
     pane; done panes linger for inspection (useful) but accumulate, and
-    each split narrows the remainder. `waitForExit` polls
-    `herdr agent get` every ≤100 ms — a process spawn per poll for up to
-    an hour per agent.
+    each split narrows the remainder. At validation time, `waitForExit`
+    spawned `herdr agent get` every ≤100 ms for up to an hour per agent;
+    it now delegates to one bounded `herdr agent wait` process per
+    invocation (#22).
 12. **Headless operation needs the driver** — the `/norn` extension
     requires an interactive Pi session; scripted validation goes through
     `scripts/e2e-driver.ts` (kept for operators).
