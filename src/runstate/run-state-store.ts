@@ -746,6 +746,25 @@ function checkShipCheckpoint(value: unknown, where: string, violations: string[]
   checkDeliveryRecordV1(value.delivery, `${where}.delivery`, violations)
 }
 
+function checkTimelineAnchor(value: unknown, where: string, violations: string[]): void {
+  if (!isPlainObject(value)) {
+    violations.push(`${where} must be a timeline anchor object`)
+    return
+  }
+  if (value.kind === 'event-id') {
+    checkKeys(value, ['kind', 'eventId'], where, violations)
+    checkNonEmptyString(value.eventId, `${where}.eventId`, violations)
+    return
+  }
+  if (value.kind === 'prefix') {
+    checkKeys(value, ['kind', 'timelineLength', 'prefixDigest'], where, violations)
+    checkInteger(value.timelineLength, 0, `${where}.timelineLength`, violations)
+    checkDigest(value.prefixDigest, `${where}.prefixDigest`, violations)
+    return
+  }
+  checkEnum(value.kind, ['event-id', 'prefix'] as const, `${where}.kind`, violations)
+}
+
 function checkMapCompletion(value: unknown, where: string, violations: string[]): void {
   if (!isPlainObject(value)) {
     violations.push(`${where} must be a map completion checkpoint object`)
@@ -754,7 +773,7 @@ function checkMapCompletion(value: unknown, where: string, violations: string[])
   checkKeys(
     value,
     [
-      'stage', 'completionAttemptId', 'timelineAnchorEventId', 'workspace', 'mapRevision',
+      'stage', 'completionAttemptId', 'timelineAnchor', 'workspace', 'mapRevision',
       'completionSha', 'treeOid', 'gate', 'tests', 'review',
     ],
     where,
@@ -763,11 +782,7 @@ function checkMapCompletion(value: unknown, where: string, violations: string[])
   )
   checkEnum(value.stage, ['gated', 'map-closed', 'recorded'] as const, `${where}.stage`, violations)
   checkNonEmptyString(value.completionAttemptId, `${where}.completionAttemptId`, violations)
-  if (value.timelineAnchorEventId !== null && value.timelineAnchorEventId !== undefined) {
-    checkNonEmptyString(value.timelineAnchorEventId, `${where}.timelineAnchorEventId`, violations)
-  } else if (value.timelineAnchorEventId === undefined) {
-    violations.push(`${where}.timelineAnchorEventId must be an event ID or null`)
-  }
+  checkTimelineAnchor(value.timelineAnchor, `${where}.timelineAnchor`, violations)
   checkWorkspaceRef(value.workspace, `${where}.workspace`, violations)
   if (isPlainObject(value.workspace) && value.workspace.kind === 'map-completion') {
     if (value.workspace.completionAttemptId !== value.completionAttemptId) {

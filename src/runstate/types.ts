@@ -293,11 +293,24 @@ export type TicketRunState =
       readonly cleanupWorkspace?: WorkspaceRef
     }
 
+/**
+ * The exact timeline boundary captured before Map close (§13.4, §15).
+ * A real head event ID is relocatable directly. When GitHub omits the head
+ * item's ID, the complete prefix length and digest form a synthetic anchor.
+ */
+export type TimelineAnchor =
+  | { readonly kind: 'event-id'; readonly eventId: string }
+  | {
+      readonly kind: 'prefix'
+      readonly timelineLength: number
+      readonly prefixDigest: Sha256Digest
+    }
+
 /** The map-completion write-ahead checkpoint (§13.1, §15). */
 export type MapCompletionCheckpoint = {
   readonly stage: 'gated' | 'map-closed' | 'recorded'
   readonly completionAttemptId: string
-  readonly timelineAnchorEventId: string | null
+  readonly timelineAnchor: TimelineAnchor
   readonly workspace: WorkspaceRef
   readonly mapRevision: string
   readonly completionSha: string

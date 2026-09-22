@@ -106,6 +106,7 @@ import type {
   ProcessGroupCheckpoint,
   RunState,
   TestEvidence,
+  TimelineAnchor,
   WorkspaceRef,
 } from '../runstate/types.ts'
 import type { ShipTargetLock, ShipTargetLockHandle } from '../ship/push.ts'
@@ -392,16 +393,50 @@ export function currentClosingEvent(timeline: readonly IssueTimelineEvent[]): Cl
   return closing
 }
 
-/** Whether a close followed by a reopen occurred after the anchor event. */
+/** The digest used to relocate an ID-less timeline head without guessing. */
+function timelinePrefixDigest(timeline: readonly IssueTimelineEvent[]): Sha256Digest {
+  return canonicalJsonDigest(timeline as unknown as CanonicalJsonValue)
+}
+
+/** Capture the exact current timeline boundary, including an ID-less head. */
+export function timelineAnchorOf(timeline: readonly IssueTimelineEvent[]): TimelineAnchor {
+  const head = timeline.at(-1)
+  if (head !== undefined && head.eventId !== '') {
+    return { kind: 'event-id', eventId: head.eventId }
+  }
+  return {
+    kind: 'prefix',
+    timelineLength: timeline.length,
+    prefixDigest: timelinePrefixDigest(timeline),
+  }
+}
+
+/**
+ * Relocate a persisted timeline boundary. A synthetic prefix must still be
+ * the exact prefix of the current fully-paginated read; otherwise chronology
+ * is ambiguous and callers must fail closed.
+ */
+export function timelineAnchorIndex(
+  timeline: readonly IssueTimelineEvent[],
+  anchor: TimelineAnchor,
+): number | undefined {
+  if (anchor.kind === 'event-id') {
+    const index = timeline.findIndex((event) => event.eventId === anchor.eventId)
+    return index === -1 ? undefined : index
+  }
+  if (timeline.length < anchor.timelineLength) return undefined
+  const prefix = timeline.slice(0, anchor.timelineLength)
+  if (timelinePrefixDigest(prefix) !== anchor.prefixDigest) return undefined
+  return anchor.timelineLength - 1
+}
+
+/** Whether a close followed by a reopen occurred after the anchor. */
 export function closeThenReopenAfter(
   timeline: readonly IssueTimelineEvent[],
-  anchorEventId: string | null,
+  anchor: TimelineAnchor,
 ): boolean {
-  const anchorIndex =
-    anchorEventId === null
-      ? -1
-      : timeline.findIndex((event) => event.eventId === anchorEventId)
-  if (anchorEventId !== null && anchorIndex === -1) return true // the anchor is gone: never guess
+  const anchorIndex = timelineAnchorIndex(timeline, anchor)
+  if (anchorIndex === undefined) return true // the anchor is gone: never guess
   let state: 'open' | 'closed' = 'open'
   let closeThenReopen = false
   timeline.forEach((event, index) => {
@@ -424,27 +459,31 @@ export type ClosingEventBinding =
   | { readonly bound: true; readonly closingEventId: string }
   | {
       readonly bound: false
-      readonly reason: 'no-closing-event' | 'reopen-follows' | 'not-first-close-after-anchor' | 'foreign-actor'
+      readonly reason:
+        | 'anchor-not-found'
+        | 'no-closing-event'
+        | 'reopen-follows'
+        | 'not-first-close-after-anchor'
+        | 'closing-event-id-missing'
+        | 'foreign-actor'
     }
 
 export function closingEventBinding(
   timeline: readonly IssueTimelineEvent[],
-  anchorEventId: string | null,
+  anchor: TimelineAnchor,
   actorId: string,
 ): ClosingEventBinding {
-  const anchorIndex =
-    anchorEventId === null ? -1 : timeline.findIndex((event) => event.eventId === anchorEventId)
-  if (anchorEventId !== null && anchorIndex === -1) {
-    return { bound: false, reason: 'not-first-close-after-anchor' }
-  }
+  const anchorIndex = timelineAnchorIndex(timeline, anchor)
+  if (anchorIndex === undefined) return { bound: false, reason: 'anchor-not-found' }
   const closing = currentClosingEvent(timeline)
   if (closing === undefined) return { bound: false, reason: 'no-closing-event' }
-  const firstCloseAfterAnchor = timeline.find(
+  const firstCloseAfterAnchorIndex = timeline.findIndex(
     (event, index) => index > anchorIndex && event.kind === 'closed',
   )
-  if (firstCloseAfterAnchor === undefined || firstCloseAfterAnchor.eventId !== closing.eventId) {
+  if (firstCloseAfterAnchorIndex === -1 || firstCloseAfterAnchorIndex !== timeline.lastIndexOf(closing)) {
     return { bound: false, reason: 'not-first-close-after-anchor' }
   }
+  if (closing.eventId === '') return { bound: false, reason: 'closing-event-id-missing' }
   if (closing.actorId !== actorId) return { bound: false, reason: 'foreign-actor' }
   return { bound: true, closingEventId: closing.eventId }
 }
@@ -1884,7 +1923,7 @@ async function closeAndRecord(
     checkpoint = {
       stage: 'gated',
       completionAttemptId: gates.completionAttemptId,
-      timelineAnchorEventId: anchor.anchorEventId,
+      timelineAnchor: anchor.timelineAnchor,
       workspace: gates.workspace,
       mapRevision: gates.mapRevision,
       completionSha: gates.completionSha,
@@ -1919,7 +1958,7 @@ async function closeAndRecord(
   // protocol instead of silently overwriting the visible state change.
   const preClose = await readMapEvidence(deps, params, ctx, 'pre-close-window')
   if ('outcome' in preClose) return { kind: 'outcome', outcome: preClose.outcome }
-  if (closeThenReopenAfter(preClose.evidence.timeline, checkpoint.timelineAnchorEventId)) {
+  if (closeThenReopenAfter(preClose.evidence.timeline, checkpoint.timelineAnchor)) {
     const cleared = await deps.checkpoint.clear()
     if (cleared.kind !== 'ok') {
       return {
@@ -1930,7 +1969,7 @@ async function closeAndRecord(
     return {
       kind: 'outcome',
       outcome: changedInput(ctx.sharedWrite, [
-        { stage: 'close-then-reopen-after-anchor', anchorEventId: checkpoint.timelineAnchorEventId },
+        { stage: 'close-then-reopen-after-anchor', timelineAnchor: checkpoint.timelineAnchor },
       ]),
     }
   }
@@ -1966,7 +2005,7 @@ async function closeAndRecord(
   if ('outcome' in postClose) return { kind: 'outcome', outcome: postClose.outcome }
   const binding = closingEventBinding(
     postClose.evidence.timeline,
-    checkpoint.timelineAnchorEventId,
+    checkpoint.timelineAnchor,
     params.actorId,
   )
   if (!binding.bound) {
@@ -2667,27 +2706,20 @@ async function readMapEvidence(
 }
 
 /**
- * The timeline anchor: the last fully paginated item that carries a real
- * event ID, or `null` when none does. GitHub's timeline union only exposes
- * `id` through per-type fragments, so "other" events (sub-issue added,
- * cross-referenced, …) read back without one; an empty-string eventId must
- * never become the persisted anchor, because the §15 close-window binding
- * locates the anchor by ID. Anchoring at the last identified event is
- * conservative: every close/reopen after the true last event is also after
- * it, and close/reopen events always carry IDs.
+ * Capture the exact head of one fully paginated timeline read. GitHub's
+ * timeline union only exposes `id` through per-type fragments, so "other"
+ * events (sub-issue added, cross-referenced, …) may have no event ID. A real
+ * head ID is persisted directly; an ID-less (or empty) head is represented
+ * by a length-and-digest prefix anchor that later reads can verify exactly.
  */
 async function readTimelineAnchor(
   deps: MapCompletionDeps,
   params: MapCompletionParams,
   ctx: ProtocolContext,
-): Promise<{ readonly anchorEventId: string | null } | { readonly outcome: MapCompletionOutcome }> {
+): Promise<{ readonly timelineAnchor: TimelineAnchor } | { readonly outcome: MapCompletionOutcome }> {
   const read = await readMapEvidence(deps, params, ctx, 'anchor')
   if ('outcome' in read) return { outcome: read.outcome }
-  for (let index = read.evidence.timeline.length - 1; index >= 0; index -= 1) {
-    const eventId = read.evidence.timeline[index]!.eventId
-    if (eventId !== '') return { anchorEventId: eventId }
-  }
-  return { anchorEventId: null }
+  return { timelineAnchor: timelineAnchorOf(read.evidence.timeline) }
 }
 
 /** Fetch the target and read its current tip SHA. */
@@ -2860,7 +2892,7 @@ async function reconcileCheckpoint(
     if (snapshot.state === 'OPEN') {
       // §13.4 rule 1: a detected reopen discards the old gates and restarts
       // full completion rather than silently reclosing.
-      if (closeThenReopenAfter(evidence.evidence.timeline, checkpoint.timelineAnchorEventId)) {
+      if (closeThenReopenAfter(evidence.evidence.timeline, checkpoint.timelineAnchor)) {
         const cleared = await deps.checkpoint.clear()
         if (cleared.kind !== 'ok') {
           return {
@@ -2892,7 +2924,7 @@ async function reconcileCheckpoint(
     // after the anchor and no reopen follows it.
     const binding = closingEventBinding(
       evidence.evidence.timeline,
-      checkpoint.timelineAnchorEventId,
+      checkpoint.timelineAnchor,
       params.actorId,
     )
     if (!binding.bound) {

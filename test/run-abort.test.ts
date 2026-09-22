@@ -739,7 +739,7 @@ describe('unreconcilable ambiguity refuses (§2.3, §13.3, §13.4)', () => {
       const state = harness.craftRunningState()
       const checkpoint = craftCompletionCheckpoint(harness, {
         mapRevision: state.acceptedMapRevisions[0]!.revision,
-        timelineAnchorEventId: 'E-gone',
+        timelineAnchor: { kind: 'event-id', eventId: 'E-gone' },
       })
       const saved = saveRunState(harness.repositoryHome, ENCODED_MAP, { ...state, mapCompletion: checkpoint })
       assert.equal(saved.kind, 'ok')
