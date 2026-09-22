@@ -241,6 +241,24 @@ export type WorkAttemptCheckpoint = {
   readonly processGroupIds: readonly string[]
 }
 
+/**
+ * The in-run conflict rework of one Ticket (§12).
+ *
+ * A Ticket whose Ship returned `integration-conflict` is re-queued for fresh
+ * Work in a later Wave of the same run instead of parking. `cycles` counts
+ * the rework attempts already granted, bounded by `maxWorkRounds`; `conflict`
+ * is the Ship conflict the pending rework must resolve. The conflict is
+ * worker feedback, never evidence.
+ */
+export type TicketRework = {
+  readonly cycles: number
+  readonly conflict: {
+    readonly code: string
+    readonly reason: string
+    readonly evidence: readonly Evidence[]
+  }
+}
+
 /** The exact persisted Wave queue, preserving issue-number Ship order (§12, §13.1). */
 export type WaveState = {
   readonly number: number
@@ -357,6 +375,11 @@ export type RunState = {
   readonly activeWave?: WaveState
   readonly parkedTickets: readonly TicketRef[]
   readonly tickets: Readonly<Record<string, TicketRunState>>
+  /**
+   * The in-run conflict rework ledger (§12, §13.1): one entry per Ticket
+   * that has been re-queued for fresh Work in this run.
+   */
+  readonly reworks?: Readonly<Record<string, TicketRework>>
   readonly activeProcesses: readonly ProcessGroupCheckpoint[]
   readonly mapCompletion?: MapCompletionCheckpoint
   readonly report?: RunReport

@@ -350,6 +350,34 @@ describe('renderStatusOutcome', () => {
     }
   })
 
+  it('renders a pending in-run rework on its waiting ticket', async () => {
+    const nornHome = setupNornHome({ withRunState: false })
+    try {
+      const state = exampleRunState() as unknown as Record<string, unknown>
+      state.reworks = {
+        I_A: {
+          cycles: 1,
+          conflict: {
+            code: 'integration-conflict',
+            reason: 'the candidate conflicts when replayed onto the advanced target',
+            evidence: [{ conflictedPaths: ['shared.txt'] }],
+          },
+        },
+      }
+      const home = join(nornHome, 'repositories', 'github.com', REPOSITORY_ID)
+      const saved = saveRunState(home, MAP_ISSUE_ID, state as unknown as RunState)
+      assert.ok(saved.kind === 'ok', saved.kind === 'error' ? saved.reason : '')
+      const outcome = await readStatus({ nornHome }, MAP_URL)
+      assert.ok(isOk(outcome))
+      assert.match(
+        renderStatusOutcome(outcome),
+        /I_A: waiting \(last wave 1\) — rework 1 pending after integration-conflict/,
+      )
+    } finally {
+      rmSync(nornHome, { recursive: true, force: true })
+    }
+  })
+
   it('renders a terminal report with its label and retained workspace', async () => {
     const nornHome = setupNornHome({ withRunState: false })
     try {

@@ -10,7 +10,7 @@ import type { StatusOutcome } from '../runner/status.ts'
 import type { RunMapOutcome } from '../run/lifecycle.ts'
 import type { AbortOutcome } from '../run/abort.ts'
 import type { ConfirmedWrite } from '../run/abort.ts'
-import type { RunReport, RunState, TicketRunState } from '../runstate/types.ts'
+import type { RunReport, RunState, TicketRework, TicketRunState } from '../runstate/types.ts'
 import { isSha256Digest } from '../core/digest.ts'
 
 export function renderSummary(summary: NornCommandSummary): string {
@@ -262,10 +262,15 @@ export function renderStatusTakesMapUrl(): string {
   ].join('\n')
 }
 
-function formatTicketLine(issueId: string, ticket: TicketRunState): string {
+function formatTicketLine(issueId: string, ticket: TicketRunState, rework?: TicketRework): string {
   switch (ticket.phase) {
     case 'waiting':
-      return `  ${issueId}: waiting${ticket.wave === undefined ? '' : ` (last wave ${ticket.wave})`}`
+      return (
+        `  ${issueId}: waiting${ticket.wave === undefined ? '' : ` (last wave ${ticket.wave})`}` +
+        (rework === undefined
+          ? ''
+          : ` — rework ${rework.cycles} pending after ${rework.conflict.code}`)
+      )
     case 'working':
       return `  ${issueId}: working in wave ${ticket.wave} (attempt ${ticket.attempt.workAttemptId}, round ${ticket.attempt.round}, slot ${ticket.attempt.slot})`
     case 'parked':
@@ -322,7 +327,9 @@ function renderRunState(state: RunState): string[] {
   const tickets = Object.entries(state.tickets)
   if (tickets.length > 0) {
     lines.push(`Tickets (${tickets.length}):`)
-    for (const [issueId, ticket] of tickets) lines.push(formatTicketLine(issueId, ticket))
+    for (const [issueId, ticket] of tickets) {
+      lines.push(formatTicketLine(issueId, ticket, state.reworks?.[issueId]))
+    }
   } else {
     lines.push('Tickets: none recorded')
   }
