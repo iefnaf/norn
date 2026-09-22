@@ -10,11 +10,20 @@
  * asks Pi to stop after a successful completion so the process group exits
  * and the invocation can settle.
  *
+ * A Reviewer additionally receives the §10.2 read-only capability set from
+ * this extension rather than from Pi's `--tools` allowlist: that allowlist is
+ * resolved while extensions load, so a name an extension contributes is not
+ * reliably known in time and an unknown name empties the whole set. The
+ * Reviewer therefore launches with `--no-builtin-tools`, and this extension
+ * registers the four read-only tools plus `norn_complete` itself, which makes
+ * the reviewer's capability set independent of CLI startup ordering.
+ *
  * The extension never decides orchestration: the sidecar it writes is a
  * protocol artifact, not business evidence.
  */
 import { fileURLToPath } from 'node:url'
 
+import { createReadOnlyTools } from '@earendil-works/pi-coding-agent'
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import type {
@@ -29,6 +38,15 @@ import {
 } from './completion.ts'
 
 export const NORN_COMPLETE_TOOL_NAME = 'norn_complete'
+
+/** Exact tool capability set exposed to every read-only Reviewer. */
+export const NORN_REVIEWER_TOOL_ALLOWLIST: readonly string[] = [
+  'read',
+  'grep',
+  'find',
+  'ls',
+  NORN_COMPLETE_TOOL_NAME,
+]
 
 /** Environment variable carrying the coordinator-owned launch context. */
 export const NORN_AGENT_CONTEXT_ENV = 'NORN_AGENT_CONTEXT'
@@ -162,6 +180,19 @@ function sameCompletion(a: AgentCompletion, b: AgentCompletion): boolean {
 export default function nornCompletionExtension(pi: ExtensionAPI): void {
   const context = loadAgentContextFromEnv(process.env)
 
+  // The Reviewer's read-only inspection tools. Pi resolves a CLI `--tools`
+  // allowlist while extensions load, so a name contributed by an extension
+  // may not be known in time — and one unknown name leaves the reviewer with
+  // no tools at all, which is exactly how a reviewer ends up unable to call
+  // norn_complete. Registering the same read-only built-ins here, on a
+  // reviewer launched with `--no-builtin-tools`, removes that ordering
+  // dependency entirely: the extension owns the complete capability set.
+  if (context?.role === 'reviewer') {
+    for (const tool of createReadOnlyTools(process.cwd())) {
+      pi.registerTool(tool as Parameters<ExtensionAPI['registerTool']>[0])
+    }
+  }
+
   pi.registerTool({
     name: NORN_COMPLETE_TOOL_NAME,
     label: 'Norn completion',
@@ -200,6 +231,23 @@ export default function nornCompletionExtension(pi: ExtensionAPI): void {
       }
     },
   })
+
+  // Re-apply the closed read-only allowlist before every Reviewer turn. The
+  // names are registered above and no CLI `--tools` filter competes with
+  // them, so this is authoritative; verifying it here fails the invocation
+  // loudly instead of letting a reviewer reply in prose and idle forever.
+  if (context?.role === 'reviewer') {
+    pi.on('before_agent_start', (_event, ctx) => {
+      pi.setActiveTools([...NORN_REVIEWER_TOOL_ALLOWLIST])
+      if (!pi.getActiveTools().includes(NORN_COMPLETE_TOOL_NAME)) {
+        console.error(
+          `Norn completion is unavailable: this Reviewer started without ${NORN_COMPLETE_TOOL_NAME} ` +
+            'and cannot satisfy the settlement protocol. Exiting without a completion.',
+        )
+        ctx.shutdown()
+      }
+    })
+  }
 }
 
 type ToolContent = { readonly type: 'text'; readonly text: string }

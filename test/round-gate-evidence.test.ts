@@ -232,16 +232,18 @@ describe('the read-only reviewer launch policy', () => {
     testOutput: [],
   }
 
-  it('plans a reviewer with the strict read-only allowlist', () => {
+  it('plans a reviewer with the strict read-only capability set', () => {
     const plan = piReadOnlyReviewerLaunch(reviewerInput, {
       model: 'provider-b/model-y',
       thinking: 'high',
       extensionPath: '/norn/extension.ts',
       piSessionId: 'pi-1',
     })
-    const toolsIndex = plan.argv.indexOf('--tools')
-    assert.ok(toolsIndex !== -1)
-    assert.equal(plan.argv[toolsIndex + 1], 'read,grep,find,ls,norn_complete')
+    // `--no-builtin-tools` removes every write-capable built-in at the CLI
+    // and cannot be resolved away by startup ordering; the completion
+    // extension then registers exactly the read-only allowlist.
+    assert.equal(plan.argv.includes('--no-builtin-tools'), true)
+    assert.equal(plan.argv.includes('--tools'), false)
     assert.deepEqual(REVIEWER_READ_ONLY_TOOLS, ['read', 'grep', 'find', 'ls', 'norn_complete'])
     assert.equal(isReadOnlyAgentArgv(plan.argv), true)
     for (const tool of ['bash', 'powershell', 'edit', 'write']) {

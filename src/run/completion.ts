@@ -113,7 +113,7 @@ import type { ShipTargetLock, ShipTargetLockHandle } from '../ship/push.ts'
 import type { ShipExtensionAdoption, ShipFacts } from '../ship/reconcile.ts'
 import { acceptedSnapshotFrom, snapshotMapPayload } from '../ship/reconcile.ts'
 import type { AgentLaunchPlan, ReviewerTestOutput } from '../work/round-gate.ts'
-import { REVIEWER_READ_ONLY_TOOLS, isReadOnlyAgentArgv, modelProvider } from '../work/round-gate.ts'
+import { isReadOnlyAgentArgv, modelProvider } from '../work/round-gate.ts'
 import type { CommandRunner } from '../work/command-runner.ts'
 import type { GateCommandErrorCode, GateCommandListValue, GateDeps } from '../work/gate.ts'
 import { runGateCommandList } from '../work/gate.ts'
@@ -963,8 +963,8 @@ export function piMapCompletionReviewerLaunch(
         { model: options.model, thinking: options.thinking },
         { extensionPath: options.extensionPath, piSessionId: options.piSessionId },
       ),
-      '--tools',
-      REVIEWER_READ_ONLY_TOOLS.join(','),
+      '--no-builtin-tools',
+      '--',
       renderMapCompletionReviewerPrompt(input),
     ],
   }

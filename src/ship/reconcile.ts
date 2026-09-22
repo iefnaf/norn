@@ -74,7 +74,7 @@ import type {
 import type { CommandRunner } from '../work/command-runner.ts'
 import type { GateCommandErrorCode, GateCommandListValue, GateDeps } from '../work/gate.ts'
 import { runGateCommandList } from '../work/gate.ts'
-import { REVIEWER_READ_ONLY_TOOLS, isReadOnlyAgentArgv, modelProvider } from '../work/round-gate.ts'
+import { isReadOnlyAgentArgv, modelProvider } from '../work/round-gate.ts'
 import type { AgentLaunchPlan, ReviewerLaunchInput, ReviewerLaunchPlanner } from '../work/round-gate.ts'
 import { formatGitObjectOid, inspectWorkspace, parseGitObjectOid } from '../work/workspace.ts'
 import type { GitObjectFormat, WorkspaceErrorCode } from '../work/workspace.ts'
@@ -431,8 +431,8 @@ export function piShipReviewerLaunch(
         { model: options.model, thinking: options.thinking },
         { extensionPath: options.extensionPath, piSessionId: options.piSessionId },
       ),
-      '--tools',
-      REVIEWER_READ_ONLY_TOOLS.join(','),
+      '--no-builtin-tools',
+      '--',
       renderShipReviewerPrompt(input),
     ],
   }

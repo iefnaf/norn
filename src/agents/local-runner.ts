@@ -99,4 +99,13 @@ export class LocalProcessAgentRunner implements VisibleAgentRunner {
   async terminate(processRef: AttachedAgentProcess): Promise<'terminated' | 'terminate-failed'> {
     return terminateProcessGroup(decodeLocalProcessHandle(processRef.adapterHandle))
   }
+
+  /**
+   * Nothing visible is owned here: the settlement engine already proves the
+   * process group's exit, and no pane or tab outlives it.
+   */
+  release(processRef: AttachedAgentProcess): Promise<void> {
+    decodeLocalProcessHandle(processRef.adapterHandle)
+    return Promise.resolve()
+  }
 }

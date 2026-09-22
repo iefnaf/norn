@@ -339,6 +339,7 @@ export function fakeRunRunner(
     async terminate(): Promise<'terminated' | 'terminate-failed'> {
       return 'terminated'
     },
+    async release(): Promise<void> {},
   }
 }
 

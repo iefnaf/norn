@@ -17,6 +17,7 @@ import { CompletionStore } from '../src/agents/completion.ts'
 import nornCompletionExtension, {
   NORN_AGENT_CONTEXT_ENV,
   NORN_COMPLETE_TOOL_NAME,
+  NORN_REVIEWER_TOOL_ALLOWLIST,
   completionExtensionPath,
   createNornCompletionSubmitter,
   loadAgentContextFromEnv,
@@ -39,14 +40,30 @@ type RegisteredTool = {
   ) => Promise<{ content: Array<{ type: string; text: string }>; details: unknown; terminate?: boolean }>
 }
 
+type ActiveToolsContext = { shutdown: () => void }
+
 function fakePi() {
   const tools: RegisteredTool[] = []
+  const activeToolSets: string[][] = []
+  const beforeAgentStartHandlers: Array<(event: unknown, ctx: ActiveToolsContext) => void> = []
   const pi = {
     registerTool(tool: RegisteredTool) {
       tools.push(tool)
     },
+    on(event: string, handler: (event: unknown, ctx: ActiveToolsContext) => void) {
+      if (event === 'before_agent_start') beforeAgentStartHandlers.push(handler)
+      return () => undefined
+    },
+    getActiveTools() {
+      return NORN_REVIEWER_TOOL_ALLOWLIST.filter((name) =>
+        tools.some((tool) => tool.name === name),
+      )
+    },
+    setActiveTools(toolNames: string[]) {
+      activeToolSets.push([...toolNames])
+    },
   }
-  return { pi: pi as unknown as ExtensionAPI, tools }
+  return { pi: pi as unknown as ExtensionAPI, tools, activeToolSets, beforeAgentStartHandlers }
 }
 
 /** A shutdown spy standing in for the extension context's exit hook. */
@@ -100,6 +117,79 @@ describe('completion extension registration', () => {
     // A successful completion must shut the Pi process down: the §17
     // settlement protocol waits for the complete process group to exit.
     assert.equal(calls(), 1)
+  })
+
+  it('registers the reviewer capability set itself and re-applies it every turn', async () => {
+    const area = await createRunArea('reviewer-tools')
+    const context = buildContext(area, { role: 'reviewer', phase: 'work' })
+    const { pi, tools, activeToolSets, beforeAgentStartHandlers } = fakePi()
+
+    withEnv({ [NORN_AGENT_CONTEXT_ENV]: JSON.stringify(context) }, () => {
+      nornCompletionExtension(pi)
+    })
+
+    // The reviewer's read-only tools come from the extension, not from Pi's
+    // `--tools` allowlist, which resolves while extensions load.
+    assert.deepEqual(tools.map((tool) => tool.name).sort(), [
+      'find',
+      'grep',
+      'ls',
+      'norn_complete',
+      'read',
+    ])
+    assert.equal(beforeAgentStartHandlers.length, 1)
+    assert.deepEqual(activeToolSets, [])
+
+    const shutdowns: number[] = []
+    beforeAgentStartHandlers[0]({}, { shutdown: () => shutdowns.push(1) })
+    assert.deepEqual(activeToolSets, [[...NORN_REVIEWER_TOOL_ALLOWLIST]])
+    assert.deepEqual(shutdowns, [])
+  })
+
+  it('exits rather than idling when a reviewer cannot reach norn_complete', async () => {
+    const area = await createRunArea('reviewer-no-tools')
+    const context = buildContext(area, { role: 'reviewer', phase: 'work' })
+    const { pi, activeToolSets, beforeAgentStartHandlers } = fakePi()
+    // Simulate a startup that lost the completion tool: registering it fails.
+    const brokenPi = {
+      registerTool(tool: RegisteredTool) {
+        if (tool.name === NORN_COMPLETE_TOOL_NAME) return
+        ;(pi as unknown as { registerTool: (t: RegisteredTool) => void }).registerTool(tool)
+      },
+      on: (pi as unknown as { on: unknown }).on,
+      getActiveTools: (pi as unknown as { getActiveTools: unknown }).getActiveTools,
+      setActiveTools: (pi as unknown as { setActiveTools: unknown }).setActiveTools,
+    } as unknown as ExtensionAPI
+
+    withEnv({ [NORN_AGENT_CONTEXT_ENV]: JSON.stringify(context) }, () => {
+      nornCompletionExtension(brokenPi)
+    })
+
+    const shutdowns: number[] = []
+    const diagnostics: string[] = []
+    const originalError = console.error
+    console.error = (message: string) => diagnostics.push(message)
+    try {
+      beforeAgentStartHandlers[0]({}, { shutdown: () => shutdowns.push(1) })
+    } finally {
+      console.error = originalError
+    }
+    assert.deepEqual(activeToolSets, [[...NORN_REVIEWER_TOOL_ALLOWLIST]])
+    assert.deepEqual(shutdowns, [1])
+    assert.match(diagnostics[0] ?? '', /Norn completion is unavailable/)
+  })
+
+  it('leaves a worker without reviewer-only read-only tool registrations', async () => {
+    const area = await createRunArea('worker-tools')
+    const context = buildContext(area, { role: 'worker', phase: 'work' })
+    const { pi, tools, beforeAgentStartHandlers } = fakePi()
+
+    withEnv({ [NORN_AGENT_CONTEXT_ENV]: JSON.stringify(context) }, () => {
+      nornCompletionExtension(pi)
+    })
+
+    assert.deepEqual(tools.map((tool) => tool.name), [NORN_COMPLETE_TOOL_NAME])
+    assert.equal(beforeAgentStartHandlers.length, 0)
   })
 
   it('answers with an error when the launch context is missing', async () => {

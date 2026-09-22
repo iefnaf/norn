@@ -302,6 +302,7 @@ export function fakeReviewerRunner(
     async terminate(): Promise<'terminated' | 'terminate-failed'> {
       return 'terminated'
     },
+    async release(): Promise<void> {},
   }
 }
 
