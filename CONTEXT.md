@@ -36,6 +36,10 @@ _Avoid_: Stage, batch, phase
 The isolated activity that turns an eligible Ticket into an exact tested and reviewed Git tree.
 _Avoid_: Prepare, build candidate, implement phase
 
+**Rework Feedback**:
+The structured setup, test, and review findings a Work attempt accumulates, together with how a parked attempt ended. A later run's first Work round for that Ticket receives it as context, never as evidence.
+_Avoid_: Review comments, agent notes, handoff notes
+
 **Shippable Change**:
 A candidate tree with tests and independent review bound to its map revision, ticket revision, base commit, and complete tree OID. It has not yet entered the target branch.
 _Avoid_: Candidate, prepared ticket, ready artifact

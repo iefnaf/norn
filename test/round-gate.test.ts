@@ -23,7 +23,7 @@ import { runGit } from '../src/adapters/git-repository.ts'
 import type { GitCommandRunner } from '../src/adapters/git-repository.ts'
 import { error } from '../src/core/outcome.ts'
 import type { WorkInput } from '../src/runstate/types.ts'
-import type { WorkAttemptRecord, WorkOutcome } from '../src/work/round-gate.ts'
+import type { RoundFeedback, WorkAttemptRecord, WorkOutcome } from '../src/work/round-gate.ts'
 import { runWorkAttempt } from '../src/work/round-gate.ts'
 
 import {
@@ -69,7 +69,11 @@ function iterateThenPass(): ReviewerScript {
 /** Seed a harness store with a persisted attempt to resume from. */
 function seedResume(
   harness: Harness,
-  attempt: { round: number; slot: 'awaiting-reservation' | 'reserved' | 'released' },
+  attempt: {
+    round: number
+    slot: 'awaiting-reservation' | 'reserved' | 'released'
+    feedback?: readonly RoundFeedback[]
+  },
   mutateInput?: (input: WorkInput) => WorkInput,
 ): void {
   const input = mutateInput === undefined ? harness.input : mutateInput(harness.input)
@@ -360,6 +364,114 @@ describe('runWorkAttempt: the full round gate', () => {
       // The reviewer judged the zero-delta assertion explicitly.
       assert.equal(harness.reviewerInputs[0]!.candidate.zeroDelta, true)
       assert.equal(harness.reviewerInputs[0]!.diff, '')
+    } finally {
+      harness.cleanup()
+    }
+  })
+})
+
+describe('runWorkAttempt: rework feedback persistence and carry', () => {
+  it('persists each round’s accumulated feedback with the working attempt', async () => {
+    const harness = makeHarness({
+      label: 'feedback-persist',
+      worker: committingWorker(),
+      reviewer: iterateThenPass(),
+    })
+    try {
+      const outcome = await harness.run()
+      assert.ok(outcome.kind === 'ok', JSON.stringify(outcome))
+      // Round 1 started with no feedback; the round-2 checkpoint is the
+      // first that carries the round-1 reviewer iterate — persisted before
+      // the round-2 worker process exists (§10.2).
+      const persisted = harness.store.working.filter(
+        (record) => (record.attempt.feedback ?? []).length > 0,
+      )
+      const first = persisted[0]
+      assert.ok(first !== undefined, 'a checkpoint carried the feedback')
+      assert.equal(first.attempt.round, 2)
+      assert.deepEqual(first.attempt.feedback, [
+        { kind: 'review', round: 1, feedback: 'cover the failure path too' },
+      ])
+      // Every later checkpoint of the same attempt keeps carrying it.
+      for (const record of persisted) {
+        assert.deepEqual(record.attempt.feedback, first.attempt.feedback)
+      }
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('parks the accumulated feedback with a terminal entry when rounds are exhausted', async () => {
+    const harness = makeHarness({
+      label: 'feedback-park',
+      worker: committingWorker(),
+      reviewer: ({ call }) => ({ discriminant: 'iterate', feedback: `finding ${call + 1}` }),
+      maxWorkRounds: 2,
+    })
+    try {
+      expectBlocked(await harness.run(), 'work-rounds-exhausted')
+      const parked = harness.store.terminals[0]?.terminal
+      assert.ok(parked?.kind === 'parked', 'the attempt parked')
+      assert.deepEqual(
+        parked.feedback.map((entry) => entry.kind),
+        ['review', 'review', 'terminal'],
+      )
+      assert.deepEqual(parked.feedback.at(-1), {
+        kind: 'terminal',
+        outcome: 'blocked',
+        code: 'work-rounds-exhausted',
+        reason:
+          'the Work attempt used its 2 worker round(s) without a passing setup, test, and review gate',
+      })
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('seeds a fresh attempt with the previous run’s carried feedback', async () => {
+    const carried: RoundFeedback[] = [
+      { kind: 'review', round: 1, feedback: 'the previous run wanted a retry path' },
+      { kind: 'terminal', outcome: 'blocked', code: 'work-rounds-exhausted', reason: 'two cold rounds' },
+    ]
+    const harness = makeHarness({
+      label: 'feedback-carry',
+      worker: committingWorker(),
+      reviewer: passReviewer,
+      carriedFeedback: carried,
+    })
+    try {
+      const outcome = await harness.run()
+      assert.ok(outcome.kind === 'ok', JSON.stringify(outcome))
+      assert.deepEqual(harness.workerInputs[0]!.feedback, carried)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('resumes a persisted attempt from its recorded feedback, not the carried list', async () => {
+    const harness = makeHarness({
+      label: 'feedback-resume',
+      worker: committingWorker(),
+      reviewer: passReviewer,
+      carriedFeedback: [
+        { kind: 'review', round: 1, feedback: 'a carried entry the persisted attempt supersedes' },
+      ],
+    })
+    try {
+      seedResume(harness, {
+        round: 1,
+        slot: 'released',
+        feedback: [{ kind: 'review', round: 1, feedback: 'the recorded round-1 feedback' }],
+      })
+      await preCreateWorkspace(harness)
+      const outcome = await harness.run()
+      assert.ok(outcome.kind === 'ok', JSON.stringify(outcome))
+      // The resumed attempt continues at round 2 with exactly what it had
+      // persisted; the carried list cannot replace recorded feedback.
+      assert.equal(harness.workerInputs[0]!.round, 2)
+      assert.deepEqual(harness.workerInputs[0]!.feedback, [
+        { kind: 'review', round: 1, feedback: 'the recorded round-1 feedback' },
+      ])
     } finally {
       harness.cleanup()
     }

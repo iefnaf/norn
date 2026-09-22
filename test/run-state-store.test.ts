@@ -370,6 +370,128 @@ describe('run state integrity: torn and corrupted documents are errors', () => {
   })
 })
 
+describe('run state integrity: structured rework feedback (§10.2)', () => {
+  const review = { kind: 'review', round: 1, feedback: 'tighten the test' }
+  const testsFeedback = {
+    kind: 'tests',
+    round: 1,
+    testIndex: 0,
+    argv: ['npm', 'test'],
+    cause: 'non-zero-exit',
+    exitCode: 1,
+    stdout: 'out',
+    stderr: 'err',
+  }
+  const setupFeedback = {
+    kind: 'setup',
+    round: 0,
+    origin: 'initial',
+    argv: ['npm', 'ci'],
+    cause: 'timeout-terminated',
+    exitCode: null,
+    stdout: '',
+    stderr: '',
+  }
+  const terminal = {
+    kind: 'terminal',
+    outcome: 'blocked',
+    code: 'work-rounds-exhausted',
+    reason: 'two cold rounds',
+  }
+
+  it('accepts every feedback shape carried on a waiting Ticket', () => {
+    const outcome = checkRunStateIntegrity(
+      stateWith((s) => {
+        s.tickets.I_A = {
+          phase: 'waiting',
+          carriedFeedback: [review, testsFeedback, setupFeedback, terminal],
+        }
+      }),
+    )
+    assert.ok(outcome.kind === 'ok', outcome.kind === 'error' ? outcome.reason : '')
+  })
+
+  it('accepts an empty or populated feedback list on a live attempt', () => {
+    for (const feedback of [[], [review, terminal]]) {
+      const outcome = checkRunStateIntegrity(
+        stateWith((s) => {
+          s.tickets.I_A = { phase: 'working', wave: 1, attempt: { ...workAttempt(), feedback } }
+        }),
+      )
+      assert.ok(outcome.kind === 'ok', outcome.kind === 'error' ? outcome.reason : '')
+    }
+  })
+
+  it('accepts terminal feedback on a parked Ticket with its matching reference', () => {
+    const outcome = checkRunStateIntegrity(
+      stateWith((s) => {
+        s.tickets.I_A = {
+          phase: 'parked',
+          wave: 1,
+          feedback: [review, terminal],
+          outcome: { kind: 'blocked', code: 'work-rounds-exhausted', reason: 'r', evidence: [] },
+        }
+        s.parkedTickets = [ticketRef('I_A', 7)]
+      }),
+    )
+    assert.ok(outcome.kind === 'ok', outcome.kind === 'error' ? outcome.reason : '')
+  })
+
+  it('rejects empty carried or parked feedback and malformed entries', () => {
+    expectIntegrityViolation(
+      stateWith((s) => {
+        s.tickets.I_A = { phase: 'waiting', carriedFeedback: [] }
+      }),
+      /carriedFeedback must not be empty/,
+    )
+    expectIntegrityViolation(
+      stateWith((s) => {
+        s.tickets.I_A = {
+          phase: 'parked',
+          wave: 1,
+          feedback: [],
+          outcome: { kind: 'blocked', code: 'work-rounds-exhausted', reason: 'r', evidence: [] },
+        }
+        s.parkedTickets = [ticketRef('I_A', 7)]
+      }),
+      /tickets\[I_A\]\.feedback must not be empty/,
+    )
+    expectIntegrityViolation(
+      stateWith((s) => {
+        s.tickets.I_A = { phase: 'waiting', carriedFeedback: [{ kind: 'prose', text: 'hi' }] }
+      }),
+      /carriedFeedback\[0\]\.kind must be a known feedback kind/,
+    )
+    expectIntegrityViolation(
+      stateWith((s) => {
+        s.tickets.I_A = { phase: 'waiting', carriedFeedback: [{ ...review, round: 'one' }] }
+      }),
+      /carriedFeedback\[0\]\.round must be an integer/,
+    )
+    expectIntegrityViolation(
+      stateWith((s) => {
+        s.tickets.I_A = {
+          phase: 'waiting',
+          carriedFeedback: [{ ...terminal, evidence: [] }],
+        }
+      }),
+      /carriedFeedback\[0\] has unknown field "evidence"/,
+    )
+    expectIntegrityViolation(
+      stateWith((s) => {
+        s.tickets.I_A = {
+          phase: 'parked',
+          wave: 1,
+          feedback: [review],
+          outcome: { kind: 'blocked', code: 'work-rounds-exhausted', reason: 'r', evidence: [] },
+        }
+        s.parkedTickets = [ticketRef('I_A', 7)]
+      }),
+      /tickets\[I_A\]\.feedback must end with its terminal entry/,
+    )
+  })
+})
+
 describe('run state integrity: revision lineage re-hash and transitions', () => {
   it('accepts a valid compatible extension lineage', () => {
     const outcome = checkRunStateIntegrity(

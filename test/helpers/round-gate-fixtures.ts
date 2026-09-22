@@ -33,6 +33,7 @@ import type { CommandExecution, CommandExecutionRequest, CommandRunner } from '.
 import type {
   AgentLaunchPlan,
   ReviewerLaunchInput,
+  RoundFeedback,
   RoundGateDeps,
   RoundGateStore,
   WorkAttemptParams,
@@ -502,6 +503,8 @@ export type HarnessOptions = {
   readonly setup?: readonly RunConfigCommand[]
   readonly tests?: readonly RunConfigCommand[]
   readonly maxWorkRounds?: number
+  /** Prior-run terminal feedback carried into this attempt (§10.2). */
+  readonly carriedFeedback?: readonly RoundFeedback[]
   readonly initialRecord?: WorkAttemptRecord
   readonly slots?: {
     readonly reserve?: 'ok' | 'full' | 'fail'
@@ -560,6 +563,7 @@ export function makeHarness(options: HarnessOptions): Harness {
   const params: WorkAttemptParams = {
     input,
     workAttemptId: WORK_ATTEMPT_ID,
+    ...(options.carriedFeedback === undefined ? {} : { carriedFeedback: options.carriedFeedback }),
     map: { githubHost: HOST, repositoryId: REPOSITORY_ID, issueId: MAP_ISSUE_ID },
     repositoryRoot: repo.root,
     repositoryHome: home.home,

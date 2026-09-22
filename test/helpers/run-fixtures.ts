@@ -55,6 +55,8 @@ import type { MapOverrides } from './map-fixtures.ts'
 import { osTargetLock } from '../../src/ship/push.ts'
 import { runMap } from '../../src/run/lifecycle.ts'
 import type { RunLifecycleDeps, RunMapOutcome } from '../../src/run/lifecycle.ts'
+import { piWorkerLaunch } from '../../src/work/round-gate.ts'
+import type { WorkerLaunchInput } from '../../src/work/round-gate.ts'
 import { loadRunState } from '../../src/runstate/run-state-store.ts'
 import type {
   EvidenceGateV1,
@@ -71,7 +73,6 @@ import type { FakeGateway, FakeIssueState, GatewayScript } from './close-fixture
 import { fakeShipCommands } from './ship-fixtures.ts'
 import type { FakeShipCommands } from './ship-fixtures.ts'
 import type { CommandExecution, CommandExecutionRequest } from '../../src/work/command-runner.ts'
-import type { WorkerLaunchInput } from '../../src/work/round-gate.ts'
 import { tempBareRemote } from './push-fixtures.ts'
 import type { BareRemote } from './push-fixtures.ts'
 import type { TempRepository } from './round-gate-fixtures.ts'
@@ -275,6 +276,7 @@ export type AgentLaunchRecord = {
   readonly ticketIssueId: string | undefined
   readonly round: number | null
   readonly cwd: string
+  readonly argv: readonly string[]
   readonly env: Readonly<Record<string, string>>
 }
 
@@ -306,6 +308,7 @@ export function fakeRunRunner(
         ticketIssueId: context.ticket?.issueId,
         round: context.work?.round ?? null,
         cwd: request.cwd,
+        argv: [...request.argv],
         env: request.env ?? {},
       })
       if (context.role === 'worker') store.observed.workerLaunches += 1
@@ -567,9 +570,16 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
       },
       writer: writer.writer,
       launches: {
-        planWorkerFor: (workAttemptId) => (input) => {
+        planWorkerFor: (workAttemptId, worker) => (input) => {
           workerBriefings.push({ workAttemptId, input })
-          return { argv: ['fake-worker'] }
+          // Exercise the production worker prompt in every lifecycle test:
+          // the round briefing is exactly what a real Pi worker receives.
+          return piWorkerLaunch(input, {
+            model: worker.model,
+            thinking: worker.thinking,
+            extensionPath: 'fake-extension.ts',
+            piSessionId: `${workAttemptId}-worker-r${input.round}-pi`,
+          })
         },
         planWorkReviewerFor: () => () => ({
           argv: ['pi', '--tools', 'read,grep,find,ls,norn_complete'],

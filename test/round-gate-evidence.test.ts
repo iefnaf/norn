@@ -269,17 +269,33 @@ describe('the read-only reviewer launch policy', () => {
   })
 
   it('renders the worker round briefing into the launch prompt', () => {
-    const plan = piWorkerLaunch(
-      {
-        round: 2,
-        previousCandidateCommit: 'sha1:' + 'a'.repeat(40),
-        feedback: [{ kind: 'review', round: 1, feedback: 'tighten' }],
-      },
+    const feedback = [
+      { kind: 'review' as const, round: 1, feedback: 'tighten' },
+    ]
+    const withinRun = piWorkerLaunch(
+      { round: 2, previousCandidateCommit: 'sha1:' + 'a'.repeat(40), feedback },
       { model: 'provider-a/model-x', thinking: 'medium', extensionPath: '/norn/extension.ts', piSessionId: 'pi-2' },
     )
-    const prompt = plan.argv.at(-1)!.toString()
-    assert.match(prompt, /norn-worker-brief:v1/)
-    assert.match(prompt, /tighten/)
+    const withinRunPrompt = withinRun.argv.at(-1)!.toString()
+    assert.match(withinRunPrompt, /norn-worker-brief:v1/)
+    assert.match(withinRunPrompt, /tighten/)
+    assert.doesNotMatch(withinRunPrompt, /carried from a previous run/)
+
+    const carried = piWorkerLaunch(
+      {
+        round: 1,
+        previousCandidateCommit: null,
+        feedback: [
+          ...feedback,
+          { kind: 'terminal', outcome: 'blocked', code: 'work-rounds-exhausted', reason: 'three cold rounds' },
+        ],
+      },
+      { model: 'provider-a/model-x', thinking: 'medium', extensionPath: '/norn/extension.ts', piSessionId: 'pi-3' },
+    )
+    const carriedPrompt = carried.argv.at(-1)!.toString()
+    assert.match(carriedPrompt, /carried from a previous run's parked attempt/)
+    assert.match(carriedPrompt, /work-rounds-exhausted/)
+    assert.match(carriedPrompt, /three cold rounds/)
   })
 })
 
@@ -432,6 +448,16 @@ describe('the production Run-State attempt store and slot seam', () => {
       assert.ok(ticket?.phase === 'parked')
       assert.equal(ticket.outcome.code, 'worker-block')
       assert.equal(ticket.workspace?.path, harness.workspacePath)
+      // The parked Ticket carries its accumulated feedback plus the terminal
+      // entry, so a later run can carry the rework context (§10.2).
+      assert.deepEqual(ticket.feedback, [
+        {
+          kind: 'terminal',
+          outcome: 'blocked',
+          code: 'worker-block',
+          reason: 'the worker blocked: requires-operator-decision',
+        },
+      ])
       assert.deepEqual(
         reloaded.value.parkedTickets.map((ref) => ref.issueId),
         ['I_7'],

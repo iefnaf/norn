@@ -204,6 +204,107 @@ function checkStringArray(
   })
 }
 
+function checkNullableInteger(value: unknown, where: string, violations: string[]): void {
+  if (value === null) return
+  if (typeof value !== 'number' || !Number.isInteger(value)) {
+    violations.push(`${where} must be an integer or null`)
+  }
+}
+
+/**
+ * One accumulated structured-feedback list (§10.2): a `waiting` Ticket's
+ * carried feedback and a parked Ticket's terminal feedback are never empty;
+ * a live attempt's feedback list may be while it has none yet.
+ */
+function checkReworkFeedbackList(
+  value: unknown,
+  where: string,
+  violations: string[],
+  options: { readonly allowEmpty?: boolean } = {},
+): void {
+  if (!Array.isArray(value)) {
+    violations.push(`${where} must be an array of feedback entries`)
+    return
+  }
+  if (value.length === 0 && options.allowEmpty !== true) {
+    violations.push(`${where} must not be empty when present`)
+  }
+  value.forEach((entry, index) => checkReworkFeedback(entry, `${where}[${index}]`, violations))
+}
+
+function checkReworkFeedback(value: unknown, where: string, violations: string[]): void {
+  if (!isPlainObject(value)) {
+    violations.push(`${where} must be a feedback entry object`)
+    return
+  }
+  switch (value.kind) {
+    case 'setup':
+      checkKeys(
+        value,
+        ['kind', 'round', 'origin', 'argv', 'cause', 'exitCode', 'stdout', 'stderr'],
+        where,
+        violations,
+      )
+      checkInteger(value.round, 0, `${where}.round`, violations)
+      checkEnum(value.origin, ['initial', 'candidate'] as const, `${where}.origin`, violations)
+      checkStringArray(value.argv, `${where}.argv`, violations)
+      checkEnum(
+        value.cause,
+        ['non-zero-exit', 'timeout-terminated'] as const,
+        `${where}.cause`,
+        violations,
+      )
+      checkNullableInteger(value.exitCode, `${where}.exitCode`, violations)
+      checkString(value.stdout, `${where}.stdout`, violations)
+      checkString(value.stderr, `${where}.stderr`, violations)
+      break
+    case 'tests':
+      checkKeys(
+        value,
+        ['kind', 'round', 'testIndex', 'argv', 'cause', 'exitCode', 'stdout', 'stderr'],
+        where,
+        violations,
+      )
+      checkInteger(value.round, 1, `${where}.round`, violations)
+      checkInteger(value.testIndex, 0, `${where}.testIndex`, violations)
+      checkStringArray(value.argv, `${where}.argv`, violations)
+      checkEnum(
+        value.cause,
+        ['non-zero-exit', 'timeout-terminated'] as const,
+        `${where}.cause`,
+        violations,
+      )
+      checkNullableInteger(value.exitCode, `${where}.exitCode`, violations)
+      checkString(value.stdout, `${where}.stdout`, violations)
+      checkString(value.stderr, `${where}.stderr`, violations)
+      break
+    case 'review':
+      checkKeys(value, ['kind', 'round', 'feedback'], where, violations)
+      checkInteger(value.round, 1, `${where}.round`, violations)
+      checkNonEmptyString(value.feedback, `${where}.feedback`, violations)
+      break
+    case 'conflict':
+      checkKeys(value, ['kind', 'round', 'code', 'reason', 'evidence'], where, violations)
+      checkInteger(value.round, 0, `${where}.round`, violations)
+      checkNonEmptyString(value.code, `${where}.code`, violations)
+      checkString(value.reason, `${where}.reason`, violations)
+      if (!Array.isArray(value.evidence)) {
+        violations.push(`${where}.evidence must be an array`)
+      } else if (!value.evidence.every(isCanonicalJsonValue)) {
+        violations.push(`${where}.evidence must be serializable machine data`)
+      }
+      break
+    case 'terminal':
+      checkKeys(value, ['kind', 'outcome', 'code', 'reason'], where, violations)
+      checkEnum(value.outcome, ['blocked', 'error'] as const, `${where}.outcome`, violations)
+      checkNonEmptyString(value.code, `${where}.code`, violations)
+      checkString(value.reason, `${where}.reason`, violations)
+      break
+    default:
+      violations.push(`${where}.kind must be a known feedback kind`)
+  }
+}
+
 /** Check exactly the keys present, rejecting unknown fields on a closed shape. */
 function checkKeys(
   value: Unknown,
@@ -665,6 +766,7 @@ function checkWorkAttempt(value: unknown, where: string, violations: string[]): 
     ['workAttemptId', 'input', 'branch', 'workspace', 'round', 'slot', 'processGroupIds'],
     where,
     violations,
+    { allowOptional: ['feedback'] },
   )
   checkNonEmptyString(value.workAttemptId, `${where}.workAttemptId`, violations)
   checkWorkInput(value.input, `${where}.input`, violations)
@@ -678,6 +780,9 @@ function checkWorkAttempt(value: unknown, where: string, violations: string[]): 
     violations,
   )
   checkStringArray(value.processGroupIds, `${where}.processGroupIds`, violations, { unique: true })
+  if (value.feedback !== undefined) {
+    checkReworkFeedbackList(value.feedback, `${where}.feedback`, violations, { allowEmpty: true })
+  }
   if (isPlainObject(value.workspace) && value.workspace.kind === 'ticket') {
     if (value.workspace.workAttemptId !== value.workAttemptId) {
       violations.push(`${where}.workspace must carry the attempt's workAttemptId`)
@@ -1071,8 +1176,11 @@ function checkTicketRunState(value: unknown, where: string, violations: string[]
   }
   switch (value.phase) {
     case 'waiting': {
-      checkKeys(value, ['phase'], where, violations, { allowOptional: ['wave'] })
+      checkKeys(value, ['phase'], where, violations, { allowOptional: ['wave', 'carriedFeedback'] })
       if (value.wave !== undefined) checkInteger(value.wave, 1, `${where}.wave`, violations)
+      if (value.carriedFeedback !== undefined) {
+        checkReworkFeedbackList(value.carriedFeedback, `${where}.carriedFeedback`, violations)
+      }
       break
     }
     case 'working': {
@@ -1083,11 +1191,14 @@ function checkTicketRunState(value: unknown, where: string, violations: string[]
     }
     case 'parked': {
       checkKeys(value, ['phase', 'wave', 'outcome'], where, violations, {
-        allowOptional: ['workspace'],
+        allowOptional: ['workspace', 'feedback'],
       })
       checkInteger(value.wave, 1, `${where}.wave`, violations)
       if (value.workspace !== undefined) {
         checkWorkspaceRef(value.workspace, `${where}.workspace`, violations)
+      }
+      if (value.feedback !== undefined) {
+        checkReworkFeedbackList(value.feedback, `${where}.feedback`, violations)
       }
       if (isPlainObject(value.outcome)) {
         checkKeys(value.outcome, ['kind', 'code', 'reason', 'evidence'], `${where}.outcome`, violations)
@@ -1198,6 +1309,14 @@ function checkRunStateInvariants(state: RunState, violations: string[]): void {
     }
     if (ticket.phase === 'waiting' && ticket.wave !== undefined && ticket.wave > state.wave) {
       violations.push(`tickets[${issueId}] carries wave ${ticket.wave} beyond wave ${state.wave}`)
+    }
+    if (ticket.phase === 'parked' && ticket.feedback !== undefined) {
+      // A parked list is the attempt's accumulation plus exactly its terminal
+      // entry; the entry's absence would let a later run carry feedback that
+      // does not say how the attempt ended (§10.2).
+      if (ticket.feedback.at(-1)?.kind !== 'terminal') {
+        violations.push(`tickets[${issueId}].feedback must end with its terminal entry`)
+      }
     }
   }
 

@@ -199,8 +199,12 @@ Process observations:
    read the error tail, not assume failure.
 10. **Round budget pressure** — the fiddly e2e ticket exhausted its
     default 3 review rounds; the remedy (new run, or a higher
-    `maxWorkRounds` via re-init) works but discards the parked attempt's
-    feedback, so the fresh worker starts from zero context.
+    `maxWorkRounds` via re-init) works but used to discard the parked
+    attempt's feedback, so the fresh worker started from zero context.
+    Ticket #21 now persists the attempt's accumulated structured feedback
+    in Run State and carries it into the next run's first Work round, so
+    the remedy keeps the warm context without ever reusing a workspace or
+    earlier evidence.
 11. **Pane litter and poll cost** — every invocation opens a new Herdr
     pane; done panes linger for inspection (useful) but accumulate, and
     each split narrows the remainder. At validation time, `waitForExit`
