@@ -71,6 +71,7 @@ import type { FakeGateway, FakeIssueState, GatewayScript } from './close-fixture
 import { fakeShipCommands } from './ship-fixtures.ts'
 import type { FakeShipCommands } from './ship-fixtures.ts'
 import type { CommandExecution, CommandExecutionRequest } from '../../src/work/command-runner.ts'
+import type { WorkerLaunchInput } from '../../src/work/round-gate.ts'
 import { tempBareRemote } from './push-fixtures.ts'
 import type { BareRemote } from './push-fixtures.ts'
 import type { TempRepository } from './round-gate-fixtures.ts'
@@ -285,7 +286,7 @@ export type FakeRunAgents = VisibleAgentRunner & {
 /** Workers keyed by ticket issue ID; the reviewer verdict is scriptable. */
 export function fakeRunRunner(
   store: RunMapStore,
-  reviewer: () => ReviewerCompletion = () => ({ discriminant: 'pass' }),
+  reviewer: (ticketIssueId: string) => ReviewerCompletion = () => ({ discriminant: 'pass' }),
   completionReviewer: () => ReviewerCompletion = () => ({ discriminant: 'pass' }),
 ): FakeRunAgents {
   const launches: AgentLaunchRecord[] = []
@@ -317,7 +318,7 @@ export function fakeRunRunner(
           ? performWorker(this.workerBehavior(context.ticket!.issueId), request)
           : context.phase === 'map-completion'
             ? completionReviewer()
-            : reviewer()
+            : reviewer(context.ticket?.issueId ?? '')
       const sidecarStore = new CompletionStore(context.completionsDir)
       const written = await sidecarStore.write(context, completion, agentRecordedAt())
       if (written.status === 'conflict') throw new Error('sidecar conflict')
@@ -364,8 +365,8 @@ export type RunHarnessOptions = {
   readonly members: readonly MemberSpec[]
   /** Worker behaviors keyed by ticket issue ID; default: one commit. */
   readonly behaviors?: Readonly<Record<string, WorkerBehavior>>
-  /** The reviewer verdict script; default: pass. */
-  readonly reviewer?: () => ReviewerCompletion
+  /** The reviewer verdict script, keyed by ticket issue ID; default: pass. */
+  readonly reviewer?: (ticketIssueId: string) => ReviewerCompletion
   /** Staged map changes applied at load boundaries. */
   readonly changes?: readonly StagedChange[]
   /** Overrides the gateway write script (failures model unknown results). */
@@ -392,6 +393,8 @@ export type RunHarness = {
   readonly commands: FakeShipCommands
   /** The ticket issue IDs that have been worked, in launch order. */
   workedTickets(): readonly string[]
+  /** Every worker launch briefing the coordinator built, in launch order. */
+  workerBriefings(): readonly WorkerBriefing[]
   /** The full lifecycle deps the harness drives `runMap` with. */
   deps(): RunLifecycleDeps
   run(): Promise<RunMapOutcome>
@@ -404,6 +407,12 @@ export type RunHarness = {
   /** Remote main's commit subjects, oldest first. */
   remoteLog(): readonly string[]
   cleanup(): void
+}
+
+/** One captured worker briefing: the attempt it belongs to and its input. */
+export type WorkerBriefing = {
+  readonly workAttemptId: string
+  readonly input: WorkerLaunchInput
 }
 
 /** Build the complete §12–§13 harness over one real repository and fake seams. */
@@ -534,6 +543,7 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
 
   let runCounter = 0
   let shipInvocation = 0
+  const workerBriefings: WorkerBriefing[] = []
 
   const buildDeps = (): RunLifecycleDeps => {
     const realPush = gitCliPush()
@@ -557,8 +567,8 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
       },
       writer: writer.writer,
       launches: {
-        planWorkerFor: () => (input) => {
-          void input
+        planWorkerFor: (workAttemptId) => (input) => {
+          workerBriefings.push({ workAttemptId, input })
           return { argv: ['fake-worker'] }
         },
         planWorkReviewerFor: () => () => ({
@@ -604,6 +614,7 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
     commands,
     workedTickets: () =>
       runner.launches.filter((entry) => entry.role === 'worker').map((entry) => entry.ticketIssueId!),
+    workerBriefings: () => workerBriefings,
     deps: buildDeps,
     snapshot(): TaskMapSnapshot {
       const evaluation = evaluateTaskMapLoad(loadOf(store))

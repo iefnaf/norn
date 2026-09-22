@@ -187,12 +187,13 @@ describe('wave execution — parked tickets, waiting descendants, independent br
     }
   })
 
-  it('parks a ticket-scoped ship failure and continues the queue with later tickets', async () => {
+  it('re-queues an integration-conflict ticket for fresh Work in the same run', async () => {
     // A and B add the same file with different content: after A ships, B's
-    // replay onto the advanced target conflicts. C — a later, independent
-    // ticket — still ships.
+    // replay onto the advanced target conflicts. Instead of parking, B is
+    // re-queued for fresh Work in wave 2 at the advanced base, with the
+    // conflict as worker feedback; the rework converges without a new run.
     const harness = await makeRunHarness({
-      label: 'ship-conflict',
+      label: 'ship-conflict-requeue',
       members: [
         ticketA({ worker: { kind: 'file', name: 'shared.txt', content: 'from A\n' } }),
         ticketB({ worker: { kind: 'file', name: 'shared.txt', content: 'from B\n' } }),
@@ -201,19 +202,136 @@ describe('wave execution — parked tickets, waiting descendants, independent br
     })
     try {
       const outcome = await harness.run()
+      assert.ok(outcome.kind === 'ok', JSON.stringify(outcome))
+      assert.equal(outcome.value.label, 'passed')
+
+      assert.equal(ticketStateOf(harness, 'I_A').phase, 'completed')
+      assert.equal(ticketStateOf(harness, 'I_B').phase, 'completed')
+      assert.equal(ticketStateOf(harness, 'I_D').phase, 'completed')
+
+      // Wave 1 worked all three; B's conflict re-queued it into wave 2.
+      const state = harness.runState()!
+      assert.equal(state.wave, 2)
+      const rework = state.reworks?.I_B
+      assert.ok(rework !== undefined)
+      assert.equal(rework.cycles, 1)
+      assert.equal(rework.conflict.code, 'integration-conflict')
+      const conflictEvidence = rework.conflict.evidence[0] as Record<string, unknown>
+      assert.deepEqual(conflictEvidence.conflictedPaths, ['shared.txt'])
+
+      // B was worked twice; its rework attempt received the conflict as
+      // structured feedback before its first worker round.
+      assert.equal(harness.workedTickets().filter((issueId) => issueId === 'I_B').length, 2)
+      const briefing = harness.workerBriefings().find((entry) => entry.workAttemptId === 'wa-w2-t2')
+      assert.ok(briefing !== undefined)
+      const conflict = briefing.input.feedback.find((entry) => entry.kind === 'conflict')
+      assert.equal(conflict?.kind, 'conflict')
+      if (conflict?.kind === 'conflict') {
+        assert.equal(conflict.round, 0)
+        assert.equal(conflict.code, 'integration-conflict')
+      }
+
+      // A shipped in wave 1, D shipped after the conflict, B's rework shipped
+      // last: init + #1 + #4 + #2.
+      const log = harness.remoteLog()
+      assert.equal(log.length, 4)
+      assert.match(log[1]!, /#1/)
+      assert.match(log[2]!, /#4/)
+      assert.match(log[3]!, /#2/)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('parks an integration-conflict ticket once the in-run rework budget is exhausted', async () => {
+    // Wave 1: A ships and #9's replay conflicts, consuming the single allowed
+    // rework. Wave 2: B (#2, unblocked by A) ships first and advances the
+    // target, so #9's rework conflicts again — the exhausted budget parks it
+    // with the existing integration-conflict semantics instead of re-queuing
+    // it forever.
+    const harness = await makeRunHarness({
+      label: 'ship-conflict-budget',
+      members: [
+        ticketA({ worker: { kind: 'file', name: 'shared.txt', content: 'from A\n' } }),
+        ticketB({ blockers: ['I_A'], worker: { kind: 'file', name: 'shared.txt', content: 'from B\n' } }),
+        ticket9({ worker: { kind: 'file', name: 'shared.txt', content: 'from 9\n' } }),
+      ],
+    })
+    const config = JSON.parse(RUN_CONFIG_JSON) as Record<string, unknown>
+    config.maxWorkRounds = 1
+    writeFileSync(join(harness.repositoryHome, 'config.json'), `${JSON.stringify(config)}\n`)
+    try {
+      const outcome = await harness.run()
       assert.equal(outcome.kind, 'blocked')
       assert.equal(outcome.code, 'no-eligible-frontier')
 
       assert.equal(ticketStateOf(harness, 'I_A').phase, 'completed')
-      const parkedB = ticketStateOf(harness, 'I_B')
-      assert.equal(parkedB.phase, 'parked')
-      assert.equal(parkedB.phase === 'parked' ? parkedB.outcome.code : '', 'integration-conflict')
-      assert.equal(ticketStateOf(harness, 'I_D').phase, 'completed')
+      assert.equal(ticketStateOf(harness, 'I_B').phase, 'completed')
+      const parked = ticketStateOf(harness, 'I_9')
+      assert.equal(parked.phase, 'parked')
+      assert.equal(parked.phase === 'parked' ? parked.outcome.code : '', 'integration-conflict')
 
-      const log = harness.remoteLog()
-      assert.equal(log.length, 3) // init + A's integration + D's integration
-      assert.match(log[1]!, /#1/)
-      assert.match(log[2]!, /#4/)
+      // Exactly one rework was granted; the second conflict parked.
+      const state = harness.runState()!
+      assert.equal(state.wave, 2)
+      assert.equal(state.reworks?.I_9?.cycles, 1)
+      assert.equal(harness.workedTickets().filter((issueId) => issueId === 'I_9').length, 2)
+      assert.equal(harness.remoteLog().length, 3) // init + #1 (A) + #2 (B); #9 never shipped
+
+      // The rework attempt still received the first conflict as feedback,
+      // and the terminal report records the exhausted budget.
+      const briefing = harness.workerBriefings().find((entry) => entry.workAttemptId === 'wa-w2-t9')
+      assert.equal(briefing?.input.feedback.find((entry) => entry.kind === 'conflict')?.kind, 'conflict')
+      const report = outcome.evidence[0] as { warnings: string[]; tickets: { ticket: { number: number }; state: string; code?: string }[] }
+      assert.ok(report.warnings.some((warning) => warning.includes('exhausted its in-run rework budget')))
+      const byNumber = new Map(report.tickets.map((entry) => [entry.ticket.number, entry]))
+      assert.equal(byNumber.get(9)?.state, 'parked')
+      assert.equal(byNumber.get(9)?.code, 'integration-conflict')
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('applies the ordinary round budget to a rework attempt', async () => {
+    // maxWorkRounds = 1. A ships; B's first attempt passes its single review
+    // round and conflicts at Ship. B's rework then iterates in its own single
+    // round — its round budget is exhausted exactly as any Work attempt's
+    // would be, and it parks with work-rounds-exhausted.
+    const reviewerCalls = new Map<string, number>()
+    const harness = await makeRunHarness({
+      label: 'rework-rounds',
+      members: [
+        ticketA({ worker: { kind: 'file', name: 'shared.txt', content: 'from A\n' } }),
+        ticketB({ worker: { kind: 'file', name: 'shared.txt', content: 'from B\n' } }),
+      ],
+      reviewer: (issueId) => {
+        const call = (reviewerCalls.get(issueId) ?? 0) + 1
+        reviewerCalls.set(issueId, call)
+        return issueId === 'I_B' && call === 2
+          ? { discriminant: 'iterate' as const, feedback: 'resolve the conflict' }
+          : { discriminant: 'pass' as const }
+      },
+    })
+    const config = JSON.parse(RUN_CONFIG_JSON) as Record<string, unknown>
+    config.maxWorkRounds = 1
+    writeFileSync(join(harness.repositoryHome, 'config.json'), `${JSON.stringify(config)}\n`)
+    try {
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'blocked')
+      assert.equal(outcome.code, 'no-eligible-frontier')
+
+      assert.equal(ticketStateOf(harness, 'I_A').phase, 'completed')
+      const parked = ticketStateOf(harness, 'I_B')
+      assert.equal(parked.phase, 'parked')
+      assert.equal(parked.phase === 'parked' ? parked.outcome.code : '', 'work-rounds-exhausted')
+
+      // The rework attempt received the conflict before its single round.
+      const briefing = harness.workerBriefings().find((entry) => entry.workAttemptId === 'wa-w2-t2')
+      assert.equal(briefing?.input.round, 1)
+      assert.equal(
+        briefing?.input.feedback.find((entry) => entry.kind === 'conflict')?.kind,
+        'conflict',
+      )
     } finally {
       harness.cleanup()
     }

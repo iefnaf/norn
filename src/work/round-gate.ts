@@ -181,6 +181,17 @@ export type RoundFeedback =
       readonly round: number
       readonly feedback: string
     }
+  | {
+      /**
+       * The Ship conflict that re-queued this Ticket for fresh Work (§12),
+       * carried into the rework attempt's first round.
+       */
+      readonly kind: 'conflict'
+      readonly round: number
+      readonly code: string
+      readonly reason: string
+      readonly evidence: readonly Evidence[]
+    }
 
 /** What the worker invocation is launched with, beyond its bound context. */
 export type WorkerLaunchInput = {
@@ -455,6 +466,12 @@ export type RoundGateDeps = {
 export type WorkAttemptParams = {
   readonly input: WorkInput
   readonly workAttemptId: string
+  /**
+   * Structured feedback a fresh attempt starts with (§12): the Ship conflict
+   * that re-queued this Ticket for rework. Seeds the accumulated feedback;
+   * ignored when a persisted attempt already owns its own list.
+   */
+  readonly carriedFeedback?: readonly RoundFeedback[]
   /** Identity of the Task Map the Ticket belongs to (sidecar binding, §17). */
   readonly map: AgentMapBinding
   readonly repositoryRoot: string
@@ -967,7 +984,7 @@ export async function runWorkAttempt(
 
   // --- initial setup at the base; a clean non-pass is worker feedback ----
 
-  const feedback: RoundFeedback[] = []
+  const feedback: RoundFeedback[] = [...(params.carriedFeedback ?? [])]
   if (state.record.attempt.round === 0) {
     const setup = await runGateCommandList(gateDeps, {
       commands: params.setup,

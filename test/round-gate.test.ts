@@ -24,6 +24,7 @@ import type { GitCommandRunner } from '../src/adapters/git-repository.ts'
 import { error } from '../src/core/outcome.ts'
 import type { WorkInput } from '../src/runstate/types.ts'
 import type { WorkAttemptRecord, WorkOutcome } from '../src/work/round-gate.ts'
+import { runWorkAttempt } from '../src/work/round-gate.ts'
 
 import {
   attemptRecord,
@@ -161,6 +162,36 @@ describe('runWorkAttempt: the full round gate', () => {
       assert.equal(feedback[0]!.round, 0)
       assert.equal(feedback[0]!.origin, 'initial')
       assert.equal(feedback[0]!.exitCode, 1)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('seeds a fresh attempt with carried conflict feedback for its first round', async () => {
+    const harness = makeHarness({ label: 'carried-conflict', worker: committingWorker(), reviewer: passReviewer })
+    try {
+      const outcome = await runWorkAttempt(harness.deps, {
+        ...harness.params,
+        carriedFeedback: [
+          {
+            kind: 'conflict',
+            round: 0,
+            code: 'integration-conflict',
+            reason: 'the candidate conflicts when replayed onto the advanced target',
+            evidence: [{ conflictedPaths: ['shared.txt'] }],
+          },
+        ],
+      })
+      assert.ok(outcome.kind === 'ok', JSON.stringify(outcome))
+      assert.equal(harness.workerInputs.length, 1)
+      const feedback = harness.workerInputs[0]!.feedback
+      assert.equal(feedback.length, 1)
+      assert.equal(feedback[0]!.kind, 'conflict')
+      if (feedback[0]!.kind === 'conflict') {
+        assert.equal(feedback[0]!.round, 0)
+        assert.equal(feedback[0]!.code, 'integration-conflict')
+        assert.deepEqual(feedback[0]!.evidence, [{ conflictedPaths: ['shared.txt'] }])
+      }
     } finally {
       harness.cleanup()
     }
