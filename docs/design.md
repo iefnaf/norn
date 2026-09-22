@@ -1231,6 +1231,8 @@ The extension:
 
 An agent invocation settles only when a valid sidecar exists and the complete Pi process group has exited. Process exit without a sidecar is a protocol error. Terminal prose never controls orchestration.
 
+The extension enforces that handoff instead of relying on the model volunteering it: when the agent is about to settle without having called `norn_complete` (and a Norn invocation context is bound), it appends a bounded corrective entry — at most two per invocation — instructing the agent to immediately submit the same conclusion in typed form, each requesting one continuation; when the agent settles without ever completing, it shuts its own Pi process down. The coordinator then observes group-exit-without-sidecar within seconds and routes it through the existing recoverable protocol-error path, instead of idling at the prompt until the invocation timeout (#33).
+
 The sidecar is not business evidence. Norn independently verifies Git state, configured test results, review bindings, remote ancestry, and GitHub state before accepting an outcome.
 
 User interruption before a valid sidecar is `blocked(user-abort)`. Agent timeout or malformed settlement is a ticket-scoped error for Work; Ship and map-completion reviewers use the scope of their enclosing operation. The adapter must terminate and settle the whole owned process group before Norn fingerprints the final Git tree.

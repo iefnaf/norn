@@ -174,7 +174,11 @@ Prerequisites):
    Ticket #24 replaced that workaround with Run Config `agentEnv`, passed as
    explicit `herdr agent start --env` entries. A failed first submission still
    does not exit the pane; the invocation then waits out its timeout unless
-   the operator notices.
+   the operator notices. Ticket #33 closed the remaining settlement gap
+   inside the completion extension: a turn that ends without `norn_complete`
+   now gets a bounded corrective continuation, and settling without any
+   completion shuts the Pi process down, so the coordinator sees the
+   recoverable protocol error in seconds instead of after the timeout.
 7. **Parallel-wave path conflicts rework in-run** — two wave-2 members
    each invented `test/index.js`; the second ship replayed onto the
    advanced target, hit an add/add conflict, and parked with

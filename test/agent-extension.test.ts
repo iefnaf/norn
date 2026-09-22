@@ -4,8 +4,8 @@
  * Covers: tool registration and the terminate hint, context loading from the
  * environment, exactly-one sidecar creation through the tool body, idempotent
  * identical resubmission, rejection of a conflicting second completion,
- * rejection of completions of the wrong role, and the live Pi session
- * binding check.
+ * rejection of completions of the wrong role, the live Pi session binding
+ * check, and the #33 settlement enforcement at the Pi settle boundary.
  */
 import assert from 'node:assert/strict'
 import { readdir, readFile } from 'node:fs/promises'
@@ -18,9 +18,11 @@ import nornCompletionExtension, {
   NORN_AGENT_CONTEXT_ENV,
   NORN_COMPLETE_TOOL_NAME,
   NORN_REVIEWER_TOOL_ALLOWLIST,
+  NORN_SETTLEMENT_NUDGE_LIMIT,
   completionExtensionPath,
   createNornCompletionSubmitter,
   loadAgentContextFromEnv,
+  settlementNudgeEntry,
 } from '../src/agents/completion-extension.ts'
 import { buildContext, createRunArea, defaultWorkerCandidate } from './helpers/agent-fixtures.ts'
 
@@ -42,16 +44,48 @@ type RegisteredTool = {
 
 type ActiveToolsContext = { shutdown: () => void }
 
+type BoundaryDraft = { readonly type: string; readonly customType?: string }
+
+type BeforeSettleEvent = {
+  readonly entries: BoundaryDraft[]
+  readonly continue: boolean
+  // Deliberate divergence from Pi's real BoundaryState: the production
+  // handler reads only `entries` (and ignores `context`/`outcome`), so the
+  // fake omits them. Extend this fake if the handler ever grows.
+}
+
+type BeforeSettleResult = { readonly entries?: BoundaryDraft[]; readonly continue?: boolean }
+
+type SettleContext = { shutdown: () => void }
+
 function fakePi() {
   const tools: RegisteredTool[] = []
   const activeToolSets: string[][] = []
   const beforeAgentStartHandlers: Array<(event: unknown, ctx: ActiveToolsContext) => void> = []
+  const beforeSettleHandlers: Array<
+    (event: BeforeSettleEvent, ctx: SettleContext) => BeforeSettleResult | undefined
+  > = []
+  const settledHandlers: Array<(event: unknown, ctx: SettleContext) => void> = []
   const pi = {
     registerTool(tool: RegisteredTool) {
       tools.push(tool)
     },
-    on(event: string, handler: (event: unknown, ctx: ActiveToolsContext) => void) {
-      if (event === 'before_agent_start') beforeAgentStartHandlers.push(handler)
+    on(
+      event: string,
+      handler:
+        | ((event: unknown, ctx: ActiveToolsContext) => void)
+        | ((event: BeforeSettleEvent, ctx: SettleContext) => BeforeSettleResult | undefined)
+        | ((event: unknown, ctx: SettleContext) => void),
+    ) {
+      if (event === 'before_agent_start') {
+        beforeAgentStartHandlers.push(handler as (event: unknown, ctx: ActiveToolsContext) => void)
+      } else if (event === 'agent_before_settle') {
+        beforeSettleHandlers.push(
+          handler as (event: BeforeSettleEvent, ctx: SettleContext) => BeforeSettleResult | undefined,
+        )
+      } else if (event === 'agent_settled') {
+        settledHandlers.push(handler as (event: unknown, ctx: SettleContext) => void)
+      }
       return () => undefined
     },
     getActiveTools() {
@@ -63,7 +97,14 @@ function fakePi() {
       activeToolSets.push([...toolNames])
     },
   }
-  return { pi: pi as unknown as ExtensionAPI, tools, activeToolSets, beforeAgentStartHandlers }
+  return {
+    pi: pi as unknown as ExtensionAPI,
+    tools,
+    activeToolSets,
+    beforeAgentStartHandlers,
+    beforeSettleHandlers,
+    settledHandlers,
+  }
 }
 
 /** A shutdown spy standing in for the extension context's exit hook. */
@@ -208,6 +249,118 @@ describe('completion extension registration', () => {
 
   it('exposes its own file path for pi --extension launch plans', () => {
     assert.ok(completionExtensionPath().endsWith('completion-extension.ts'))
+  })
+})
+
+describe('settlement enforcement at the Pi settle boundary', () => {
+  const settleEvent = (entries: BoundaryDraft[] = []): BeforeSettleEvent => ({
+    entries,
+    continue: false,
+  })
+
+  it('appends exactly one corrective continuation when the agent settles without completing', async () => {
+    const area = await createRunArea('settle-nudge')
+    const context = buildContext(area, { role: 'reviewer', phase: 'work' })
+    const { pi, beforeSettleHandlers } = fakePi()
+
+    withEnv({ [NORN_AGENT_CONTEXT_ENV]: JSON.stringify(context) }, () => {
+      nornCompletionExtension(pi)
+    })
+
+    assert.equal(beforeSettleHandlers.length, 1)
+    // Another extension already proposed an entry: the nudge appends after it
+    // instead of replacing the boundary proposal.
+    const foreign = { type: 'custom', customType: 'someone-else' }
+    const result = beforeSettleHandlers[0](settleEvent([foreign]), { shutdown: () => undefined })
+
+    assert.deepEqual(result, {
+      entries: [foreign, settlementNudgeEntry(1, NORN_SETTLEMENT_NUDGE_LIMIT)],
+      continue: true,
+    })
+    const nudge = result?.entries?.[1]
+    assert.equal(nudge?.type, 'custom_message')
+    assert.equal(nudge?.customType, 'norn-settlement-enforcement')
+    assert.match(JSON.stringify(nudge), /norn_complete/)
+  })
+
+  it('stops nudging after the bounded attempts and lets the agent settle', async () => {
+    const area = await createRunArea('settle-bounded')
+    const context = buildContext(area, { role: 'worker', phase: 'work' })
+    const { pi, beforeSettleHandlers } = fakePi()
+
+    withEnv({ [NORN_AGENT_CONTEXT_ENV]: JSON.stringify(context) }, () => {
+      nornCompletionExtension(pi)
+    })
+
+    const results: Array<BeforeSettleResult | undefined> = []
+    for (let i = 0; i <= NORN_SETTLEMENT_NUDGE_LIMIT; i += 1) {
+      results.push(beforeSettleHandlers[0](settleEvent(), { shutdown: () => undefined }))
+    }
+
+    // Exactly the bounded number of nudges, each requesting one continuation
+    // with a single corrective entry — then nothing, so the agent settles.
+    for (const result of results.slice(0, NORN_SETTLEMENT_NUDGE_LIMIT)) {
+      assert.deepEqual(result?.entries?.map((entry) => entry.customType), [
+        'norn-settlement-enforcement',
+      ])
+      assert.equal(result?.continue, true)
+    }
+    assert.deepEqual(results.at(-1), undefined)
+  })
+
+  it('adds no nudge and no shutdown once norn_complete has completed the invocation', async () => {
+    const area = await createRunArea('settle-completed')
+    const context = buildContext(area, { role: 'worker', phase: 'work' })
+    const { pi, tools, beforeSettleHandlers, settledHandlers } = fakePi()
+
+    withEnv({ [NORN_AGENT_CONTEXT_ENV]: JSON.stringify(context) }, () => {
+      nornCompletionExtension(pi)
+    })
+
+    // A successful norn_complete: the sidecar is written and the process is
+    // asked to shut down exactly once — by the tool itself.
+    const { shutdown, calls } = recordedShutdown()
+    const result = await tools[0].execute('t1', WORKER_CANDIDATE, undefined, undefined, {
+      sessionManager: { getSessionId: () => context.piSessionId },
+      shutdown,
+    })
+    assert.match(result.content[0].text, /Norn completion written/)
+
+    assert.equal(beforeSettleHandlers[0](settleEvent(), { shutdown }), undefined)
+    settledHandlers[0]({}, { shutdown })
+    assert.equal(calls(), 1)
+  })
+
+  it('changes nothing without a bound Norn invocation context', () => {
+    const { pi, beforeSettleHandlers, settledHandlers } = fakePi()
+
+    withEnv({ [NORN_AGENT_CONTEXT_ENV]: undefined }, () => {
+      nornCompletionExtension(pi)
+    })
+
+    assert.equal(beforeSettleHandlers[0](settleEvent(), { shutdown: () => undefined }), undefined)
+    const { shutdown, calls } = recordedShutdown()
+    settledHandlers[0]({}, { shutdown })
+    assert.equal(calls(), 0)
+  })
+
+  it('shuts the process down when the agent settles without ever completing', async () => {
+    const area = await createRunArea('settle-exit')
+    const context = buildContext(area, { role: 'reviewer', phase: 'work' })
+    const { pi, beforeSettleHandlers, settledHandlers } = fakePi()
+
+    withEnv({ [NORN_AGENT_CONTEXT_ENV]: JSON.stringify(context) }, () => {
+      nornCompletionExtension(pi)
+    })
+
+    // The nudges were exhausted (or ignored) and the agent still settled
+    // without the typed handoff: exit instead of idling at the prompt.
+    const { shutdown, calls } = recordedShutdown()
+    for (let i = 0; i <= NORN_SETTLEMENT_NUDGE_LIMIT; i += 1) {
+      beforeSettleHandlers[0](settleEvent(), { shutdown })
+    }
+    settledHandlers[0]({}, { shutdown })
+    assert.equal(calls(), 1)
   })
 })
 
