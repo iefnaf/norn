@@ -92,6 +92,8 @@ const PANE_CLOSED = '{"id":"cli:pane:close","result":{"type":"ok"}}\n'
 const PANE_CLOSE_FAILED =
   '{"error":{"code":"pane_not_found","message":"pane w10:p2 not found"},"id":"cli:pane:close"}\n'
 const TAB_CLOSED = '{"id":"cli:tab:close","result":{"type":"ok"}}\n'
+const AGENT_PANE_BUSY =
+  '{"error":{"code":"agent_pane_busy","message":"agent target pane w10:p2 is not an available shell"},"id":"cli:agent:start"}\n'
 const AGENT_INVOCATION_1_HANDLE = JSON.stringify({
   adapter: 'herdr',
   paneId: 'w10:p2',
@@ -491,6 +493,51 @@ describe('HerdrAgentRunner against a scripted CLI', () => {
 
     const reattached = runner.attach(handle.adapterHandle)
     assert.deepEqual(reattached, handle)
+  })
+
+  it('retries agent start while the new tab shell is still initializing', async () => {
+    const { exec, plans } = execRecorder([
+      { stdout: HERDR_VERSION_OK },
+      { stdout: TAB_CREATED },
+      { stdout: AGENT_PANE_BUSY },
+      { stdout: AGENT_PANE_BUSY },
+      { stdout: AGENT_STARTED },
+    ])
+    // The bounded readiness budget is exercised with a short pause.
+    const runner = new HerdrAgentRunner(exec, 10_000, 1, 5_000, 1)
+    const area = await createRunArea('scripted')
+    const context = buildContext(area, { role: 'worker', phase: 'work' })
+
+    const handle = await runner.launch({ context, argv: ['pi'], cwd: area.workspacePath })
+
+    assert.deepEqual(decodeHerdrHandle(handle.adapterHandle), {
+      paneId: 'w10:p2',
+      agentName: 'norn-ag-invocation-1',
+      tabId: 'w10:t9',
+    })
+    const starts = plans.filter((plan) => plan.args[1] === 'start')
+    assert.equal(starts.length, 3, 'two rejections, then the accepted start')
+    assert.deepEqual(starts[0], starts[2]!)
+    assert.equal(plans.filter((plan) => plan.args[1] === 'close').length, 0)
+  })
+
+  it('gives up when the pane never becomes ready and still closes the tab', async () => {
+    const { exec, plans } = execRecorder([
+      { stdout: HERDR_VERSION_OK },
+      { stdout: TAB_CREATED },
+      { stdout: AGENT_PANE_BUSY },
+      { stdout: TAB_CLOSED },
+    ])
+    const runner = new HerdrAgentRunner(exec, 10_000, 1, 0, 1)
+    const area = await createRunArea('scripted')
+    const context = buildContext(area, { role: 'worker', phase: 'work' })
+
+    await assert.rejects(
+      () => runner.launch({ context, argv: ['pi'], cwd: area.workspacePath }),
+      /agent_pane_busy/,
+    )
+    assert.equal(plans.filter((plan) => plan.args[1] === 'start').length, 1)
+    assert.deepEqual(plans[3], planHerdrTabClose('w10:t9'))
   })
 
   it('closes the new tab when the agent start step fails', async () => {

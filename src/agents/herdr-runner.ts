@@ -349,6 +349,27 @@ const HERDR_COMMAND_TIMEOUT_MS = 15_000
  */
 const HERDR_AGENT_START_TIMEOUT_MS = 45_000
 
+/**
+ * A freshly created tab's root shell needs a moment before Herdr accepts an
+ * agent in it. `agent start` rejects such a pane immediately with an
+ * `agent_pane_*` error (observed: `agent_pane_busy`, "not an available
+ * shell") instead of waiting like the readiness window does, so a launch
+ * retries the identical plan inside this bounded budget. A rejected call
+ * created nothing — the agent name is unique to the invocation — which makes
+ * the retry idempotent.
+ */
+const HERDR_START_READY_BUDGET_MS = 12_000
+const HERDR_START_READY_INTERVAL_MS = 250
+
+/**
+ * Whether a rejected `agent start` describes the pane rather than the agent:
+ * the tab's shell is not yet an available target, which the readiness budget
+ * retries.
+ */
+function agentPaneNotReady(payload: HerdrCliResult): boolean {
+  return (payload.error?.code ?? '').startsWith('agent_pane_')
+}
+
 type HerdrExec = (plan: HerdrPlan, executionTimeoutMs?: number) => Promise<string>
 
 async function execHerdr(
@@ -424,15 +445,43 @@ export class HerdrAgentRunner implements VisibleAgentRunner {
    * without a tight re-wait loop.
    */
   private readonly blockedPollIntervalMs: number
+  /**
+   * Budget and pause for retrying `agent start` while the new tab's root
+   * shell is still initializing (see `HERDR_START_READY_BUDGET_MS`).
+   */
+  private readonly startReadyBudgetMs: number
+  private readonly startReadyIntervalMs: number
 
   constructor(
     exec: HerdrExec = execHerdr,
     exitConfirmTimeoutMs = 10_000,
     blockedPollIntervalMs = 1_000,
+    startReadyBudgetMs = HERDR_START_READY_BUDGET_MS,
+    startReadyIntervalMs = HERDR_START_READY_INTERVAL_MS,
   ) {
     this.exec = exec
     this.exitConfirmTimeoutMs = exitConfirmTimeoutMs
     this.blockedPollIntervalMs = blockedPollIntervalMs
+    this.startReadyBudgetMs = startReadyBudgetMs
+    this.startReadyIntervalMs = startReadyIntervalMs
+  }
+
+  /**
+   * Start the agent in the tab's root pane, retrying while Herdr reports the
+   * pane itself as not ready. Every retry uses the identical plan, and the
+   * last response — success or the final rejection — is returned so the
+   * caller's error path keeps Herdr's own code and message.
+   */
+  private async startAgentWhenPaneReady(
+    plan: HerdrPlan,
+    executionTimeoutMs: number,
+  ): Promise<HerdrCliResult> {
+    const deadline = Date.now() + this.startReadyBudgetMs
+    for (;;) {
+      const payload = parseHerdrJson(await this.exec(plan, executionTimeoutMs), 'agent start')
+      if (!agentPaneNotReady(payload) || Date.now() >= deadline) return payload
+      await sleep(this.startReadyIntervalMs)
+    }
   }
 
   /**
@@ -522,9 +571,9 @@ export class HerdrAgentRunner implements VisibleAgentRunner {
       ...(typeof tabId === 'string' && tabId.length > 0 ? { tabId } : {}),
     }
     try {
-      const started = parseHerdrJson(
-        await this.exec(startPlanFor(paneId), HERDR_AGENT_START_TIMEOUT_MS),
-        'agent start',
+      const started = await this.startAgentWhenPaneReady(
+        startPlanFor(paneId),
+        HERDR_AGENT_START_TIMEOUT_MS,
       )
       if (started.error !== undefined) {
         throw new Error(
