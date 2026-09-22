@@ -1,0 +1,17 @@
+name: Agent bot
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  bot:
+    uses: iefnaf/agent-bot/.github/workflows/mention.yml@v1
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    secrets:
+      AGENT_API_KEY: ${{ secrets.AGENT_API_KEY }}
