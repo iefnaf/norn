@@ -183,6 +183,11 @@ export default function nornCompletionExtension(pi: ExtensionAPI): void {
       )
       const result = await submit(params, ctx.sessionManager.getSessionId())
       if (!result.ok) return toolError(result.problem)
+      // The settlement protocol requires the complete process group to exit
+      // before the invocation can settle (design.md §17). A terminating
+      // tool result alone only skips the follow-up LLM call, so a successful
+      // completion also shuts this Pi process down.
+      ctx.shutdown()
       return {
         content: [
           {

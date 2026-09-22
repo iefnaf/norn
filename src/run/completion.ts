@@ -853,6 +853,8 @@ async function checkCompletionShape(
 
 /** Everything the independent completion reviewer judges (§15 step 4). */
 export type MapCompletionReviewerLaunchInput = {
+  /** The invocation ID this launch's Pi session must be named after. */
+  readonly invocationId: string
   /** The complete normalized Task Map snapshot, topology included. */
   readonly map: {
     readonly title: string
@@ -1689,7 +1691,9 @@ async function runCompletionReviewer(
     readonly testOutput: readonly ReviewerTestOutput[]
   },
 ): Promise<Outcome<MapCompletionReviewEvidence, MapCompletionBlockCode, MapCompletionErrorCode>> {
+  const completionReviewerInvocationId = `${attempt.completionAttemptId}-rev`
   const plan = deps.planReviewer({
+    invocationId: completionReviewerInvocationId,
     map: {
       title: attempt.snapshot.title,
       body: attempt.snapshot.body,
@@ -1722,7 +1726,7 @@ async function runCompletionReviewer(
     )
   }
 
-  const invocationId = `${attempt.completionAttemptId}-rev`
+  const invocationId = completionReviewerInvocationId
   const context: AgentCompletionContext = {
     schema: AGENT_COMPLETION_SCHEMA,
     invocationId,
@@ -2662,7 +2666,16 @@ async function readMapEvidence(
   return { evidence: read.value }
 }
 
-/** The timeline anchor: the last fully paginated item, or `null` when empty. */
+/**
+ * The timeline anchor: the last fully paginated item that carries a real
+ * event ID, or `null` when none does. GitHub's timeline union only exposes
+ * `id` through per-type fragments, so "other" events (sub-issue added,
+ * cross-referenced, …) read back without one; an empty-string eventId must
+ * never become the persisted anchor, because the §15 close-window binding
+ * locates the anchor by ID. Anchoring at the last identified event is
+ * conservative: every close/reopen after the true last event is also after
+ * it, and close/reopen events always carry IDs.
+ */
 async function readTimelineAnchor(
   deps: MapCompletionDeps,
   params: MapCompletionParams,
@@ -2670,8 +2683,11 @@ async function readTimelineAnchor(
 ): Promise<{ readonly anchorEventId: string | null } | { readonly outcome: MapCompletionOutcome }> {
   const read = await readMapEvidence(deps, params, ctx, 'anchor')
   if ('outcome' in read) return { outcome: read.outcome }
-  const last = read.evidence.timeline.at(-1)
-  return { anchorEventId: last === undefined ? null : last.eventId }
+  for (let index = read.evidence.timeline.length - 1; index >= 0; index -= 1) {
+    const eventId = read.evidence.timeline[index]!.eventId
+    if (eventId !== '') return { anchorEventId: eventId }
+  }
+  return { anchorEventId: null }
 }
 
 /** Fetch the target and read its current tip SHA. */

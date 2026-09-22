@@ -121,15 +121,13 @@ export function productionLaunchPlans(): RunLifecycleDeps['launches'] {
         piSessionId: `ship-rev-${planned}-pi`,
       })
     },
-    planMapCompletionReviewer: (reviewer) => (input) => {
-      planned += 1
-      return piMapCompletionReviewerLaunch(input, {
+    planMapCompletionReviewer: (reviewer) => (input) =>
+      piMapCompletionReviewerLaunch(input, {
         model: reviewer.model,
         thinking: reviewer.thinking,
         extensionPath: COMPLETION_EXTENSION_PATH,
-        piSessionId: `map-completion-rev-${planned}-pi`,
-      })
-    },
+        piSessionId: `${input.invocationId}-pi`,
+      }),
     newShipInvocationId: () => {
       issued += 1
       return `ship-rev-${issued}`

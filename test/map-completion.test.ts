@@ -305,6 +305,40 @@ describe('map completion — happy path', () => {
       harness.cleanup()
     }
   })
+
+  it('anchors the gated checkpoint at the last event with a real ID when the timeline ends with ID-less events', async () => {
+    // GitHub's timeline union exposes `id` only through per-type fragments,
+    // so "other" events (sub-issue added, …) read back with an empty
+    // eventId. An empty-string anchor is rejected by the Run State
+    // validator, which would strand every completion at the gated persist.
+    const harness = await makeRunHarness({ label: 'mc-anchor', members: [ticketA(), ticketB({ blockers: ['I_A'] })] })
+    try {
+      mapIssueOf(harness).timeline.push({ kind: 'commented', eventId: 'ME0', commentId: 'MC0' })
+      mapIssueOf(harness).timeline.push({ kind: 'other', eventId: '' })
+      mapIssueOf(harness).timeline.push({ kind: 'other', eventId: '' })
+
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+      assert.equal(outcome.value.label, 'passed')
+      assert.equal(harness.runState()!.mapCompletion?.timelineAnchorEventId, 'ME0')
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('completes with a null anchor when the map timeline has no identified events at all', async () => {
+    const harness = await makeRunHarness({ label: 'mc-anchor-null', members: [ticketA()] })
+    try {
+      mapIssueOf(harness).timeline.push({ kind: 'other', eventId: '' })
+
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+      assert.equal(outcome.value.label, 'passed')
+      assert.equal(harness.runState()!.mapCompletion?.timelineAnchorEventId, null)
+    } finally {
+      harness.cleanup()
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------

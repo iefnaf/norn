@@ -39,6 +39,8 @@ const AGENT_INFO =
   '{"id":"cli:agent:get","result":{"agent":{"pane_id":"w10:p2","agent_status":"working"},"type":"agent_info"}}\n'
 const AGENT_GONE =
   '{"error":{"code":"agent_not_found","message":"agent target w10:p2 not found"},"id":"cli:agent:get"}\n'
+const AGENT_DONE =
+  '{"id":"cli:agent:get","result":{"agent":{"pane_id":"w10:p2","agent_status":"done"},"type":"agent_info"}}\n'
 
 describe('herdr CLI plans', () => {
   it('starts a visible named pane with the agent argv and context env', () => {
@@ -138,6 +140,18 @@ describe('HerdrAgentRunner against a scripted CLI', () => {
 
   it('treats a missing pane as exited', async () => {
     const { exec } = execRecorder([{ stdout: AGENT_STARTED }, { stdout: AGENT_GONE }])
+    const runner = new HerdrAgentRunner(exec)
+    const area = await createRunArea('scripted')
+    const context = buildContext(area, { role: 'worker', phase: 'work' })
+    const handle = await runner.launch({ context, argv: ['pi'], cwd: area.workspacePath })
+
+    assert.equal(await runner.isLive(handle), false)
+  })
+
+  it('treats a finished agent herdr still lists as exited', async () => {
+    // Herdr keeps a finished agent's pane open for inspection and keeps
+    // answering `agent get` with the record; only the status says `done`.
+    const { exec } = execRecorder([{ stdout: AGENT_STARTED }, { stdout: AGENT_DONE }])
     const runner = new HerdrAgentRunner(exec)
     const area = await createRunArea('scripted')
     const context = buildContext(area, { role: 'worker', phase: 'work' })

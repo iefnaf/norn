@@ -32,7 +32,10 @@ type RegisteredTool = {
     params: unknown,
     signal: undefined,
     onUpdate: undefined,
-    ctx: { sessionManager: { getSessionId: () => string | undefined } },
+    ctx: {
+      sessionManager: { getSessionId: () => string | undefined }
+      shutdown: () => void
+    },
   ) => Promise<{ content: Array<{ type: string; text: string }>; details: unknown; terminate?: boolean }>
 }
 
@@ -44,6 +47,17 @@ function fakePi() {
     },
   }
   return { pi: pi as unknown as ExtensionAPI, tools }
+}
+
+/** A shutdown spy standing in for the extension context's exit hook. */
+function recordedShutdown(): { shutdown: () => void; calls(): number } {
+  let count = 0
+  return {
+    shutdown: () => {
+      count += 1
+    },
+    calls: () => count,
+  }
 }
 
 function withEnv(env: Record<string, string | undefined>, run: () => void): void {
@@ -76,11 +90,16 @@ describe('completion extension registration', () => {
     assert.equal(tools.length, 1)
     assert.equal(tools[0].name, NORN_COMPLETE_TOOL_NAME)
 
+    const { shutdown, calls } = recordedShutdown()
     const result = await tools[0].execute('t1', WORKER_CANDIDATE, undefined, undefined, {
       sessionManager: { getSessionId: () => context.piSessionId },
+      shutdown,
     })
     assert.equal(result.terminate, true)
     assert.match(result.content[0].text, /Norn completion written/)
+    // A successful completion must shut the Pi process down: the §17
+    // settlement protocol waits for the complete process group to exit.
+    assert.equal(calls(), 1)
   })
 
   it('answers with an error when the launch context is missing', async () => {
@@ -89,8 +108,10 @@ describe('completion extension registration', () => {
       nornCompletionExtension(pi)
     })
 
+    const { shutdown } = recordedShutdown()
     const result = await tools[0].execute('t1', WORKER_CANDIDATE, undefined, undefined, {
       sessionManager: { getSessionId: () => undefined },
+      shutdown,
     })
     assert.match(result.content[0].text, /missing or invalid/)
   })

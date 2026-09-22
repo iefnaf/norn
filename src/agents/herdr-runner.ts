@@ -141,8 +141,16 @@ async function execHerdr(plan: HerdrPlan): Promise<string> {
   }
 }
 
-type HerdrCliResult = {
-  readonly result?: { readonly agent?: { readonly pane_id?: string } }
+export type HerdrCliResult = {
+  readonly result?: {
+    readonly agent?: {
+      readonly pane_id?: string
+      /** Herdr's process report for the pane's agent; `done` once the
+       * complete process group has exited (the pane itself is retained
+       * for inspection until it is closed). */
+      readonly agent_status?: string
+    }
+  }
   readonly error?: { readonly code?: string; readonly message?: string }
 }
 
@@ -184,8 +192,15 @@ export class HerdrAgentRunner implements VisibleAgentRunner {
     const { paneId } = decodeHerdrHandle(processRef.adapterHandle)
     const payload = parseHerdrJson(await this.exec(planHerdrAgentGet(paneId)), 'agent get')
     if (payload.error?.code === 'agent_not_found') return false
-    if (payload.result?.agent !== undefined) return true
-    throw new Error(`herdr agent get returned an unrecognized response for pane ${paneId}`)
+    const agent = payload.result?.agent
+    if (agent === undefined) {
+      throw new Error(`herdr agent get returned an unrecognized response for pane ${paneId}`)
+    }
+    // Herdr keeps a finished agent's pane open so the operator can inspect
+    // it; the process group itself is gone once herdr reports its status as
+    // `done`. Any other reported status (or an older herdr without the
+    // field) counts as live.
+    return agent.agent_status !== 'done'
   }
 
   async waitForExit(

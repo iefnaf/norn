@@ -217,5 +217,28 @@ describe('productionLaunchPlans', () => {
     })(reviewerInput)
     assert.match(shipPlan.argv.join(' '), /--session-id ship-rev-1-pi/)
     assert.equal(plans.newShipInvocationId(), 'ship-rev-1')
+
+    // The completion reviewer's Pi session must be named after its
+    // invocation ID, or the completion extension's session binding rejects
+    // every norn_complete call (§17).
+    const completionPlan = plans.planMapCompletionReviewer({
+      model: 'provider-b/model-y',
+      thinking: 'high',
+      timeoutMs: 1_000,
+      family: 'provider-b',
+    })({
+      invocationId: 'run-x-mc1-rev',
+      map: { title: 'M', body: '', mapRevision: 'sha256:' + '0'.repeat(64), members: [] },
+      target: {
+        branch: 'main',
+        completionSha: ('sha1:' + '6'.repeat(40)) as never,
+        treeOid: ('sha1:' + '7'.repeat(40)) as never,
+      },
+      tests: [],
+      testOutput: [],
+    })
+    const completionJoined = completionPlan.argv.join(' ')
+    assert.match(completionJoined, /--tools read,grep,find,ls,norn_complete/)
+    assert.match(completionJoined, /--session-id run-x-mc1-rev-pi/)
   })
 })
