@@ -10,6 +10,13 @@
  * asks Pi to stop after a successful completion so the process group exits
  * and the invocation can settle.
  *
+ * Settlement is enforced, not merely requested (issue #33): when the agent is
+ * about to settle without having called `norn_complete`, the extension
+ * appends a bounded corrective entry and requests one continuation; when it
+ * settles without ever completing, it shuts the Pi process down so the
+ * coordinator observes group-exit-without-sidecar instead of idling at the
+ * prompt until the invocation timeout.
+ *
  * A Reviewer additionally receives the §10.2 read-only capability set from
  * this extension rather than from Pi's `--tools` allowlist: that allowlist is
  * resolved while extensions load, so a name an extension contributes is not
@@ -24,7 +31,10 @@
 import { fileURLToPath } from 'node:url'
 
 import { createReadOnlyTools } from '@earendil-works/pi-coding-agent'
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
+import type {
+  CustomMessageEntryDraft,
+  ExtensionAPI,
+} from '@earendil-works/pi-coding-agent'
 
 import type {
   AgentCompletion,
@@ -50,6 +60,49 @@ export const NORN_REVIEWER_TOOL_ALLOWLIST: readonly string[] = [
 
 /** Environment variable carrying the coordinator-owned launch context. */
 export const NORN_AGENT_CONTEXT_ENV = 'NORN_AGENT_CONTEXT'
+
+/**
+ * Maximum corrective settlement nudges before the extension lets the agent
+ * settle (and exits). The verdict is already formed when a nudge fires, so a
+ * model that can emit the tool call does so on the first reminder; the bound
+ * exists only to prevent a settle/continue loop.
+ */
+export const NORN_SETTLEMENT_NUDGE_LIMIT = 2
+
+/**
+ * The corrective entry appended at the settle boundary when the agent's turn
+ * ended without the typed handoff. Terminal prose is discarded by the
+ * settlement protocol (design.md §17), so the nudge restates the one accepted
+ * exit instead of harvesting the prose.
+ */
+export function settlementNudgeEntry(
+  attempt: number,
+  limit: number,
+): CustomMessageEntryDraft {
+  return {
+    type: 'custom_message',
+    customType: 'norn-settlement-enforcement',
+    content:
+      `Your answer ended without the required norn_complete handoff, so this Norn ` +
+      `invocation has no completion yet; a prose conclusion is discarded by the ` +
+      `settlement protocol (reminder ${attempt} of ${limit}). Call norn_complete ` +
+      `now with the same conclusion in its typed form — workers submit candidate ` +
+      `or block, reviewers submit pass, iterate, or block — and then finish. ` +
+      `That tool call is the only accepted way to end this invocation.`,
+    display: false,
+  }
+}
+
+/**
+ * State shared between the `norn_complete` tool body and the settlement
+ * lifecycle handlers of one agent invocation.
+ */
+type SettlementState = {
+  /** True once a norn_complete call wrote a valid sidecar. */
+  completed: boolean
+  /** Corrective nudges already appended at settle boundaries. */
+  nudges: number
+}
 
 /** Absolute path of this extension file, for `pi --extension` launch plans. */
 export function completionExtensionPath(): string {
@@ -179,6 +232,7 @@ function sameCompletion(a: AgentCompletion, b: AgentCompletion): boolean {
  */
 export default function nornCompletionExtension(pi: ExtensionAPI): void {
   const context = loadAgentContextFromEnv(process.env)
+  const settlement: SettlementState = { completed: false, nudges: 0 }
 
   // The Reviewer's read-only inspection tools. Pi resolves a CLI `--tools`
   // allowlist while extensions load, so a name contributed by an extension
@@ -214,6 +268,7 @@ export default function nornCompletionExtension(pi: ExtensionAPI): void {
       )
       const result = await submit(params, ctx.sessionManager.getSessionId())
       if (!result.ok) return toolError(result.problem)
+      settlement.completed = true
       // The settlement protocol requires the complete process group to exit
       // before the invocation can settle (design.md §17). A terminating
       // tool result alone only skips the follow-up LLM call, so a successful
@@ -230,6 +285,32 @@ export default function nornCompletionExtension(pi: ExtensionAPI): void {
         terminate: true,
       }
     },
+  })
+
+  // Enforce settlement (issue #33): without this, an agent whose turn ends in
+  // a prose verdict never calls norn_complete, and the process idles at the
+  // prompt until the coordinator's invocation timeout — ~30 minutes of dead
+  // wall-clock for a condition detectable in seconds. Two lifecycle hooks
+  // close that gap without harvesting prose as a verdict.
+  pi.on('agent_before_settle', (event) => {
+    if (context === undefined || settlement.completed) return
+    if (settlement.nudges >= NORN_SETTLEMENT_NUDGE_LIMIT) return
+    settlement.nudges += 1
+    return {
+      entries: [
+        ...event.entries,
+        settlementNudgeEntry(settlement.nudges, NORN_SETTLEMENT_NUDGE_LIMIT),
+      ],
+      continue: true,
+    }
+  })
+
+  pi.on('agent_settled', (_event, ctx) => {
+    if (context === undefined || settlement.completed) return
+    // The agent settled without ever completing: exit now so the coordinator
+    // observes group-exit-without-sidecar and routes it through the existing
+    // recoverable protocol-error path instead of waiting out the timeout.
+    ctx.shutdown()
   })
 
   // Re-apply the closed read-only allowlist before every Reviewer turn. The
