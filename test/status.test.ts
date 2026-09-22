@@ -235,6 +235,31 @@ describe('readStatus', () => {
     }
   })
 
+  it('surfaces an aborted run with its retained state and no report (§2.3, #16)', async () => {
+    const nornHome = setupNornHome({ withRunState: true })
+    try {
+      // The operator aborted run-42: status reports the retained lifecycle
+      // decision — never a terminal report, never a resume or mutation.
+      const home = join(nornHome, 'repositories', 'github.com', REPOSITORY_ID)
+      const aborted = { ...exampleRunState(), status: 'aborted' as const }
+      const saved = saveRunState(home, MAP_ISSUE_ID, aborted)
+      assert.equal(saved.kind, 'ok')
+
+      const outcome = await readStatus({ nornHome }, MAP_URL)
+      assert.ok(isOk(outcome))
+      if (outcome.kind !== 'ok') return
+      assert.equal(outcome.value.runState?.runId, 'run-42')
+      assert.equal(outcome.value.runState?.status, 'aborted')
+      assert.equal(outcome.value.runState?.report, undefined)
+
+      const rendered = renderStatusOutcome(outcome)
+      assert.match(rendered, /Run: run-42 — aborted/)
+      assert.match(rendered, /Terminal report: none yet/)
+    } finally {
+      rmSync(nornHome, { recursive: true, force: true })
+    }
+  })
+
   it('reports ownership while a live coordinator holds the map lock, then release', { timeout: 20_000 }, async () => {
     const nornHome = setupNornHome({ withRunState: true })
     const home = join(nornHome, 'repositories', 'github.com', REPOSITORY_ID)

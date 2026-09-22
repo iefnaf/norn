@@ -85,7 +85,7 @@ export async function readStatus(deps: StatusDeps, mapUrl: string): Promise<Stat
 }
 
 /** Locate the repository home whose metadata matches the URL's repository. */
-function findRepositoryHome(
+export function findRepositoryHome(
   nornHome: string,
   requested: MapIssueLocator,
 ): Outcome<string, StatusBlockCode, StatusErrorCode> {
@@ -167,7 +167,7 @@ function noRepositoryHome(requested: MapIssueLocator): Outcome<never, StatusBloc
   })
 }
 
-type FoundRunState = { readonly encodedIssueId: string; readonly state: RunState | undefined }
+export type FoundRunState = { readonly encodedIssueId: string; readonly state: RunState | undefined }
 
 /**
  * Find the persisted Run State whose map matches the requested locator.
@@ -175,7 +175,7 @@ type FoundRunState = { readonly encodedIssueId: string; readonly state: RunState
  * document's own `map` reference decides the match; documents that cannot be
  * attributed (absent or unparseable) cannot be reported as this map's state.
  */
-function findRunStateForMap(
+export function findRunStateForMap(
   repositoryHome: string,
   requested: MapIssueLocator,
 ): Outcome<FoundRunState, StatusBlockCode, StatusErrorCode> {

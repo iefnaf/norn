@@ -78,6 +78,7 @@ import { reconcileFinalCandidate } from './reconcile.ts'
 import type {
   FinalCandidate,
   ShipExtensionAdoption,
+  ShipFacts,
   ShipReconcileBlockCode,
   ShipReconcileDeps,
   ShipReconcileErrorCode,
@@ -577,6 +578,38 @@ export type ShipPushParams = ShipReconcileParams & {
 
 /** Default cap on stable-fetch cycles while classifying a remote state. */
 export const STABLE_FETCH_MAX_CYCLES = 3
+
+// ---------------------------------------------------------------------------
+// The §13.3 recorded-integration probe, shared with abort (§13.2, #16)
+// ---------------------------------------------------------------------------
+
+/**
+ * Classify one recorded `ShipCheckpoint` against the fetched remote target
+ * through the §13.3 step-1 rules (bounded stable fetches, exact integration
+ * shape, ancestry) — the same classification the push recovery uses, exposed
+ * for the abort protocol's possibly-successful-write reconciliation.
+ * `decided/present` proves the exact integration shape on the target,
+ * `decided/absent` proves the delivery is not on it, and `ambiguous`/`infra`
+ * leave the write unclassifiable — never a guess (§2.3, §13.3).
+ */
+export async function probeRecordedIntegration(
+  facts: ShipFacts,
+  targetBranch: string,
+  checkpoint: ShipCheckpoint,
+  options: { readonly stableFetchMax?: number } = {},
+): Promise<StableProbe> {
+  const format = parseGitObjectOid(checkpoint.baseSha)?.objectFormat
+  if (format === undefined) {
+    return { kind: 'ambiguous', reason: 'the recorded checkpoint carries a malformed base OID' }
+  }
+  const config: PushConfig = {
+    budget: 0,
+    stableFetchMax: options.stableFetchMax ?? STABLE_FETCH_MAX_CYCLES,
+    now: () => agentRecordedAt(),
+    format,
+  }
+  return stableProbe({ facts }, { targetBranch }, checkpoint, config)
+}
 
 // ---------------------------------------------------------------------------
 // The push protocol (§11.3, §13.3 steps 1–2)
@@ -1176,12 +1209,12 @@ async function readTarget(
 }
 
 /** One cycle's classification of the recorded integration against the target. */
-type RemoteClassification =
+export type RemoteClassification =
   | { readonly kind: 'classified'; readonly result: 'present' | 'absent' }
   | { readonly kind: 'ambiguous'; readonly reason: string }
   | { readonly kind: 'infra'; readonly reason: string }
 
-type StableProbe =
+export type StableProbe =
   | { readonly kind: 'decided'; readonly result: 'present' | 'absent'; readonly targetSha: string }
   | { readonly kind: 'ambiguous'; readonly reason: string }
   | { readonly kind: 'infra'; readonly reason: string }
@@ -1194,9 +1227,9 @@ type StableProbe =
  * recorded tree) — and `absent` proves the delivery is not on the target.
  * Anything else stays unclassified and is never guessed from.
  */
-async function classifyRemote(
-  deps: ShipPushDeps,
-  params: ShipPushParams,
+export async function classifyRemote(
+  deps: Pick<ShipPushDeps, 'facts'>,
+  params: Pick<ShipPushParams, 'targetBranch'>,
   checkpoint: ShipCheckpoint,
   config: PushConfig,
   targetSha: GitObjectOid,
@@ -1252,9 +1285,9 @@ async function classifyRemote(
  * is proved; persistent disagreement or unclassifiable cycles are ambiguity,
  * never a guess.
  */
-async function stableProbe(
-  deps: ShipPushDeps,
-  params: ShipPushParams,
+export async function stableProbe(
+  deps: Pick<ShipPushDeps, 'facts'>,
+  params: Pick<ShipPushParams, 'targetBranch'>,
   checkpoint: ShipCheckpoint,
   config: PushConfig,
 ): Promise<StableProbe> {

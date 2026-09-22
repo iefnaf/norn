@@ -2443,6 +2443,23 @@ async function repairAndBlock(
 // §14 member validation under the completion protocol
 // ---------------------------------------------------------------------------
 
+/** The narrow seams the §14 member-completion evaluation composes (§15 steps 6 and 9). */
+export type MemberCompletionDeps = {
+  /** One complete comments+timeline read of one issue (§14). */
+  readonly readIssueEvidence: IssueEvidenceReader['loadIssueEvidence']
+  /** The remote target and commit facts seam, fetch included (§14). */
+  readonly facts: ShipFacts
+}
+
+/** The narrow parameters of the §14 member-completion evaluation. */
+export type MemberCompletionParams = {
+  readonly map: { readonly issueId: string; readonly repositoryId: string }
+  readonly targetBranch: string
+  readonly trustedEvidenceAuthorIds: readonly string[]
+  /** Whether the caller already confirmed a shared write (§15 shared-write state). */
+  readonly alreadyShipped: boolean
+}
+
 /**
  * §15 steps 6 and 9: every current member must be a valid Completed Ticket
  * under the complete §14 predicate, evaluated over one complete evidence
@@ -2450,9 +2467,9 @@ async function repairAndBlock(
  * every member's verdict is recorded for the §15 rule-4 predicate; a
  * non-`undefined` return is the failure to report.
  */
-async function collectMemberCompletion(
-  deps: MapCompletionDeps,
-  params: MapCompletionParams,
+export async function collectMemberCompletion(
+  deps: MemberCompletionDeps,
+  params: MemberCompletionParams,
   snapshot: TaskMapSnapshot,
   into?: Map<string, 'completed' | readonly DeliveryEvidenceFinding[]>,
 ): Promise<CompletionFailure | undefined> {
@@ -3081,7 +3098,7 @@ function changedInput(
 }
 
 /** The shared-write state a completion starts with (§15). */
-function initialSharedWrite(params: MapCompletionParams): 'none' | 'confirmed' {
+function initialSharedWrite(params: { readonly alreadyShipped: boolean }): 'none' | 'confirmed' {
   return params.alreadyShipped ? 'confirmed' : 'none'
 }
 

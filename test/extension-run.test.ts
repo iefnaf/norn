@@ -150,12 +150,17 @@ describe('/norn run routing in the registered extension', () => {
     assert.match(spaced.notifications[0]!.message, /takes exactly one full GitHub issue URL/)
   })
 
-  it('still reports unimplemented subcommands as pending', async () => {
+  it('routes /norn abort like the other map subcommands: one full issue URL', async () => {
     const pi = registeredNorn()
-    const pending = fakeCtx(true)
-    await pi.commands[0]!.def.handler('abort https://github.com/acme/widget/issues/6', pending.ctx)
-    assert.equal(pending.notifications.length, 1)
-    assert.match(pending.notifications[0]!.message, /not implemented yet/)
+    const missing = fakeCtx(true)
+    await pi.commands[0]!.def.handler('abort', missing.ctx)
+    assert.equal(missing.notifications.length, 1)
+    assert.match(missing.notifications[0]!.message, /\/norn abort takes exactly one full GitHub issue URL/)
+
+    const spaced = fakeCtx(true)
+    await pi.commands[0]!.def.handler('abort   https://github.com/acme/widget/issues/6 extra', spaced.ctx)
+    assert.equal(spaced.notifications.length, 1)
+    assert.match(spaced.notifications[0]!.message, /takes exactly one full GitHub issue URL/)
   })
 })
 

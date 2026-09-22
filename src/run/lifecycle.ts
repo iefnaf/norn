@@ -75,6 +75,8 @@ import type { StableSnapshotOutcome } from '../map/stable-read.ts'
 import { checkMap } from '../runner/check.ts'
 import type { CheckMapDeps } from '../runner/check.ts'
 import { plausibleRemoteIdentities } from '../runner/init.ts'
+import { runAbortProtocol } from './abort.ts'
+import type { AbortCoreDeps } from './abort.ts'
 import { completeMap } from './completion.ts'
 import type {
   MapCompletionDeps,
@@ -130,7 +132,8 @@ import { formatGitObjectOid } from '../work/workspace.ts'
  * Closed block codes of `/norn run`. The first three are operation-scoped
  * (discovered before run ownership was acquired or resumed, §9); the rest
  * are run-scoped terminal blocks and share the code recorded in the
- * persisted RunReport.
+ * persisted RunReport. `user-abort` records a handled operator interrupt
+ * that aborted the coordinator through the §2.3 protocol (ticket #16).
  */
 export type RunBlockCode =
   | 'check-findings'
@@ -140,6 +143,7 @@ export type RunBlockCode =
   | 'push-rejected'
   | 'no-eligible-frontier'
   | 'map-completion-gate-failed'
+  | 'user-abort'
 
 /**
  * Closed error codes of `/norn run`. Infrastructure and adapter failures
@@ -301,7 +305,7 @@ function normalizeOid(format: 'sha1' | 'sha256', value: string): string {
  * OIDs (records store prefixed OIDs per §10.3), and `commitFacts` returns
  * prefixed OIDs so §14 record comparisons match exactly.
  */
-function bindFacts(
+export function bindFacts(
   gitFacts: CheckMapDeps['gitFacts'],
   root: string,
   remote: string,
@@ -669,6 +673,11 @@ async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapO
   }
 
   for (;;) {
+    // --- a handled operator interrupt follows the abort protocol (§2.3) -----
+
+    if (ctx.deps.signal?.aborted) {
+      return await handledCoordinatorInterrupt(ctx, state)
+    }
     // --- resume a persisted ship queue before anything else (§13.2) ---------
 
     if (state.activeWave !== undefined && state.activeWave.shipQueueTicketIssueIds.length > 0) {
@@ -1680,6 +1689,11 @@ async function shipWaveQueue(ctx: RunContext, state: RunState): Promise<StepResu
     if (wave.nextShipIndex >= wave.shipQueueTicketIssueIds.length) {
       return { kind: 'next', state: current, value: null }
     }
+    // A handled operator interrupt between queued Tickets follows the abort
+    // protocol (§2.3): settle, reconcile, record — never a bare stop.
+    if (ctx.deps.signal?.aborted) {
+      return { kind: 'stop', outcome: await handledCoordinatorInterrupt(ctx, current) }
+    }
     const issueId = wave.shipQueueTicketIssueIds[wave.nextShipIndex]!
     const record = current.tickets[issueId]
     if (record !== undefined && (record.phase === 'completed' || record.phase === 'parked')) {
@@ -1803,6 +1817,14 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
     return { kind: 'stop', outcome: failureOutcome(ctx, pushed) }
   }
   if (pushed.value.pushes > 0) ctx.sharedWrite = true
+
+  // --- mid-Ship handled interrupt: the push may have landed and the close
+  // has not begun — exactly the possibly-successful shared-write window the
+  // abort protocol reconciles (§2.3, §11.3, §13.3).
+
+  if (ctx.deps.signal?.aborted) {
+    return { kind: 'stop', outcome: await handledCoordinatorInterrupt(ctx, currentStateOf(ctx) ?? state) }
+  }
 
   // --- the close: record comment, close, §14 validation (§11.3) ------------
 
@@ -2031,21 +2053,28 @@ async function finishRun(
   return { kind: 'next', state: driven.state, value: final }
 }
 
+/** The inputs of the exported terminal-report builder (§13.1). */
+export type RunReportInput = {
+  readonly state: RunState
+  readonly finalSnapshot: TaskMapSnapshot
+  /** Ticket references by issue ID, accumulated across every snapshot read. */
+  readonly ticketRefs: ReadonlyMap<string, TicketRef>
+  readonly warnings: readonly string[]
+  readonly label: RunReport['label']
+  readonly code: string | undefined
+  readonly sharedWrite: 'none' | 'confirmed'
+  readonly completionSha: GitObjectOid | undefined
+}
+
 /**
  * Assemble the terminal RunReport from the persisted state (§13.1): revision
  * lineage, per-Ticket states with parked codes, accepted extensions,
  * shared-write accounting, warnings, and the retained blocked workspace.
+ * Exported for the abort protocol's passed-precedence terminalization
+ * (§13.2, ticket #16) — pure data in, report out.
  */
-function buildReport(
-  ctx: RunContext,
-  state: RunState,
-  finalSnapshot: TaskMapSnapshot,
-  label: RunReport['label'],
-  code: string | undefined,
-  sharedWrite: 'none' | 'confirmed',
-  completionSha: GitObjectOid | undefined,
-  warnings: readonly string[] | undefined,
-): RunReport {
+export function buildRunReport(input: RunReportInput): RunReport {
+  const { state, finalSnapshot, ticketRefs, warnings } = input
   const entries: Array<NonNullable<RunReport['tickets'][number]>> = []
   const seen = new Set<string>()
   const push = (ref: TicketRef, record: TicketRunState | undefined): void => {
@@ -2068,7 +2097,7 @@ function buildReport(
   }
   for (const [issueId, record] of Object.entries(state.tickets)) {
     if (seen.has(issueId)) continue
-    const ref = ctx.ticketRefs.get(issueId) ?? refOfRecord(state, issueId)
+    const ref = ticketRefs.get(issueId) ?? refOfRecord(state, issueId)
     if (ref !== undefined) push(ref, record)
   }
   entries.sort((a, b) => a.ticket.number - b.ticket.number)
@@ -2079,8 +2108,8 @@ function buildReport(
     .sort((a, b) => b.wave - a.wave)[0]?.workspace
 
   return {
-    label,
-    ...(code === undefined ? {} : { code }),
+    label: input.label,
+    ...(input.code === undefined ? {} : { code: input.code }),
     runId: state.runId,
     initialMapRevision: state.acceptedMapRevisions[0]!.revision,
     finalMapRevision: state.acceptedMapRevisions.at(-1)!.revision,
@@ -2089,11 +2118,34 @@ function buildReport(
       addedTicketIssueIds: [...(entry.extension?.addedTicketIssueIds ?? [])],
     })),
     tickets: entries,
-    sharedWrite,
-    ...(completionSha === undefined ? {} : { completionSha }),
-    warnings: [...(warnings ?? ctx.warnings)],
+    sharedWrite: input.sharedWrite,
+    ...(input.completionSha === undefined ? {} : { completionSha: input.completionSha }),
+    warnings: [...warnings],
     ...(retained === undefined ? {} : { retainedWorkspace: retained }),
   }
+}
+
+/** Assemble the coordinator's terminal RunReport from its run context. */
+function buildReport(
+  ctx: RunContext,
+  state: RunState,
+  finalSnapshot: TaskMapSnapshot,
+  label: RunReport['label'],
+  code: string | undefined,
+  sharedWrite: 'none' | 'confirmed',
+  completionSha: GitObjectOid | undefined,
+  warnings: readonly string[] | undefined,
+): RunReport {
+  return buildRunReport({
+    state,
+    finalSnapshot,
+    ticketRefs: ctx.ticketRefs,
+    warnings: warnings ?? ctx.warnings,
+    label,
+    code,
+    sharedWrite,
+    completionSha,
+  })
 }
 
 /** The reference of one ticket record, from its own persisted payload. */
@@ -2447,6 +2499,78 @@ async function finishCompletion(
     }
   }
   return terminalized
+}
+
+// ---------------------------------------------------------------------------
+// Handled operator interrupt (§2.3, §13.2 — ticket #16)
+// ---------------------------------------------------------------------------
+
+/** The abort-protocol seams bound to one coordinator run context. */
+function abortCoreDepsOf(ctx: RunContext): AbortCoreDeps {
+  return {
+    runner: ctx.deps.runner,
+    repositoryHome: ctx.repositoryHome,
+    encodedMapIssueId: ctx.encodedMapIssueId,
+    targetBranch: ctx.branch,
+    trustedEvidenceAuthorIds: ctx.config.trustedEvidenceAuthorIds,
+    actorId: ctx.actorId,
+    facts: ctx.facts,
+    readMap: () => readMapSnapshot(ctx),
+    readIssueEvidence: ctx.deps.evidence.loadIssueEvidence,
+    ...(ctx.deps.agentSettleTimeoutMs === undefined
+      ? {}
+      : { agentSettleTimeoutMs: ctx.deps.agentSettleTimeoutMs }),
+    ...(ctx.deps.slotProbe === undefined ? {} : { probe: ctx.deps.slotProbe }),
+    ...(ctx.deps.releaseReservation === undefined
+      ? {}
+      : {
+          releaseReservation: (repositoryHome: string, workAttemptId: string) =>
+            ctx.deps.releaseReservation!(repositoryHome, workAttemptId),
+        }),
+  }
+}
+
+/**
+ * A handled operator interrupt of the coordinator: the SAME ordered abort
+ * protocol `/norn abort` runs (§2.3, §13.2) — terminate and settle every
+ * run-owned process group, reconcile every possibly-successful shared
+ * write, let a proven-finalized completion terminalize `passed`, then record
+ * `aborted`. The coordinator already holds the map lock, so the protocol
+ * runs under it; remote evidence is never touched or rolled back.
+ */
+async function handledCoordinatorInterrupt(ctx: RunContext, state: RunState): Promise<RunMapOutcome> {
+  const outcome = await runAbortProtocol(abortCoreDepsOf(ctx), state)
+  if (outcome.kind === 'ok') {
+    if (outcome.value.kind === 'passed') {
+      return ok(outcome.value.report)
+    }
+    return blocked({
+      scope: 'run',
+      code: 'user-abort',
+      reason:
+        `the operator interrupted the coordinator; run ${outcome.value.runId} is recorded ` +
+        'aborted and will not be resumed; remote evidence is intact',
+      sharedWrite: outcome.value.sharedWrite,
+      evidence: [
+        {
+          runId: outcome.value.runId,
+          status: 'aborted',
+          sharedWrite: outcome.value.sharedWrite,
+          confirmedWrites: outcome.value.confirmedWrites,
+          warnings: outcome.value.warnings,
+        },
+      ],
+    })
+  }
+  // The protocol failed: the run stays `running` and recoverable — the
+  // operator re-runs the abort (or resumes) once the facts are provable.
+  return error({
+    scope: 'run',
+    code: outcome.code as never,
+    reason: outcome.reason,
+    sharedWrite: outcome.sharedWrite,
+    evidence: [...outcome.evidence],
+  })
 }
 
 // ---------------------------------------------------------------------------

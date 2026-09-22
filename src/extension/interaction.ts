@@ -7,6 +7,7 @@
  */
 import type { InitInteraction, PlausibleRepositoryRemote } from '../runner/init.ts'
 import type { AgentRoleInput, CommandSpecInput } from '../runner/init.ts'
+import type { AbortInteraction, AbortRunSummary } from '../run/abort.ts'
 import type { CatalogModel, ThinkingLevel } from '../adapters/model-catalog.ts'
 import { SUGGESTED_COMMAND_TIMEOUT_MS } from '../config/run-config.ts'
 
@@ -35,6 +36,35 @@ function modelLabel(model: CatalogModel): string {
 function parseNumber(text: string | undefined, suggested: number): number {
   const trimmed = text === undefined ? '' : text.trim()
   return trimmed === '' ? suggested : Number(trimmed)
+}
+
+/** The persisted-facts summary the confirmation dialog shows (§2.3). */
+function abortSummaryLines(summary: AbortRunSummary): string {
+  return [
+    `Norn abort — run ${summary.runId}`,
+    `State: ${summary.status} · Wave ${summary.wave}`,
+    `Map: ${summary.mapUrl}`,
+    `Parked tickets: ${summary.parkedTickets.length === 0 ? 'none' : summary.parkedTickets.join(', ')}`,
+    summary.pendingSharedWrite
+      ? 'Shared writes: the persisted state already proves at least one — abort reconciles them; pushed commits and remote evidence are never rolled back.'
+      : 'Shared writes: none proven by the persisted state.',
+    'Aborting is explicit and final: Norn stops or reconciles every run-owned process,',
+    'records the run as aborted without deleting its state, and never removes remote',
+    'evidence. To confirm, type the exact Run ID. An empty answer cancels.',
+  ].join('\n')
+}
+
+/** Build the operator-facing abort interaction over Pi dialogs. */
+export function dialogAbortInteraction(ui: Pick<DialogUi, 'input' | 'notify'>): AbortInteraction {
+  return {
+    async confirmRunId(summary) {
+      ui.notify(abortSummaryLines(summary), 'info')
+      return ui.input(
+        `Abort Norn run ${summary.runId}? Type the exact Run ID to confirm`,
+        summary.runId,
+      )
+    },
+  }
 }
 
 /** Build the operator-facing interaction over Pi dialogs. */

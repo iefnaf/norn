@@ -8,6 +8,8 @@ import type { TopologyFinding } from '../map/snapshot.ts'
 import type { DeliveryEvidenceFinding, DeliveryRemedy } from '../evidence/delivery.ts'
 import type { StatusOutcome } from '../runner/status.ts'
 import type { RunMapOutcome } from '../run/lifecycle.ts'
+import type { AbortOutcome } from '../run/abort.ts'
+import type { ConfirmedWrite } from '../run/abort.ts'
 import type { RunReport, RunState, TicketRunState } from '../runstate/types.ts'
 import { isSha256Digest } from '../core/digest.ts'
 
@@ -380,6 +382,62 @@ export function renderRunTakesOneMapUrl(): string {
     '/norn run takes exactly one full GitHub issue URL:',
     '/norn run https://<host>/<owner>/<repository>/issues/<number>',
   ].join('\n')
+}
+
+/** `/norn abort` takes exactly one full map URL. */
+export function renderAbortTakesOneMapUrl(): string {
+  return [
+    '/norn abort takes exactly one full GitHub issue URL:',
+    '/norn abort https://<host>/<owner>/<repository>/issues/<number>',
+  ].join('\n')
+}
+
+function renderConfirmedWrite(write: ConfirmedWrite): string {
+  const detail =
+    write.kind === 'integration'
+      ? `ticket ${write.ticketIssueId} · ${write.stage} · ${write.integratedSha} · by ${write.provenBy}`
+      : write.kind === 'map-close'
+        ? `close event ${write.eventId}`
+        : `record comment ${write.commentId}`
+  return `  ${write.kind}: ${detail}`
+}
+
+/** Render the typed `/norn abort` outcome: the recorded lifecycle decision. */
+export function renderAbortOutcome(outcome: AbortOutcome): string {
+  if (outcome.kind === 'blocked') {
+    return `Norn abort blocked (${outcome.code}): ${outcome.reason}`
+  }
+  if (outcome.kind === 'error') {
+    const recoverable = outcome.sharedWrite !== 'none'
+    return [
+      `Norn abort error (${outcome.code}): ${outcome.reason}`,
+      recoverable
+        ? `sharedWrite ${outcome.sharedWrite}: the run remains "running" and recoverable — retry /norn abort or /norn run once the facts are provable; a new run cannot start from ambiguous state`
+        : 'sharedWrite none',
+    ].join('\n')
+  }
+  const value = outcome.value
+  if (value.kind === 'passed') {
+    return [
+      `Norn abort — finalized map completion wins: run ${value.runId} terminalized passed.`,
+      `completionSha ${value.report.completionSha ?? '—'} · sharedWrite confirmed`,
+      'Remote evidence is intact; the next /norn run starts a fresh run ID.',
+    ].join('\n')
+  }
+  const lines = [
+    `Norn abort — run ${value.runId} is recorded aborted (Run State retained).`,
+    `Settled process groups: ${value.settledProcessGroupIds.length} · released Work slots: ${value.releasedSlots.length}`,
+    `sharedWrite: ${value.sharedWrite} — pushed commits and remote evidence are never rolled back.`,
+  ]
+  if (value.confirmedWrites.length > 0) {
+    lines.push(`Confirmed shared writes (${value.confirmedWrites.length}):`)
+    for (const write of value.confirmedWrites) lines.push(renderConfirmedWrite(write))
+  }
+  if (value.warnings.length > 0) {
+    lines.push(`Warnings: ${value.warnings.join(' | ')}`)
+  }
+  lines.push('The next /norn run starts a fresh run ID and never reuses this run\'s unshipped Work.')
+  return lines.join('\n')
 }
 
 function renderReportTickets(report: RunReport): string[] {

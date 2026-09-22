@@ -7,11 +7,13 @@
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent'
 
 import { commandSummary, parseNornInvocation } from '../runner/commands.ts'
+import { executeAbortCommand } from './abort-command.ts'
 import { executeCheckCommand } from './check-command.ts'
 import { executeInitCommand } from './init-command.ts'
 import { executeRunCommand } from './run-command.ts'
 import { executeStatusCommand } from './status-command.ts'
 import {
+  renderAbortTakesOneMapUrl,
   renderCheckTakesOneMapUrl,
   renderInitTakesNoArguments,
   renderPending,
@@ -70,6 +72,12 @@ export default function (pi: ExtensionAPI): void {
               return
             }
             await executeStatusCommand(invocation.args, ctx.ui)
+          } else if (invocation.subcommand.name === 'abort') {
+            if (invocation.args === '' || /\s/.test(invocation.args)) {
+              ctx.ui.notify(renderAbortTakesOneMapUrl(), 'warning')
+              return
+            }
+            await executeAbortCommand({ cwd: ctx.cwd, ui: ctx.ui }, invocation.args)
           } else {
             ctx.ui.notify(renderPending(invocation.subcommand), 'info')
           }

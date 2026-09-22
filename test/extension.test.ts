@@ -88,18 +88,19 @@ describe('bare /norn renders the runner-provided summary', () => {
   })
 })
 
-describe('subcommand routing before implementation', () => {
-  it('reports a recognized subcommand as pending with its description', async () => {
+describe('subcommand routing', () => {
+  it('warns when /norn abort is invoked without a map URL or with extra words', async () => {
     const pi = registeredNorn()
-    const { ctx, notifications } = fakeCtx(true)
 
-    // `run` is implemented (ticket #13); `abort` is the remaining pending
-    // subcommand.
-    await pi.commands[0]!.def.handler('abort https://github.com/o/r/issues/1', ctx)
+    const missing = fakeCtx(true)
+    await pi.commands[0]!.def.handler('abort', missing.ctx)
+    assert.equal(missing.notifications.length, 1)
+    assert.match(missing.notifications[0]!.message, /\/norn abort takes exactly one full GitHub issue URL/)
 
-    assert.equal(notifications.length, 1)
-    assert.match(notifications[0]!.message, /not implemented yet/)
-    assert.match(notifications[0]!.message, /abort/)
+    const spaced = fakeCtx(true)
+    await pi.commands[0]!.def.handler('abort   https://github.com/o/r/issues/1 extra', spaced.ctx)
+    assert.equal(spaced.notifications.length, 1)
+    assert.match(spaced.notifications[0]!.message, /takes exactly one full GitHub issue URL/)
   })
 
   it('shows the summary again after unknown input', async () => {
