@@ -73,7 +73,8 @@ export const NORN_SETTLEMENT_NUDGE_LIMIT = 2
  * The corrective entry appended at the settle boundary when the agent's turn
  * ended without the typed handoff. Terminal prose is discarded by the
  * settlement protocol (design.md §17), so the nudge restates the one accepted
- * exit instead of harvesting the prose.
+ * exit instead of harvesting the prose. It is rendered in the pane (`display:
+ * true`) so an operator watching a child can see why it continued.
  */
 export function settlementNudgeEntry(
   attempt: number,
@@ -89,7 +90,7 @@ export function settlementNudgeEntry(
       `now with the same conclusion in its typed form — workers submit candidate ` +
       `or block, reviewers submit pass, iterate, or block — and then finish. ` +
       `That tool call is the only accepted way to end this invocation.`,
-    display: false,
+    display: true,
   }
 }
 

@@ -49,6 +49,9 @@ type BoundaryDraft = { readonly type: string; readonly customType?: string }
 type BeforeSettleEvent = {
   readonly entries: BoundaryDraft[]
   readonly continue: boolean
+  // Deliberate divergence from Pi's real BoundaryState: the production
+  // handler reads only `entries` (and ignores `context`/`outcome`), so the
+  // fake omits them. Extend this fake if the handler ever grows.
 }
 
 type BeforeSettleResult = { readonly entries?: BoundaryDraft[]; readonly continue?: boolean }
