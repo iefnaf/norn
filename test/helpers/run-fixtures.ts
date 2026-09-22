@@ -288,7 +288,7 @@ export type FakeRunAgents = VisibleAgentRunner & {
 /** Workers keyed by ticket issue ID; the reviewer verdict is scriptable. */
 export function fakeRunRunner(
   store: RunMapStore,
-  reviewer: () => ReviewerCompletion = () => ({ discriminant: 'pass' }),
+  reviewer: (ticketIssueId: string) => ReviewerCompletion = () => ({ discriminant: 'pass' }),
   completionReviewer: () => ReviewerCompletion = () => ({ discriminant: 'pass' }),
 ): FakeRunAgents {
   const launches: AgentLaunchRecord[] = []
@@ -321,7 +321,7 @@ export function fakeRunRunner(
           ? performWorker(this.workerBehavior(context.ticket!.issueId), request)
           : context.phase === 'map-completion'
             ? completionReviewer()
-            : reviewer()
+            : reviewer(context.ticket?.issueId ?? '')
       const sidecarStore = new CompletionStore(context.completionsDir)
       const written = await sidecarStore.write(context, completion, agentRecordedAt())
       if (written.status === 'conflict') throw new Error('sidecar conflict')
@@ -368,8 +368,8 @@ export type RunHarnessOptions = {
   readonly members: readonly MemberSpec[]
   /** Worker behaviors keyed by ticket issue ID; default: one commit. */
   readonly behaviors?: Readonly<Record<string, WorkerBehavior>>
-  /** The reviewer verdict script; default: pass. */
-  readonly reviewer?: () => ReviewerCompletion
+  /** The reviewer verdict script, keyed by ticket issue ID; default: pass. */
+  readonly reviewer?: (ticketIssueId: string) => ReviewerCompletion
   /** Staged map changes applied at load boundaries. */
   readonly changes?: readonly StagedChange[]
   /** Overrides the gateway write script (failures model unknown results). */
@@ -394,10 +394,10 @@ export type RunHarness = {
   readonly gateway: FakeGateway
   readonly runner: FakeRunAgents
   readonly commands: FakeShipCommands
-  /** Every worker launch input, in launch order (production planner input). */
-  readonly workBriefs: readonly WorkerLaunchInput[]
   /** The ticket issue IDs that have been worked, in launch order. */
   workedTickets(): readonly string[]
+  /** Every worker launch briefing the coordinator built, in launch order. */
+  workerBriefings(): readonly WorkerBriefing[]
   /** The full lifecycle deps the harness drives `runMap` with. */
   deps(): RunLifecycleDeps
   run(): Promise<RunMapOutcome>
@@ -410,6 +410,12 @@ export type RunHarness = {
   /** Remote main's commit subjects, oldest first. */
   remoteLog(): readonly string[]
   cleanup(): void
+}
+
+/** One captured worker briefing: the attempt it belongs to and its input. */
+export type WorkerBriefing = {
+  readonly workAttemptId: string
+  readonly input: WorkerLaunchInput
 }
 
 /** Build the complete §12–§13 harness over one real repository and fake seams. */
@@ -540,7 +546,7 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
 
   let runCounter = 0
   let shipInvocation = 0
-  const workBriefs: WorkerLaunchInput[] = []
+  const workerBriefings: WorkerBriefing[] = []
 
   const buildDeps = (): RunLifecycleDeps => {
     const realPush = gitCliPush()
@@ -565,9 +571,9 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
       writer: writer.writer,
       launches: {
         planWorkerFor: (workAttemptId, worker) => (input) => {
+          workerBriefings.push({ workAttemptId, input })
           // Exercise the production worker prompt in every lifecycle test:
           // the round briefing is exactly what a real Pi worker receives.
-          workBriefs.push(input)
           return piWorkerLaunch(input, {
             model: worker.model,
             thinking: worker.thinking,
@@ -616,9 +622,9 @@ export async function makeRunHarness(options: RunHarnessOptions): Promise<RunHar
     gateway,
     runner,
     commands,
-    workBriefs,
     workedTickets: () =>
       runner.launches.filter((entry) => entry.role === 'worker').map((entry) => entry.ticketIssueId!),
+    workerBriefings: () => workerBriefings,
     deps: buildDeps,
     snapshot(): TaskMapSnapshot {
       const evaluation = evaluateTaskMapLoad(loadOf(store))

@@ -173,13 +173,16 @@ Prerequisites):
    explicit `herdr agent start --env` entries. A failed first submission still
    does not exit the pane; the invocation then waits out its timeout unless
    the operator notices.
-7. **Parallel-wave path conflicts park a ticket** — two wave-2 members
+7. **Parallel-wave path conflicts rework in-run** — two wave-2 members
    each invented `test/index.js`; the second ship replayed onto the
    advanced target, hit an add/add conflict, and parked with
-   `integration-conflict`. By design (§11.2 never resolves conflicts),
-   and a fresh run re-worked the ticket from the advanced base — but
-   operators should expect it whenever parallel tickets create the same
-   auxiliary path.
+   `integration-conflict`. By design (§11.2 never resolves conflicts) — a
+   fresh run re-worked the ticket from the advanced base. Ticket #20 now
+   re-queues an `integration-conflict` ticket for fresh Work in a later
+   wave of the same run, at the advanced base and carrying the conflict as
+   worker feedback, bounded by `maxWorkRounds` reworks; only exhausting
+   that budget parks it. Operators should still expect a conflict whenever
+   parallel tickets create the same auxiliary path.
 
 Process observations:
 

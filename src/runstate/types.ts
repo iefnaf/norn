@@ -233,10 +233,9 @@ export type ProcessGroupCheckpoint = {
 /**
  * One structured feedback entry accumulated across a Work attempt's rounds
  * (§10.2, §13.1). Feedback only: it informs later worker rounds — including
- * the first round of a later run for a previously parked Ticket — and is
- * never evidence. The command-failure shapes and reviewer iterate prose are
- * the only payloads that travel; a `terminal` entry records how a parked
- * attempt ended.
+ * a later attempt for the same Ticket, in this run or a later one — and is
+ * never evidence. Command failures, reviewer iterate prose, an in-run Ship
+ * conflict, and a park's terminal entry are the only payloads that travel.
  */
 export type ReworkFeedback =
   | {
@@ -266,6 +265,17 @@ export type ReworkFeedback =
       readonly feedback: string
     }
   | {
+      /**
+       * The Ship conflict that re-queued this Ticket for fresh Work (§12),
+       * carried into the rework attempt's first round.
+       */
+      readonly kind: 'conflict'
+      readonly round: number
+      readonly code: string
+      readonly reason: string
+      readonly evidence: readonly Evidence[]
+    }
+  | {
       /** How the parked attempt ended; the terminal entry of its feedback. */
       readonly kind: 'terminal'
       readonly outcome: 'blocked' | 'error'
@@ -288,6 +298,24 @@ export type WorkAttemptCheckpoint = {
    * reconstructed from a workspace or from earlier evidence.
    */
   readonly feedback?: readonly ReworkFeedback[]
+}
+
+/**
+ * The in-run conflict rework of one Ticket (§12).
+ *
+ * A Ticket whose Ship returned `integration-conflict` is re-queued for fresh
+ * Work in a later Wave of the same run instead of parking. `cycles` counts
+ * the rework attempts already granted, bounded by `maxWorkRounds`; `conflict`
+ * is the Ship conflict the pending rework must resolve. The conflict is
+ * worker feedback, never evidence.
+ */
+export type TicketRework = {
+  readonly cycles: number
+  readonly conflict: {
+    readonly code: string
+    readonly reason: string
+    readonly evidence: readonly Evidence[]
+  }
 }
 
 /** The exact persisted Wave queue, preserving issue-number Ship order (§12, §13.1). */
@@ -417,6 +445,11 @@ export type RunState = {
   readonly activeWave?: WaveState
   readonly parkedTickets: readonly TicketRef[]
   readonly tickets: Readonly<Record<string, TicketRunState>>
+  /**
+   * The in-run conflict rework ledger (§12, §13.1): one entry per Ticket
+   * that has been re-queued for fresh Work in this run.
+   */
+  readonly reworks?: Readonly<Record<string, TicketRework>>
   readonly activeProcesses: readonly ProcessGroupCheckpoint[]
   readonly mapCompletion?: MapCompletionCheckpoint
   readonly report?: RunReport

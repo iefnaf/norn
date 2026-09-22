@@ -96,6 +96,7 @@ import type {
   ReworkFeedback,
   RunReport,
   RunState,
+  TicketRework,
   TicketRunState,
   WaveState,
   WorkspaceRef,
@@ -1587,9 +1588,28 @@ async function runOneWork(
   const ticket = snapshot.tickets.find((candidate) => candidate.ref.issueId === entry.ref.issueId)!
   // A Ticket this run has not started yet may carry the previous run's
   // parked terminal feedback in its waiting record; a resumed attempt
-  // already owns its persisted feedback (§10.2).
+  // already owns its persisted feedback (§10.2). An in-run Ship conflict
+  // additionally carries the conflict that re-queued it (§12), re-seeded
+  // from the ledger so a resumed attempt gets the same briefing.
   const waiting = state.tickets[entry.ref.issueId]
-  const carriedFeedback = waiting?.phase === 'waiting' ? waiting.carriedFeedback : undefined
+  const carried = waiting?.phase === 'waiting' ? waiting.carriedFeedback : undefined
+  const rework = state.reworks?.[entry.ref.issueId]
+  const conflictFeedback: ReworkFeedback[] =
+    rework === undefined
+      ? []
+      : [
+          {
+            kind: 'conflict',
+            round: 0,
+            code: rework.conflict.code,
+            reason: rework.conflict.reason,
+            evidence: rework.conflict.evidence,
+          },
+        ]
+  const carriedFeedback: readonly ReworkFeedback[] | undefined =
+    carried === undefined && conflictFeedback.length === 0
+      ? undefined
+      : [...(carried ?? []), ...conflictFeedback]
   const gateDeps: RoundGateDeps = {
     runner: ctx.deps.runner,
     commands: ctx.deps.commands,
@@ -1883,6 +1903,11 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
   }
   if (pushed.kind === 'blocked') {
     if (pushed.scope === 'ticket') {
+      // §12: a replay conflict re-queues the Ticket for fresh Work in a later
+      // Wave of this run instead of parking it, while the rework budget lasts.
+      if (pushed.code === 'integration-conflict') {
+        return requeueIntegrationConflict(ctx, issueId, pushed)
+      }
       return parkQueuedTicket(ctx, issueId, pushed)
     }
     return { kind: 'stop', outcome: failureOutcome(ctx, pushed) }
@@ -1936,6 +1961,88 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
   ctx.sharedWrite = true
   ctx.warnings.push(...closed.value.warnings)
   return { kind: 'next', state: reloaded.value!, value: null }
+}
+
+/**
+ * Re-queue a Ticket whose Ship replay conflicted (§12): fresh Work in a
+ * later Wave of this run, at the advanced base, with the conflict carried as
+ * worker feedback. Each rework is a complete Work attempt with its own
+ * `maxWorkRounds` round budget; a Ticket may be reworked at most
+ * `maxWorkRounds` times per run, after which the conflict parks it exactly
+ * as before. The abandoned attempt's workspace is deleted best-effort once
+ * the re-queue is persisted (its conflict evidence is already captured) and
+ * a cleanup failure is only a warning.
+ */
+async function requeueIntegrationConflict(
+  ctx: RunContext,
+  issueId: string,
+  outcome: {
+    readonly kind: 'blocked'
+    readonly code: string
+    readonly reason: string
+    readonly evidence: readonly Evidence[]
+  },
+): Promise<StepResult> {
+  const loaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
+  if (loaded.kind !== 'ok') {
+    return {
+      kind: 'stop',
+      outcome: runFailure(ctx, loaded.code as never,
+        `reloading run state to re-queue ticket ${issueId} failed: ${loaded.reason}`),
+    }
+  }
+  const current = loaded.value!
+  const cycles = current.reworks?.[issueId]?.cycles ?? 0
+  if (cycles >= ctx.config.maxWorkRounds) {
+    ctx.warnings.push(
+      `ticket ${issueId} exhausted its in-run rework budget ` +
+        `(maxWorkRounds=${ctx.config.maxWorkRounds}) after ${cycles} rework(s); ` +
+        'it parks with the existing integration-conflict semantics',
+    )
+    return parkQueuedTicket(ctx, issueId, outcome)
+  }
+  const record = current.tickets[issueId]
+  const workspace =
+    record !== undefined && (record.phase === 'shippable' || record.phase === 'shipping')
+      ? record.change.workspace
+      : undefined
+  const reworks: Record<string, TicketRework> = {
+    ...(current.reworks ?? {}),
+    [issueId]: {
+      cycles: cycles + 1,
+      conflict: {
+        code: outcome.code,
+        reason: outcome.reason,
+        evidence: [...outcome.evidence],
+      },
+    },
+  }
+  const next: RunState = {
+    ...current,
+    tickets: {
+      ...current.tickets,
+      [issueId]: { phase: 'waiting', wave: current.activeWave?.number ?? current.wave },
+    },
+    reworks,
+  }
+  const saved = saveRunState(ctx.repositoryHome, ctx.encodedMapIssueId, next)
+  if (saved.kind !== 'ok') {
+    return {
+      kind: 'stop',
+      outcome: runFailure(ctx, saved.code as never,
+        `persisting the re-queue of ticket ${issueId} failed: ${saved.reason}`),
+    }
+  }
+  if (workspace !== undefined) {
+    const cleaned = await (ctx.deps.cleanup ?? fsWorkspaceCleanup())(workspace)
+    if (cleaned.kind !== 'ok') {
+      ctx.warnings.push(
+        `cleaning up the conflicted workspace of ticket ${issueId} failed and was ignored: ` +
+          cleaned.reason,
+      )
+    }
+  }
+  return { kind: 'next', state: next, value: null }
 }
 
 /** Persist one queued Ticket's ticket-scoped Ship failure as parked (§12). */

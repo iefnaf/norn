@@ -157,7 +157,8 @@ export type WorkOutcome = Outcome<ShippableChange, WorkBlockCode, WorkErrorCode>
 /**
  * One structured feedback entry accumulated across rounds (§10.2). The
  * persisted vocabulary lives in `runstate/types.ts` so that a parked
- * attempt's terminal feedback can cross a run boundary through Run State.
+ * attempt's terminal feedback can cross a run boundary through Run State
+ * and an in-run Ship conflict can seed a rework attempt.
  */
 export type RoundFeedback = ReworkFeedback
 
@@ -450,9 +451,11 @@ export type WorkAttemptParams = {
   readonly input: WorkInput
   readonly workAttemptId: string
   /**
-   * Terminal feedback of the previous run's parked attempt for this Ticket
-   * (§10.2). Seeds this attempt's accumulated feedback when it starts fresh;
-   * ignored when a persisted attempt already carries its own feedback.
+   * Structured feedback a fresh attempt starts with: the previous run's
+   * parked terminal feedback (§10.2), the Ship conflict that re-queued this
+   * Ticket for in-run rework (§12), or both. Seeds this attempt's
+   * accumulated feedback; ignored when a persisted attempt already owns its
+   * own list.
    */
   readonly carriedFeedback?: readonly RoundFeedback[]
   /** Identity of the Task Map the Ticket belongs to (sidecar binding, §17). */

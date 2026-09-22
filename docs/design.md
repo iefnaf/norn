@@ -420,6 +420,7 @@ A command entry is `{ argv, timeoutMs }` with non-empty `argv` and `timeoutMs > 
 
 Rules:
 
+- `maxWorkRounds` bounds both the worker rounds of one Work attempt (§10.2) and the number of in-run conflict reworks of one Ticket (§12);
 - models are exact provider/model IDs; v1 has no fallback list; preflight resolves each against the authenticated model catalog and blocks when it is unavailable;
 - worker and reviewer must resolve to different provider families;
 - commands are argument arrays; `argv[0]` is the executable; no shell, per-command environment, or working directory is configurable — the Command runner supplies the active gate workspace as working directory and a coordinator-defined environment that excludes GitHub tokens and push credentials;
@@ -586,7 +587,7 @@ repeat at most maxWorkRounds times:
     on reviewer pass: verify again and seal Shippable Change in Run State
 ```
 
-`maxWorkRounds` counts worker invocations, including the first. The coordinator increments and persists the attempt's round plus its agent launch intent before each worker process is created, so a crash cannot reset the budget. A later round starts from the previous round's clean candidate commit rather than resetting to `baseSha`. It receives the accumulated structured setup, test, and review feedback. Setup and tests are rerun against every new candidate; no test or review evidence from an earlier round enters the final `ShippableChange`.
+`maxWorkRounds` counts worker invocations, including the first. The coordinator increments and persists the attempt's round plus its agent launch intent before each worker process is created, so a crash cannot reset the budget. A later round starts from the previous round's clean candidate commit rather than resetting to `baseSha`. It receives the accumulated structured setup, test, and review feedback; a fresh attempt re-queued by an in-run Ship conflict (§12) starts with that conflict as its first feedback entry. Setup and tests are rerun against every new candidate; no test or review evidence from an earlier round enters the final `ShippableChange`.
 
 That accumulated feedback is persisted with the attempt checkpoint before the next worker process is created, so a coordinator restart resumes the same warm context. When an attempt parks, its Ticket retains the full accumulated feedback plus one `terminal` entry recording how the attempt ended. A later run for the same map carries those entries into the Ticket's first Work round, keeping their original round numbers. Feedback is context, never evidence: it is never bound to a tree or counted as a gate result, and it crosses a run boundary only through persisted Run State. A new run never reuses an earlier run's branches, workspaces, or test and review evidence to reconstruct it.
 
@@ -784,7 +785,7 @@ Barrier policy:
 
 - if the Task Map is no longer OPEN or its change is incompatible, no remaining result from that Wave ships and the run returns `blocked(changed-input)`;
 - a Compatible Map Extension is persisted before Ship; existing results remain valid and added Tickets are deferred to the next frontier computation;
-- blocked and ticket-scoped error outcomes park their ticket for the current run;
+- blocked and ticket-scoped error outcomes park their ticket for the current run — except a ticket-scoped `integration-conflict`, which is re-queued for fresh Work in a later Wave of the same run at the advanced base, carrying the conflict as worker feedback; a Ticket may be reworked at most `maxWorkRounds` times per run, after which the conflict parks it with the ordinary ticket-scoped semantics;
 - descendants of parked tickets remain waiting;
 - independent branches continue;
 - failure of the Local control store, map lock, or target lock is run-scoped; an explicit coordinator abort follows the abort protocol in §2.3, while an unexpected coordinator exit leaves recoverable `running` state;
@@ -879,6 +880,15 @@ type ShipCheckpoint = {
   delivery: DeliveryRecordV1
 }
 
+type TicketRework = {
+  cycles: number
+  conflict: {
+    code: string
+    reason: string
+    evidence: Evidence[]
+  }
+}
+
 type TicketRunState =
   | { phase: 'waiting'; wave?: number; carriedFeedback?: ReworkFeedback[] }
   | { phase: 'working'; wave: number; attempt: WorkAttemptCheckpoint }
@@ -960,13 +970,14 @@ type RunState = {
   activeWave?: WaveState
   parkedTickets: TicketRef[]
   tickets: Record<string, TicketRunState>
+  reworks?: Record<string, TicketRework>
   activeProcesses: ProcessGroupCheckpoint[]
   mapCompletion?: MapCompletionCheckpoint
   report?: RunReport
 }
 ```
 
-`TicketRunState` is a discriminated union; fields from one phase are not optional in another. The serialized `code: string` slots accept only members of the closed outcome-code unions for the recorded phase and `nornVersion`; an unknown code is a state-integrity error, not a new runtime branch. Ticket record keys are immutable Ticket issue IDs. `activeWave.shipQueueTicketIssueIds` is the exact persisted queue and therefore preserves issue-number order across restart and later Compatible Map Extensions. On load, `wave` must equal `activeWave.number` when a Wave exists, and `parkedTickets` must exactly match Tickets whose phase is `parked`; disagreement is a state-integrity error. `ReworkFeedback` is the one persisted form of accumulated rework context: a live attempt's `feedback`, a parked Ticket's `feedback`, and a waiting Ticket's `carriedFeedback`. Those fields are optional on load — a document written before the vocabulary existed still resumes, without inventing context — but they are the only place that context is stored: it is never reconstructed from a workspace, a branch, or earlier evidence, a carried list is never empty, and a parked list always ends in its `terminal` entry. A `ShipCheckpoint` contains the complete write-ahead intent before push; `zeroDelta` must agree with the persisted base, integrated commit, and trees. A `MapCompletionCheckpoint` contains a unique completion-attempt ID, a timeline anchor, the sealed evidence gate, and completed tests and review before Map close, and later gains the exact closing event and sealed record. Its map-completion workspace carries the same attempt ID. `timelineAnchor` is the immutable node ID when the head of the fully paginated pre-close timeline exposes one. When the head is ID-less (including an empty timeline), it is instead the exact prefix length plus the SHA-256 digest of that canonical timeline prefix. Recovery relocates an event-ID anchor or verifies the complete synthetic prefix before using its index; inability to do so is an error rather than permission to guess. Checkpoint `stage` always means “last remotely confirmed stage”; recovery must still probe the next side effect because a process may have exited after the remote accepted it but before the following local update. A completed Ticket retains `cleanupWorkspace` until cleanup has succeeded or its failure has been persisted as a warning. A `passed` `RunReport` has no non-success code, requires `completionSha`, and has `sharedWrite: 'confirmed'` because Map closure is a shared write. `Blocked` and terminal `error` reports require a recognized code and have no completion SHA. A terminal `error` report always has `sharedWrite: 'none'`; errors after confirmed or unknown shared writes remain recoverable and do not create a terminal report.
+`TicketRunState` is a discriminated union; fields from one phase are not optional in another. The serialized `code: string` slots accept only members of the closed outcome-code unions for the recorded phase and `nornVersion`; an unknown code is a state-integrity error, not a new runtime branch. Ticket record keys are immutable Ticket issue IDs. `reworks` carries one entry per Ticket re-queued by an in-run Ship conflict (§12): `cycles` counts the rework attempts granted in this run and its keys must be known Ticket IDs. `activeWave.shipQueueTicketIssueIds` is the exact persisted queue and therefore preserves issue-number order across restart and later Compatible Map Extensions. On load, `wave` must equal `activeWave.number` when a Wave exists, and `parkedTickets` must exactly match Tickets whose phase is `parked`; disagreement is a state-integrity error. `ReworkFeedback` is the one persisted form of accumulated rework context: a live attempt's `feedback`, a parked Ticket's `feedback`, and a waiting Ticket's `carriedFeedback`. Those fields are optional on load — a document written before the vocabulary existed still resumes, without inventing context — but they are the only place that context is stored: it is never reconstructed from a workspace, a branch, or earlier evidence, a carried list is never empty, and a parked list always ends in its `terminal` entry. A `ShipCheckpoint` contains the complete write-ahead intent before push; `zeroDelta` must agree with the persisted base, integrated commit, and trees. A `MapCompletionCheckpoint` contains a unique completion-attempt ID, a timeline anchor, the sealed evidence gate, and completed tests and review before Map close, and later gains the exact closing event and sealed record. Its map-completion workspace carries the same attempt ID. `timelineAnchor` is the immutable node ID when the head of the fully paginated pre-close timeline exposes one. When the head is ID-less (including an empty timeline), it is instead the exact prefix length plus the SHA-256 digest of that canonical timeline prefix. Recovery relocates an event-ID anchor or verifies the complete synthetic prefix before using its index; inability to do so is an error rather than permission to guess. Checkpoint `stage` always means “last remotely confirmed stage”; recovery must still probe the next side effect because a process may have exited after the remote accepted it but before the following local update. A completed Ticket retains `cleanupWorkspace` until cleanup has succeeded or its failure has been persisted as a warning. A `passed` `RunReport` has no non-success code, requires `completionSha`, and has `sharedWrite: 'confirmed'` because Map closure is a shared write. `Blocked` and terminal `error` reports require a recognized code and have no completion SHA. A terminal `error` report always has `sharedWrite: 'none'`; errors after confirmed or unknown shared writes remain recoverable and do not create a terminal report.
 
 Only the coordinator writes this document. `acceptedMapRevisions[0]` is the preflight snapshot; each later entry is a verified Compatible Map Extension, and the last entry is current. Added Ticket IDs are sorted. On load, Norn re-hashes every payload and verifies every recorded transition before trusting the lineage. The complete canonical payload is retained so recovery and Ship can prove compatibility for evidence created under an earlier revision. No recovery-critical queue, candidate, process-group identity, or shared-write intent exists only in memory.
 
@@ -976,7 +987,7 @@ The document is stored at `<repository-home>/maps/<encoded-issue-id>/run-state.j
 
 ### 13.2 Lifecycle
 
-- If state is `running`, the same `configRevision` and `nornVersion` resume the run ID, parked set, accepted Map lineage, exact Wave queue, and persisted retry counters.
+- If state is `running`, the same `configRevision` and `nornVersion` resume the run ID, parked set, accepted Map lineage, exact Wave queue, persisted retry counters, and in-run rework ledger.
 - Resume first reconciles `activeProcesses`. It then reloads a stable Map snapshot. An identical snapshot continues; a Compatible Map Extension is appended atomically; an incompatible change settles active processes and terminates the run as blocked.
 - A CLOSED Map with a pending `mapCompletion` checkpoint is routed to §13.4 before the ordinary OPEN-state preflight rule is applied. No other CLOSED Map is silently accepted.
 - A config or Norn version mismatch refuses resume; it never mixes evidence produced by different executors.

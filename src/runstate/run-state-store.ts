@@ -283,6 +283,17 @@ function checkReworkFeedback(value: unknown, where: string, violations: string[]
       checkInteger(value.round, 1, `${where}.round`, violations)
       checkNonEmptyString(value.feedback, `${where}.feedback`, violations)
       break
+    case 'conflict':
+      checkKeys(value, ['kind', 'round', 'code', 'reason', 'evidence'], where, violations)
+      checkInteger(value.round, 0, `${where}.round`, violations)
+      checkNonEmptyString(value.code, `${where}.code`, violations)
+      checkString(value.reason, `${where}.reason`, violations)
+      if (!Array.isArray(value.evidence)) {
+        violations.push(`${where}.evidence must be an array`)
+      } else if (!value.evidence.every(isCanonicalJsonValue)) {
+        violations.push(`${where}.evidence must be serializable machine data`)
+      }
+      break
     case 'terminal':
       checkKeys(value, ['kind', 'outcome', 'code', 'reason'], where, violations)
       checkEnum(value.outcome, ['blocked', 'error'] as const, `${where}.outcome`, violations)
@@ -1049,7 +1060,7 @@ function checkRunStateShape(value: unknown, violations: string[]): RunState | un
     ],
     'run state',
     violations,
-    { allowOptional: ['activeWave', 'mapCompletion', 'report'] },
+    { allowOptional: ['activeWave', 'mapCompletion', 'reworks', 'report'] },
   )
   if (value.schema !== RUN_STATE_SCHEMA) {
     violations.push(`schema must be "${RUN_STATE_SCHEMA}"`)
@@ -1076,6 +1087,9 @@ function checkRunStateShape(value: unknown, violations: string[]): RunState | un
     }
   } else {
     violations.push('tickets must be an object keyed by ticket issue ID')
+  }
+  if (value.reworks !== undefined) {
+    checkTicketReworkLedger(value.reworks, 'reworks', violations)
   }
   if (Array.isArray(value.activeProcesses)) {
     value.activeProcesses.forEach((entry, index) => {
@@ -1120,6 +1134,39 @@ function checkWaveState(value: unknown, where: string, violations: string[]): vo
     unique: true,
   })
   checkInteger(value.nextShipIndex, 0, `${where}.nextShipIndex`, violations)
+}
+
+function checkTicketReworkLedger(value: unknown, where: string, violations: string[]): void {
+  if (!isPlainObject(value)) {
+    violations.push(`${where} must be an object keyed by ticket issue ID`)
+    return
+  }
+  for (const [issueId, entry] of Object.entries(value)) {
+    if (issueId === '') violations.push(`${where} has an empty entry key`)
+    checkTicketRework(entry, `${where}[${issueId}]`, violations)
+  }
+}
+
+function checkTicketRework(value: unknown, where: string, violations: string[]): void {
+  if (!isPlainObject(value)) {
+    violations.push(`${where} must be a ticket rework object`)
+    return
+  }
+  checkKeys(value, ['cycles', 'conflict'], where, violations)
+  checkInteger(value.cycles, 1, `${where}.cycles`, violations)
+  if (!isPlainObject(value.conflict)) {
+    violations.push(`${where}.conflict must be an object`)
+    return
+  }
+  const conflict = value.conflict
+  checkKeys(conflict, ['code', 'reason', 'evidence'], `${where}.conflict`, violations)
+  checkNonEmptyString(conflict.code, `${where}.conflict.code`, violations)
+  checkString(conflict.reason, `${where}.conflict.reason`, violations)
+  if (!Array.isArray(conflict.evidence)) {
+    violations.push(`${where}.conflict.evidence must be an array`)
+  } else if (!conflict.evidence.every(isCanonicalJsonValue)) {
+    violations.push(`${where}.conflict.evidence must be serializable machine data`)
+  }
 }
 
 function checkTicketRunState(value: unknown, where: string, violations: string[]): void {
@@ -1238,6 +1285,7 @@ function checkRunStateInvariants(state: RunState, violations: string[]): void {
 
   // Ticket record keys are immutable ticket issue IDs of this map's members.
   const mapIdentity = { host: state.map.githubHost, repositoryId: state.map.repositoryId }
+  const knownTicketIds = new Set(Object.keys(state.tickets))
   for (const [issueId, ticket] of Object.entries(state.tickets)) {
     if (issueId === '') violations.push('tickets has an empty record key')
     if (ticket.phase === 'working') {
@@ -1269,6 +1317,13 @@ function checkRunStateInvariants(state: RunState, violations: string[]): void {
       if (ticket.feedback.at(-1)?.kind !== 'terminal') {
         violations.push(`tickets[${issueId}].feedback must end with its terminal entry`)
       }
+    }
+  }
+
+  // Rework ledger entries belong to tickets of this run (§12).
+  for (const issueId of Object.keys(state.reworks ?? {})) {
+    if (!knownTicketIds.has(issueId)) {
+      violations.push(`reworks references unknown ticket "${issueId}"`)
     }
   }
 

@@ -60,6 +60,10 @@ _Avoid_: Blocked ticket, failed ticket
 A Ticket whose attempted Work or Ship cannot safely progress under current trustworthy facts without changed code, input, configuration, or an operator decision.
 _Avoid_: Waiting ticket, failed ticket
 
+**Rework**:
+One additional Work attempt a Ticket receives in a later Wave of the same run after its Ship returned `integration-conflict`, at the advanced base and carrying that conflict as worker feedback.
+_Avoid_: Retry, re-queue, re-plan
+
 **Run Config**:
 A resolved, versioned JSON document containing the target branch, commands, exact worker and reviewer models, attempt limits, repository-wide concurrency, and trusted evidence authors.
 _Avoid_: Task Map configuration, Run Definition

@@ -865,6 +865,55 @@ describe('run state integrity: wave, checkpoint, and report agreements', () => {
   })
 })
 
+describe('run state integrity: the in-run conflict rework ledger', () => {
+  const conflict = {
+    code: 'integration-conflict',
+    reason: 'the candidate for ticket #2 conflicts when replayed onto the advanced target',
+    evidence: [{ conflictedPaths: ['shared.txt'], baseSha: 'sha1:' + '3'.repeat(40) }],
+  }
+
+  it('accepts a rework entry for a known ticket', () => {
+    const outcome = checkRunStateIntegrity(
+      stateWith((s) => {
+        s.tickets.I_A = { phase: 'waiting', wave: 1 }
+        s.reworks = { I_A: { cycles: 1, conflict } }
+      }),
+    )
+    assert.ok(outcome.kind === 'ok', outcome.kind === 'error' ? outcome.reason : '')
+  })
+
+  it('rejects a ledger entry for an unknown ticket', () => {
+    expectIntegrityViolation(
+      stateWith((s) => { s.reworks = { I_ghost: { cycles: 1, conflict } } }),
+      /reworks references unknown ticket "I_ghost"/,
+    )
+  })
+
+  it('rejects a cycle count below one and malformed conflicts', () => {
+    expectIntegrityViolation(
+      stateWith((s) => { s.reworks = { I_A: { cycles: 0, conflict } } }),
+      /reworks\[I_A\]\.cycles must be an integer >= 1/,
+    )
+    expectIntegrityViolation(
+      stateWith((s) => { s.reworks = { I_A: { cycles: 1, conflict: { ...conflict, code: '' } } } }),
+      /reworks\[I_A\]\.conflict\.code must be a non-empty string/,
+    )
+    expectIntegrityViolation(
+      stateWith((s) => {
+        s.reworks = { I_A: { cycles: 1, conflict: { ...conflict, evidence: [{ bad: undefined }] } } }
+      }),
+      /reworks\[I_A\]\.conflict\.evidence must be serializable machine data/,
+    )
+  })
+
+  it('rejects unknown ledger fields', () => {
+    expectIntegrityViolation(
+      stateWith((s) => { s.reworks = { I_A: { cycles: 1, conflict, extra: true } } }),
+      /reworks\[I_A\] has unknown field "extra"/,
+    )
+  })
+})
+
 describe('crash safety: killing a writer never leaves a torn document', () => {
   it('a SIGKILLed writer leaves the previous or complete new document', { timeout: 180_000 }, async () => {
     const home = tempHome()

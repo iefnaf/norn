@@ -597,7 +597,7 @@ describe('interleaved Ships serialize on the target lock', () => {
     }
   })
 
-  it('parks the losing conflict instead of overwriting the first shipment', { timeout: 120_000 }, async () => {
+  it('reworks the losing conflict in-run instead of overwriting the first shipment', { timeout: 120_000 }, async () => {
     const harness = await makeCrossMapHarness({
       label: 'ship-conflict',
       concurrency: 4,
@@ -630,30 +630,38 @@ describe('interleaved Ships serialize on the target lock', () => {
       holdB1.release()
 
       const [outcomeA, outcomeB] = await Promise.all([runA, runB])
-      const outcomes = [
-        { world: worldA, outcome: outcomeA },
-        { world: worldB, outcome: outcomeB },
-      ]
-      const winners = outcomes.filter((entry) => entry.outcome.kind === 'ok')
-      const losers = outcomes.filter((entry) => entry.outcome.kind !== 'ok')
-      assert.equal(winners.length, 1)
-      assert.equal(losers.length, 1)
+      assert.equal(outcomeA.kind, 'ok')
+      assert.equal(outcomeB.kind, 'ok')
 
-      // The winner shipped exactly one integration; the loser parks on the
-      // replay conflict and never pushed.
-      const loser = losers[0]!
-      assert.equal(loser.outcome.kind, 'blocked')
-      assert.equal(loser.outcome.code, 'no-eligible-frontier')
-      const loserTicket = harness.runStateOf(loser.world)!.tickets[
-        loser.world.members[0]!.issueId
-      ]
-      assert.ok(loserTicket?.phase === 'parked')
-      assert.equal(loserTicket.phase === 'parked' ? loserTicket.outcome.code : '', 'integration-conflict')
-      assert.equal(loser.world.observed.pushes, 0)
+      // Mutual exclusion: pushes never overlapped, whichever run shipped first.
+      assert.equal(harness.pushStats().maxInFlight, 1, 'pushes must never overlap')
+      assert.equal(harness.pushStats().count, 2)
+      assert.equal(worldA.observed.pushes + worldB.observed.pushes, 2)
 
-      assert.equal(harness.pushStats().maxInFlight, 1)
-      assert.equal(harness.pushStats().count, 1)
-      assert.equal(harness.remoteLog().length, 2)
+      // The run that lost the replay reworked its Ticket in a second Wave and
+      // shipped on top of the winner: init plus two integrations in linear
+      // history, never an overwrite.
+      assert.equal(harness.remoteLog().length, 3)
+      const second = remoteGitText(harness, ['rev-parse', 'main'])
+      const first = remoteGitText(harness, ['rev-parse', 'main~1'])
+      assert.notEqual(second, first)
+      assert.equal(
+        remoteGitText(harness, ['rev-list', '--count', `${first}..${second}`]),
+        '1',
+      )
+
+      // Exactly one run consumed an in-run rework, and its Ticket completed.
+      const reworked = [worldA, worldB].filter(
+        (world) =>
+          (harness.runStateOf(world)?.reworks?.[world.members[0]!.issueId]?.cycles ?? 0) === 1,
+      )
+      assert.equal(reworked.length, 1)
+      const loserState = harness.runStateOf(reworked[0]!)!
+      assert.equal(loserState.tickets[reworked[0]!.members[0]!.issueId]?.phase, 'completed')
+      assert.equal(
+        loserState.reworks![reworked[0]!.members[0]!.issueId]!.conflict.code,
+        'integration-conflict',
+      )
     } finally {
       await harness.settleAll()
       harness.cleanup()
