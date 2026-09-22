@@ -152,8 +152,9 @@ Fixed in this change (norn defects — each ships with a regression test):
    last timeline item's `eventId`, but "other" event kinds (sub-issue
    added, …) carry no ID in GitHub's timeline union, producing `""` —
    which the Run State validator (correctly) rejects, so the gated
-   completion checkpoint could never persist. The anchor is now the last
-   event that has a real ID (`null` when none exists).
+   completion checkpoint could never persist. #18 initially fell back to
+   the last real event ID; follow-up #23 now preserves the exact boundary
+   with a length-and-digest synthetic prefix whenever the head is ID-less.
 
 Operator-side findings (no norn change, documented above in
 Prerequisites):

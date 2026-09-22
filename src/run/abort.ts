@@ -93,6 +93,7 @@ import {
   closingEventBinding,
   collectMemberCompletion,
   evaluateMapCompletionRecord,
+  timelineAnchorIndex,
 } from './completion.ts'
 
 // ---------------------------------------------------------------------------
@@ -705,18 +706,15 @@ async function reconcileCompletionWrites(
     }
   }
   const timeline = evidenceRead.value.timeline
-  const anchorIndex =
-    checkpoint.timelineAnchorEventId === null
-      ? -1
-      : timeline.findIndex((event) => event.eventId === checkpoint.timelineAnchorEventId)
-  if (checkpoint.timelineAnchorEventId !== null && anchorIndex === -1) {
+  const anchorIndex = timelineAnchorIndex(timeline, checkpoint.timelineAnchor)
+  if (anchorIndex === undefined) {
     return {
       kind: 'failed',
       outcome: abortError(
         'issue-close',
         'the completion checkpoint timeline anchor can no longer be located; the close ' +
           'window is ambiguous and never guessed from (§13.1, §13.4)',
-        [{ anchorEventId: checkpoint.timelineAnchorEventId }],
+        [{ timelineAnchor: checkpoint.timelineAnchor }],
         'unknown',
       ),
     }
@@ -741,7 +739,7 @@ async function reconcileCompletionWrites(
 
   // Passed precedence (§13.2): only a close bound to this checkpoint and a
   // currently-valid §15 record proves completion finalized.
-  const closing = closingEventBinding(timeline, checkpoint.timelineAnchorEventId, deps.actorId)
+  const closing = closingEventBinding(timeline, checkpoint.timelineAnchor, deps.actorId)
   if (!closing.bound) return { kind: 'ok', writes }
 
   const snapshotRead = await deps.readMap()

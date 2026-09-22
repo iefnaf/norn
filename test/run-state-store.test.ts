@@ -692,7 +692,11 @@ describe('run state integrity: wave, checkpoint, and report agreements', () => {
         s.mapCompletion = {
           stage: 'gated',
           completionAttemptId: 'mc-1',
-          timelineAnchorEventId: null,
+          timelineAnchor: {
+            kind: 'prefix',
+            timelineLength: 0,
+            prefixDigest: canonicalJsonDigest([]),
+          },
           workspace: {
             kind: 'map-completion',
             repositoryId: REPOSITORY_ID,

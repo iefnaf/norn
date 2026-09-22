@@ -61,6 +61,7 @@ import type {
   MapCompletionCheckpoint,
   ProcessGroupCheckpoint,
   RunState,
+  TimelineAnchor,
   TestEvidence,
 } from '../../src/runstate/types.ts'
 import { NORN_VERSION } from '../../src/version.ts'
@@ -716,7 +717,7 @@ export function craftCompletionCheckpoint(
     readonly stage?: MapCompletionCheckpoint['stage']
     readonly mapRevision: string
     readonly completionAttemptId?: string
-    readonly timelineAnchorEventId?: string | null
+    readonly timelineAnchor?: TimelineAnchor
     readonly closingEventId?: string
   },
 ): MapCompletionCheckpoint {
@@ -728,7 +729,11 @@ export function craftCompletionCheckpoint(
   return {
     stage: init.stage ?? 'gated',
     completionAttemptId,
-    timelineAnchorEventId: init.timelineAnchorEventId ?? null,
+    timelineAnchor: init.timelineAnchor ?? {
+      kind: 'prefix',
+      timelineLength: 0,
+      prefixDigest: canonicalJsonDigest([]),
+    },
     workspace: {
       kind: 'map-completion',
       repositoryId: REPOSITORY_ID,

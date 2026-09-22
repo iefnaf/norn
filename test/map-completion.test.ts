@@ -306,11 +306,11 @@ describe('map completion — happy path', () => {
     }
   })
 
-  it('anchors the gated checkpoint at the last event with a real ID when the timeline ends with ID-less events', async () => {
+  it('persists the exact timeline prefix when the head event has no ID', async () => {
     // GitHub's timeline union exposes `id` only through per-type fragments,
     // so "other" events (sub-issue added, …) read back with an empty
-    // eventId. An empty-string anchor is rejected by the Run State
-    // validator, which would strand every completion at the gated persist.
+    // eventId. Falling back to ME0 would lose the position of both trailing
+    // items; the synthetic prefix anchor preserves the exact boundary.
     const harness = await makeRunHarness({ label: 'mc-anchor', members: [ticketA(), ticketB({ blockers: ['I_A'] })] })
     try {
       mapIssueOf(harness).timeline.push({ kind: 'commented', eventId: 'ME0', commentId: 'MC0' })
@@ -320,21 +320,74 @@ describe('map completion — happy path', () => {
       const outcome = await harness.run()
       assert.equal(outcome.kind, 'ok')
       assert.equal(outcome.value.label, 'passed')
-      assert.equal(harness.runState()!.mapCompletion?.timelineAnchorEventId, 'ME0')
+      const anchor = harness.runState()!.mapCompletion?.timelineAnchor
+      assert.equal(anchor?.kind, 'prefix')
+      if (anchor?.kind === 'prefix') {
+        assert.equal(anchor.timelineLength, 3)
+        assert.match(anchor.prefixDigest, /^sha256:[0-9a-f]{64}$/)
+      }
     } finally {
       harness.cleanup()
     }
   })
 
-  it('completes with a null anchor when the map timeline has no identified events at all', async () => {
-    const harness = await makeRunHarness({ label: 'mc-anchor-null', members: [ticketA()] })
+  it('does not mistake an ID-less historical close-then-reopen for post-anchor interference', async () => {
+    const harness = await makeRunHarness({ label: 'mc-anchor-history', members: [ticketA()] })
     try {
-      mapIssueOf(harness).timeline.push({ kind: 'other', eventId: '' })
+      // The map is currently OPEN; this old repair sequence predates the
+      // completion attempt, but no event in the timeline has an ID.
+      mapIssueOf(harness).timeline.push(
+        { kind: 'closed', eventId: '', actorId: ACTOR_ID },
+        { kind: 'reopened', eventId: '', actorId: ACTOR_ID },
+        { kind: 'other', eventId: '' },
+      )
 
       const outcome = await harness.run()
       assert.equal(outcome.kind, 'ok')
       assert.equal(outcome.value.label, 'passed')
-      assert.equal(harness.runState()!.mapCompletion?.timelineAnchorEventId, null)
+      const anchor = harness.runState()!.mapCompletion?.timelineAnchor
+      assert.equal(anchor?.kind, 'prefix')
+      if (anchor?.kind === 'prefix') assert.equal(anchor.timelineLength, 3)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('detects an ID-less close-then-reopen appended after the synthetic anchor', async () => {
+    const harness = await makeRunHarness({ label: 'mc-anchor-interference', members: [ticketA()] })
+    try {
+      mapIssueOf(harness).timeline.push({ kind: 'other', eventId: '' })
+      const deps = harness.deps()
+      const loadIssueEvidence = deps.evidence.loadIssueEvidence.bind(deps.evidence)
+      let interfered = false
+      const outcome = await runMap(
+        {
+          ...deps,
+          evidence: {
+            async loadIssueEvidence(locator) {
+              if (
+                locator.number === MAP_NUMBER &&
+                !interfered &&
+                harness.runState()?.mapCompletion !== undefined
+              ) {
+                interfered = true
+                mapIssueOf(harness).timeline.push(
+                  { kind: 'closed', eventId: '', actorId: ACTOR_ID },
+                  { kind: 'reopened', eventId: '', actorId: ACTOR_ID },
+                )
+              }
+              return loadIssueEvidence(locator)
+            },
+          },
+        },
+        mapUrlOf(),
+      )
+
+      assert.equal(interfered, true)
+      assert.equal(outcome.kind, 'blocked')
+      assert.equal(outcome.code, 'changed-input')
+      assert.equal(harness.store.observed.mapCloseCalls, 0)
+      assert.equal(mapIssueOf(harness).state, 'OPEN')
     } finally {
       harness.cleanup()
     }
