@@ -12,7 +12,20 @@ import assert from 'node:assert/strict'
 import { readdir } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 
-import { HerdrAgentRunner, type HerdrPlan, decodeHerdrHandle, encodeHerdrHandle, herdrAgentName, nornAgentContextEnv, planAgentPiArgv, planHerdrAgentGet, planHerdrAgentStart, planHerdrAgentWait, planHerdrPaneClose } from '../src/agents/herdr-runner.ts'
+import {
+  HerdrAgentRunner,
+  type HerdrPlan,
+  decodeHerdrHandle,
+  encodeHerdrHandle,
+  herdrAgentEnvironment,
+  herdrAgentName,
+  nornAgentContextEnv,
+  planAgentPiArgv,
+  planHerdrAgentGet,
+  planHerdrAgentStart,
+  planHerdrAgentWait,
+  planHerdrPaneClose,
+} from '../src/agents/herdr-runner.ts'
 import { settleAgentInvocation } from '../src/agents/runner.ts'
 import { buildContext, createRunArea, defaultWorkerCandidate, fakeAgentLaunch } from './helpers/agent-fixtures.ts'
 
@@ -128,6 +141,26 @@ describe('herdr CLI plans', () => {
     assert.deepEqual(JSON.parse(entry.value), context)
   })
 
+  it('adds sorted explicit extras without GitHub tokens, push credentials, or context spoofing', async () => {
+    const area = await createRunArea('plan-env')
+    const context = buildContext(area, { role: 'reviewer', phase: 'ship' })
+    const entries = herdrAgentEnvironment(context as never, {
+      NO_PROXY: 'localhost,127.0.0.1',
+      SSH_AUTH_SOCK: '/tmp/agent.sock',
+      NORN_AGENT_CONTEXT: '{"spoofed":true}',
+      HTTPS_PROXY: 'http://127.0.0.1:7897',
+      GITHUB_TOKEN: 'secret',
+    })
+
+    assert.deepEqual(entries.map((entry) => entry.key), [
+      'HTTPS_PROXY',
+      'NO_PROXY',
+      'NORN_AGENT_CONTEXT',
+    ])
+    assert.equal(entries[0]!.value, 'http://127.0.0.1:7897')
+    assert.deepEqual(JSON.parse(entries[2]!.value), context)
+  })
+
   it('round-trips adapter handles and rejects malformed ones', () => {
     const handle = encodeHerdrHandle('w10:p2', 'norn-ag-1')
     assert.deepEqual(decodeHerdrHandle(handle), { paneId: 'w10:p2', agentName: 'norn-ag-1' })
@@ -147,10 +180,12 @@ describe('HerdrAgentRunner against a scripted CLI', () => {
       context,
       argv: ['pi'],
       cwd: area.workspacePath,
+      env: { HTTPS_PROXY: 'http://127.0.0.1:7897' },
     })
 
     assert.equal(handle.kind, 'herdr')
     assert.deepEqual(plans[0].args.slice(0, 3), ['agent', 'start', 'norn-ag-invocation-1'])
+    assert.ok(plans[0].args.includes('HTTPS_PROXY=http://127.0.0.1:7897'))
     assert.equal(await runner.isLive(handle), true)
 
     const reattached = runner.attach(handle.adapterHandle)

@@ -15,8 +15,9 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 
-import { canonicalJson } from '../core/canonical-json.ts'
+import { canonicalJson, compareUtf16CodeUnits } from '../core/canonical-json.ts'
 import type { CanonicalJsonValue } from '../core/canonical-json.ts'
+import { sanitizeCommandEnvironment } from '../work/environment.ts'
 
 import { NORN_AGENT_CONTEXT_ENV } from './completion-extension.ts'
 import type { AgentLaunchRequest, AttachedAgentProcess, VisibleAgentRunner } from './runner.ts'
@@ -125,11 +126,29 @@ export function planAgentPiArgv(
   ]
 }
 
-/** The single environment entry every agent invocation receives. */
+/** The coordinator-owned environment entry every agent invocation receives. */
 export function nornAgentContextEnv(context: CanonicalJsonValue): HerdrEnvEntry {
   return { key: NORN_AGENT_CONTEXT_ENV, value: canonicalJson(context) }
 }
 
+/**
+ * Build the explicit Herdr environment overrides. Configured extras retain
+ * the shared GitHub/push-credential denylist; the coordinator-owned context
+ * is always written last and cannot be replaced by a launch plan.
+ */
+export function herdrAgentEnvironment(
+  context: CanonicalJsonValue,
+  extra: Readonly<Record<string, string>> = {},
+): readonly HerdrEnvEntry[] {
+  const sanitized = sanitizeCommandEnvironment(extra)
+  const entries = Object.entries(sanitized)
+    .filter(([name]) => name !== NORN_AGENT_CONTEXT_ENV)
+    .sort(([left], [right]) => compareUtf16CodeUnits(left, right))
+    .map(([key, value]) => ({ key, value }))
+  return [...entries, nornAgentContextEnv(context)]
+}
+
+/** Budget of one Herdr CLI call; `agent wait` overrides it per call. */
 const HERDR_COMMAND_TIMEOUT_MS = 15_000
 
 type HerdrExec = (plan: HerdrPlan, executionTimeoutMs?: number) => Promise<string>
@@ -184,7 +203,10 @@ export class HerdrAgentRunner implements VisibleAgentRunner {
   async launch(request: AgentLaunchRequest): Promise<AttachedAgentProcess> {
     const plan = planHerdrAgentStart(request.context.invocationId, {
       cwd: request.cwd,
-      env: [nornAgentContextEnv(request.context as unknown as CanonicalJsonValue)],
+      env: herdrAgentEnvironment(
+        request.context as unknown as CanonicalJsonValue,
+        request.env,
+      ),
       argv: request.argv,
     })
     const payload = parseHerdrJson(await this.exec(plan), 'agent start')

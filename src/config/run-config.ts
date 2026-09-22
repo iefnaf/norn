@@ -20,6 +20,7 @@ import { canonicalJsonDigest } from '../core/digest.ts'
 import type { Sha256Digest } from '../core/digest.ts'
 import { blocked, ok } from '../core/outcome.ts'
 import type { Outcome } from '../core/outcome.ts'
+import { isDeniedEnvironmentName } from '../work/environment.ts'
 
 export const RUN_CONFIG_SCHEMA = 'norn-run:v1' as const
 
@@ -36,6 +37,9 @@ export type RunConfigAgentRole = {
   readonly timeoutMs: number
 }
 
+/** Explicit extra environment entries applied to every child agent pane. */
+export type RunConfigAgentEnvironment = Readonly<Record<string, string>>
+
 /** The one resolved Run Config document every invocation recomputes (§8). */
 export type ResolvedRunConfig = {
   readonly schema: typeof RUN_CONFIG_SCHEMA
@@ -45,6 +49,7 @@ export type ResolvedRunConfig = {
   readonly maxWorkRounds: number
   readonly maxPushRetries: number
   readonly concurrency: number
+  readonly agentEnv: RunConfigAgentEnvironment
   readonly worker: RunConfigAgentRole
   readonly reviewer: RunConfigAgentRole
   readonly trustedEvidenceAuthorIds: readonly string[]
@@ -69,8 +74,8 @@ export type RunConfigResolveOutcome = Outcome<RunConfigResolution, RunConfigReso
 /**
  * Every default of the schema, as a fixed constant (§8). No default is ever
  * derived from repository, remote, or environment state; such facts are
- * captured explicitly by `/norn init` instead. `setup` defaults to an empty
- * list, so it has no scalar constant here.
+ * captured explicitly by `/norn init` instead. `setup` and `agentEnv` default
+ * to empty collections, so they have no scalar constants here.
  */
 export const RUN_CONFIG_DEFAULTS = Object.freeze({
   maxWorkRounds: 3,
@@ -95,6 +100,7 @@ const TOP_LEVEL_KEYS = [
   'maxWorkRounds',
   'maxPushRetries',
   'concurrency',
+  'agentEnv',
   'worker',
   'reviewer',
   'trustedEvidenceAuthorIds',
@@ -102,6 +108,16 @@ const TOP_LEVEL_KEYS = [
 
 const COMMAND_KEYS = ['argv', 'timeoutMs'] as const
 const AGENT_ROLE_KEYS = ['model', 'thinking', 'timeoutMs'] as const
+/**
+ * Names `agentEnv` may never set: the coordinator-owned launch context, and
+ * `__proto__`, which JSON parsing exposes as an own property but a plain-object
+ * environment merge would silently drop.
+ */
+const RESERVED_AGENT_ENVIRONMENT_NAMES: ReadonlySet<string> = new Set([
+  'NORN_AGENT_CONTEXT',
+  '__proto__',
+])
+const ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
@@ -209,6 +225,45 @@ function checkOptionalInteger(
   return value
 }
 
+function checkAgentEnvironment(
+  value: unknown,
+  violations: string[],
+): RunConfigAgentEnvironment | undefined {
+  if (value === undefined) return {}
+  if (!isPlainObject(value)) {
+    violations.push('agentEnv must be an object mapping environment names to string values')
+    return undefined
+  }
+
+  let allValid = true
+  const entries: Array<readonly [string, string]> = []
+  for (const name of Object.keys(value).sort(compareUtf16CodeUnits)) {
+    const environmentValue = value[name]
+    if (!ENVIRONMENT_NAME_PATTERN.test(name)) {
+      violations.push(`agentEnv has invalid environment name "${name}"`)
+      allValid = false
+    }
+    if (RESERVED_AGENT_ENVIRONMENT_NAMES.has(name)) {
+      violations.push(`agentEnv cannot set reserved environment name "${name}"`)
+      allValid = false
+    }
+    if (isDeniedEnvironmentName(name)) {
+      violations.push(`agentEnv cannot set denied credential environment name "${name}"`)
+      allValid = false
+    }
+    if (typeof environmentValue !== 'string') {
+      violations.push(`agentEnv.${name} must be a string`)
+      allValid = false
+    } else if (environmentValue.includes('\0')) {
+      violations.push(`agentEnv.${name} must not contain a NUL character`)
+      allValid = false
+    } else {
+      entries.push([name, environmentValue])
+    }
+  }
+  return allValid ? Object.fromEntries(entries) : undefined
+}
+
 function checkAgentRole(
   value: unknown,
   field: 'worker' | 'reviewer',
@@ -305,6 +360,7 @@ export function resolveRunConfig(
   const maxWorkRounds = checkOptionalInteger(input.maxWorkRounds, 'maxWorkRounds', 1, violations)
   const maxPushRetries = checkOptionalInteger(input.maxPushRetries, 'maxPushRetries', 0, violations)
   const concurrency = checkOptionalInteger(input.concurrency, 'concurrency', 1, violations)
+  const agentEnv = checkAgentEnvironment(input.agentEnv, violations)
   const worker = checkAgentRole(input.worker, 'worker', violations)
   const reviewer = checkAgentRole(input.reviewer, 'reviewer', violations)
   const trustedEvidenceAuthorIds = checkTrustedEvidenceAuthorIds(
@@ -334,6 +390,7 @@ export function resolveRunConfig(
     maxWorkRounds === undefined ||
     maxPushRetries === undefined ||
     concurrency === undefined ||
+    agentEnv === undefined ||
     worker === undefined ||
     reviewer === undefined ||
     trustedEvidenceAuthorIds === undefined ||
@@ -350,6 +407,7 @@ export function resolveRunConfig(
     maxWorkRounds,
     maxPushRetries,
     concurrency,
+    agentEnv,
     worker,
     reviewer,
     trustedEvidenceAuthorIds,

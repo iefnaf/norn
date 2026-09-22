@@ -200,6 +200,17 @@ export type RunLaunchPlans = {
   readonly newShipInvocationId: () => string
 }
 
+/** Apply the resolved per-run extras to one trusted launch planner. */
+function withAgentEnvironment<Input>(
+  planner: (input: Input) => AgentLaunchPlan,
+  agentEnv: Readonly<Record<string, string>>,
+): (input: Input) => AgentLaunchPlan {
+  return (input) => {
+    const plan = planner(input)
+    return { ...plan, env: { ...agentEnv, ...(plan.env ?? {}) } }
+  }
+}
+
 /**
  * Everything `/norn run` needs beyond the preflight seams of
  * `CheckMapDeps`: the Visible Agent Runner, the Command runner, the git
@@ -1548,11 +1559,17 @@ async function runOneWork(
       }),
       capacity: ctx.config.concurrency,
     }),
-    planWorker: ctx.deps.launches.planWorkerFor(entry.workAttemptId, ctx.config.worker),
-    planReviewer: ctx.deps.launches.planWorkReviewerFor(entry.workAttemptId, {
-      ...ctx.config.reviewer,
-      family: ctx.reviewerFamily,
-    }),
+    planWorker: withAgentEnvironment(
+      ctx.deps.launches.planWorkerFor(entry.workAttemptId, ctx.config.worker),
+      ctx.config.agentEnv,
+    ),
+    planReviewer: withAgentEnvironment(
+      ctx.deps.launches.planWorkReviewerFor(entry.workAttemptId, {
+        ...ctx.config.reviewer,
+        family: ctx.reviewerFamily,
+      }),
+      ctx.config.agentEnv,
+    ),
     reviewerPlanIsReadOnly: ctx.deps.launches.reviewerPlanIsReadOnly,
     ...(ctx.deps.slotWaitMs === undefined ? {} : { slotWaitMs: ctx.deps.slotWaitMs }),
     ...(ctx.deps.slotPollMs === undefined ? {} : { slotPollMs: ctx.deps.slotPollMs }),
@@ -1773,10 +1790,13 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
     readIssueEvidence: ctx.deps.evidence.loadIssueEvidence,
     runner: ctx.deps.runner,
     commands: ctx.deps.commands,
-    planReviewer: ctx.deps.launches.planShipReviewer({
-      ...ctx.config.reviewer,
-      family: ctx.reviewerFamily,
-    }),
+    planReviewer: withAgentEnvironment(
+      ctx.deps.launches.planShipReviewer({
+        ...ctx.config.reviewer,
+        family: ctx.reviewerFamily,
+      }),
+      ctx.config.agentEnv,
+    ),
     reviewerPlanIsReadOnly: ctx.deps.launches.reviewerPlanIsReadOnly,
     newInvocationId: ctx.deps.launches.newShipInvocationId,
     push: ctx.deps.push,
@@ -2397,10 +2417,13 @@ function completionDepsOf(ctx: RunContext): MapCompletionDeps {
     lock:
       ctx.deps.targetLockFor?.(ctx.repositoryHome, ctx.branch) ??
       osTargetLock(ctx.repositoryHome, ctx.branch),
-    planReviewer: ctx.deps.launches.planMapCompletionReviewer({
-      ...ctx.config.reviewer,
-      family: ctx.reviewerFamily,
-    }),
+    planReviewer: withAgentEnvironment(
+      ctx.deps.launches.planMapCompletionReviewer({
+        ...ctx.config.reviewer,
+        family: ctx.reviewerFamily,
+      }),
+      ctx.config.agentEnv,
+    ),
     reviewerPlanIsReadOnly: ctx.deps.launches.reviewerPlanIsReadOnly,
     ...(ctx.deps.now === undefined ? {} : { now: ctx.deps.now }),
   }

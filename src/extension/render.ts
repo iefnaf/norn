@@ -59,6 +59,7 @@ export function renderInitOutcome(outcome: InitOutcome): string {
       `Worker: ${value.config.worker.model} (thinking ${value.config.worker.thinking})`,
       `Reviewer: ${value.config.reviewer.model} (thinking ${value.config.reviewer.thinking})`,
       `Concurrency: ${value.config.concurrency} · maxWorkRounds: ${value.config.maxWorkRounds} · maxPushRetries: ${value.config.maxPushRetries}`,
+      `Child agent env: ${Object.keys(value.config.agentEnv).join(', ') || 'none'}`,
       `Tests: ${value.config.tests.map((test) => test.argv.join(' ')).join(' ; ')}`,
       `configRevision: ${value.configRevision}`,
     ]

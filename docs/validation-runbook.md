@@ -17,15 +17,18 @@ delivered map and a `passed` RunReport as remote evidence.
   not the coordinator's).
 - Both configured model families reachable **from Herdr pane processes**.
   On this machine `zai-coding-cn` works directly, but `openai-codex`
-  (chatgpt.com) is only reachable through the local proxy. Pi reads a
-  global `httpProxy` setting, so the unblock was:
+  (chatgpt.com) is only reachable through the local proxy. During `/norn
+  init`, add per-run child-agent entries instead of changing Pi's global
+  settings:
 
   ```jsonc
-  // ~/.pi/agent/settings.json
-  { "httpProxy": "http://127.0.0.1:7897" }
+  "agentEnv": {
+    "HTTP_PROXY": "http://127.0.0.1:7897",
+    "HTTPS_PROXY": "http://127.0.0.1:7897"
+  }
   ```
 
-  Without it, every reviewer invocation dies with `fetch failed`, pi
+  Without them, every reviewer invocation dies with `fetch failed`, pi
   abandons the turn after three retries, and the pane sits at a prompt
   until the agent timeout.
 - Pi project trust pre-seeded for the Norn-home prefix, **using the
@@ -93,6 +96,7 @@ For headless validation (what #18 actually drove), use the driver in
 ```sh
 cd <fixture-checkout>
 export PI_CODING_AGENT_DIR=/tmp/norn-e2e/agent   # isolate Norn home
+export NORN_E2E_HTTP_PROXY=http://127.0.0.1:7897 # optional; writes agentEnv
 
 node <norn-checkout>/scripts/e2e-driver.ts init
 node <norn-checkout>/scripts/e2e-driver.ts check https://github.com/iefnaf/taskflow-dag-demo/issues/6
@@ -103,6 +107,7 @@ The explicit choices used for the validated run: target branch `main`;
 setup **empty** (the fixture has zero dependencies — see friction #8);
 tests `npm test` (120 s); Worker `zai-coding-cn/glm-5.3` thinking `low`;
 Reviewer `openai-codex/gpt-5.6-luna` thinking `minimal`; concurrency 2;
+`HTTP_PROXY` and `HTTPS_PROXY` set from `NORN_E2E_HTTP_PROXY` when needed;
 maxPushRetries 2; maxWorkRounds 3 for the first full run, raised to 5 for
 the final run after a `work-rounds-exhausted` park (`NORN_E2E_MAX_WORK_ROUNDS=5`
 in the environment, re-`init` first — a config change requires no active
@@ -163,10 +168,11 @@ Prerequisites):
    `/private/tmp` canonicalization trap: a trust entry for the
    non-canonical path silently does not apply.
 6. **Proxied model providers** — panes inherit the Herdr server's
-   environment; providers only reachable through a local proxy need Pi's
-   global `httpProxy` setting. A failed first submission does not exit
-   the pane; the invocation then waits out its timeout unless the
-   operator notices.
+   environment, so the original run needed Pi's global `httpProxy` setting.
+   Ticket #24 replaced that workaround with Run Config `agentEnv`, passed as
+   explicit `herdr agent start --env` entries. A failed first submission still
+   does not exit the pane; the invocation then waits out its timeout unless
+   the operator notices.
 7. **Parallel-wave path conflicts park a ticket** — two wave-2 members
    each invented `test/index.js`; the second ship replayed onto the
    advanced target, hit an add/add conflict, and parked with

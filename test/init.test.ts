@@ -121,6 +121,9 @@ function scriptedInteraction(
     async chooseInteger(field, suggested) {
       return suggested
     },
+    async chooseAgentEnvironment() {
+      return {}
+    },
     async chooseTrustedEvidenceAuthors() {
       return []
     },
@@ -247,6 +250,12 @@ describe('initRepository: successful setup', () => {
         async chooseTargetBranch() {
           return 'trunk'
         },
+        async chooseAgentEnvironment() {
+          return {
+            NO_PROXY: 'localhost,127.0.0.1',
+            HTTPS_PROXY: 'http://127.0.0.1:7897',
+          }
+        },
         async chooseTrustedEvidenceAuthors() {
           return ['I_zeta', 'I_alpha']
         },
@@ -279,6 +288,10 @@ describe('initRepository: successful setup', () => {
         maxWorkRounds: 5,
         maxPushRetries: 0,
         concurrency: 8,
+        agentEnv: {
+          HTTPS_PROXY: 'http://127.0.0.1:7897',
+          NO_PROXY: 'localhost,127.0.0.1',
+        },
         worker: WORKER,
         reviewer: REVIEWER,
         trustedEvidenceAuthorIds: ['I_actor', 'I_alpha', 'I_zeta'],
@@ -690,6 +703,10 @@ describe('initRepository: operator cancellations', () => {
       override: { async chooseInteger(field, suggested) { return field === 'concurrency' ? undefined : suggested } },
     },
     {
+      name: 'child agent environment',
+      override: { async chooseAgentEnvironment() { return undefined } },
+    },
+    {
       name: 'trusted evidence authors',
       override: { async chooseTrustedEvidenceAuthors() { return undefined } },
     },
@@ -786,6 +803,16 @@ describe('initRepository: invalid choices', () => {
         },
       },
       expect: /non-empty/,
+    },
+    {
+      name: 'GitHub token in child agent environment',
+      override: { async chooseAgentEnvironment() { return { GH_TOKEN: 'secret' } } },
+      expect: /denied credential/,
+    },
+    {
+      name: 'push credential in child agent environment',
+      override: { async chooseAgentEnvironment() { return { SSH_AUTH_SOCK: '/tmp/agent.sock' } } },
+      expect: /denied credential/,
     },
     {
       name: 'empty trusted author id',

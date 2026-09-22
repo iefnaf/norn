@@ -9,6 +9,8 @@
  */
 import type { ChildProcess } from 'node:child_process'
 
+import { sanitizeCommandEnvironment } from '../work/environment.ts'
+
 import {
   isProcessGroupAlive,
   spawnProcessGroup,
@@ -51,7 +53,7 @@ export function childEnvironment(
     const value = process.env[name]
     if (value !== undefined) base[name] = value
   }
-  return { ...base, ...extra }
+  return { ...base, ...sanitizeCommandEnvironment(extra) }
 }
 
 export class LocalProcessAgentRunner implements VisibleAgentRunner {

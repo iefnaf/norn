@@ -65,6 +65,9 @@ export type AgentRoleInput = {
   readonly timeoutMs: number
 }
 
+/** Explicit extra environment entries for every child agent pane. */
+export type AgentEnvironmentInput = Readonly<Record<string, string>>
+
 /**
  * The typed choice contract crossing the extension boundary (§6). Every method
  * receives complete question data and returns the operator's answer as data;
@@ -93,6 +96,8 @@ export type InitInteraction = {
     suggested: number,
     minimum: number,
   ): Promise<number | undefined>
+  /** Extra environment entries applied only to child agent panes. */
+  chooseAgentEnvironment(): Promise<AgentEnvironmentInput | undefined>
   /** Additional trusted evidence author IDs beyond the authenticated actor. */
   chooseTrustedEvidenceAuthors(actor: GitHubActor): Promise<readonly string[] | undefined>
   /** Show existing configuration and the proposed replacement; confirm. */
@@ -186,6 +191,7 @@ type InitAnswers = {
   readonly maxWorkRounds: number
   readonly maxPushRetries: number
   readonly concurrency: number
+  readonly agentEnv: AgentEnvironmentInput
   readonly trustedEvidenceAuthorIds: readonly string[]
 }
 
@@ -400,6 +406,9 @@ async function askInitChoices(
   )
   if (concurrency === undefined) return cancelled('concurrency')
 
+  const agentEnv = await interaction.chooseAgentEnvironment()
+  if (agentEnv === undefined) return cancelled('child agent environment')
+
   const additionalTrustedAuthors = await interaction.chooseTrustedEvidenceAuthors(actor)
   if (additionalTrustedAuthors === undefined) return cancelled('trusted evidence authors')
 
@@ -412,6 +421,7 @@ async function askInitChoices(
     maxWorkRounds,
     maxPushRetries,
     concurrency,
+    agentEnv,
     trustedEvidenceAuthorIds: additionalTrustedAuthors,
   })
 }
@@ -472,6 +482,7 @@ function validateAnswersAndBuildConfig(
     maxWorkRounds: answers.maxWorkRounds,
     maxPushRetries: answers.maxPushRetries,
     concurrency: answers.concurrency,
+    agentEnv: answers.agentEnv,
     worker: answers.worker,
     reviewer: answers.reviewer,
     trustedEvidenceAuthorIds: [...new Set([actor.id, ...additionalAuthors])],

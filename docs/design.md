@@ -381,6 +381,10 @@ A Completed Ticket whose current `ticketRevision` differs from its Delivery Reco
   "maxWorkRounds": 3,
   "maxPushRetries": 2,
   "concurrency": 4,
+  "agentEnv": {
+    "HTTP_PROXY": "http://127.0.0.1:7897",
+    "HTTPS_PROXY": "http://127.0.0.1:7897"
+  },
   "worker": {
     "model": "provider-a/model-x",
     "thinking": "medium",
@@ -407,6 +411,7 @@ Required fields have no default; everything else expands from a fixed constant o
 | `maxWorkRounds` | `3` | integer ≥ 1 |
 | `maxPushRetries` | `2` | integer ≥ 0 |
 | `concurrency` | `4` | integer ≥ 1 |
+| `agentEnv` | `{}` | explicit environment-name/string-value mapping applied to every child agent pane; names are canonicalized and credential-denied names are invalid |
 | `worker` | — (required) | agent role (below) |
 | `reviewer` | — (required) | agent role; different provider family from `worker` |
 | `trustedEvidenceAuthorIds` | — (required) | one or more opaque GitHub node IDs |
@@ -417,8 +422,9 @@ Rules:
 
 - models are exact provider/model IDs; v1 has no fallback list; preflight resolves each against the authenticated model catalog and blocks when it is unavailable;
 - worker and reviewer must resolve to different provider families;
-- commands are argument arrays; `argv[0]` is the executable; no shell, environment, or working directory is configurable — the Command runner supplies the active gate workspace as working directory and a coordinator-defined environment that excludes GitHub tokens and push credentials;
-- secrets are supplied by the Pi extension at invocation and never enter `config.json` or the resolved document;
+- commands are argument arrays; `argv[0]` is the executable; no shell, per-command environment, or working directory is configurable — the Command runner supplies the active gate workspace as working directory and a coordinator-defined environment that excludes GitHub tokens and push credentials;
+- `agentEnv` is the only configurable child environment: its explicit entries are applied to every Worker and Reviewer pane (Work, Ship, and map completion), never to setup/tests or coordinator processes, and are part of `configRevision`; names must match `[A-Za-z_][A-Za-z0-9_]*`, `NORN_AGENT_CONTEXT` is coordinator-owned, and the existing GitHub-token/push-credential denylist rejects entries such as `GH_TOKEN`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`, askpass variables, and injected Git config;
+- `agentEnv` is stored as plain text in `config.json` and is intended for non-secret runtime knobs such as `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY`; resolved invocation secrets remain supplied by the Pi extension and never enter `config.json` or the resolved document;
 - the authenticated GitHub actor must be in `trustedEvidenceAuthorIds`; further entries keep remote evidence written by other trusted accounts valid (§14–15);
 - `tests` must not be empty: §14–15's per-test checks are the machine gate on delivery and completion, and an empty list would make them vacuous;
 - every default is a fixed constant; no default is derived from repository, remote, or environment state — such facts (for example the default branch) are captured explicitly by `/norn init`.

@@ -36,10 +36,11 @@ const FULLY_EXPANDED = {
   maxWorkRounds: 3,
   maxPushRetries: 2,
   concurrency: 4,
+  agentEnv: {},
 }
 
 /** Independently computed: SHA-256 over RFC 8785 canonical JSON of FULLY_EXPANDED. */
-const EXPECTED_FULL_DIGEST = 'sha256:9b65d8cb00d0d6321ca84e54940d20209a60ffd9352669fb54b7d3c4e9e9ce74'
+const EXPECTED_FULL_DIGEST = 'sha256:a37b8a407b04d8a09a7857cf2fb16ecc55453c216ab0084bd9f79990fbbfaff1'
 
 function resolveOrThrow(input: unknown) {
   const outcome = resolveRunConfig(input, resolveFamily)
@@ -49,9 +50,10 @@ function resolveOrThrow(input: unknown) {
 }
 
 describe('resolveRunConfig: defaults expand from fixed constants', () => {
-  it('expands setup, maxWorkRounds, maxPushRetries, and concurrency from RUN_CONFIG_DEFAULTS', () => {
+  it('expands setup, agentEnv, maxWorkRounds, maxPushRetries, and concurrency', () => {
     const { config } = resolveOrThrow(BASE_FILE)
     assert.deepEqual(config.setup, [])
+    assert.deepEqual(config.agentEnv, {})
     assert.equal(config.maxWorkRounds, RUN_CONFIG_DEFAULTS.maxWorkRounds)
     assert.equal(config.maxPushRetries, RUN_CONFIG_DEFAULTS.maxPushRetries)
     assert.equal(config.concurrency, RUN_CONFIG_DEFAULTS.concurrency)
@@ -70,8 +72,16 @@ describe('resolveRunConfig: defaults expand from fixed constants', () => {
       maxWorkRounds: 5,
       maxPushRetries: 0,
       concurrency: 9,
+      agentEnv: {
+        HTTPS_PROXY: 'http://127.0.0.1:7897',
+        NO_PROXY: 'localhost,127.0.0.1',
+      },
     })
     assert.deepEqual(config.setup, [{ argv: ['npm', 'ci'], timeoutMs: 180_000 }])
+    assert.deepEqual(config.agentEnv, {
+      HTTPS_PROXY: 'http://127.0.0.1:7897',
+      NO_PROXY: 'localhost,127.0.0.1',
+    })
     assert.equal(config.maxWorkRounds, 5)
     assert.equal(config.maxPushRetries, 0)
     assert.equal(config.concurrency, 9)
@@ -97,6 +107,25 @@ describe('resolveRunConfig: configRevision determinism', () => {
     const omitted = resolveOrThrow(BASE_FILE)
     const explicit = resolveOrThrow(FULLY_EXPANDED)
     assert.equal(omitted.configRevision, explicit.configRevision)
+  })
+
+  it('canonicalizes agentEnv key order and binds its values into the revision', () => {
+    const first = resolveOrThrow({
+      ...BASE_FILE,
+      agentEnv: { NO_PROXY: 'localhost', HTTPS_PROXY: 'http://127.0.0.1:7897' },
+    })
+    const reordered = resolveOrThrow({
+      ...BASE_FILE,
+      agentEnv: { HTTPS_PROXY: 'http://127.0.0.1:7897', NO_PROXY: 'localhost' },
+    })
+    const changed = resolveOrThrow({
+      ...BASE_FILE,
+      agentEnv: { HTTPS_PROXY: 'http://127.0.0.1:7898', NO_PROXY: 'localhost' },
+    })
+
+    assert.deepEqual(Object.keys(first.config.agentEnv), ['HTTPS_PROXY', 'NO_PROXY'])
+    assert.equal(first.configRevision, reordered.configRevision)
+    assert.notEqual(first.configRevision, changed.configRevision)
   })
 
   it('key order and formatting of the file text do not affect the revision', () => {
@@ -168,6 +197,49 @@ describe('resolveRunConfig: validation blocks violations with invalid-config', (
     { name: 'maxWorkRounds not a number', mutate: (f) => { f.maxWorkRounds = '3' } },
     { name: 'maxPushRetries negative', mutate: (f) => { f.maxPushRetries = -1 } },
     { name: 'concurrency zero', mutate: (f) => { f.concurrency = 0 } },
+    { name: 'agentEnv is not an object', mutate: (f) => { f.agentEnv = ['HTTPS_PROXY'] } },
+    {
+      name: 'agentEnv value is not a string',
+      mutate: (f) => { f.agentEnv = { HTTPS_PROXY: 7897 } },
+      expect: /must be a string/,
+    },
+    {
+      name: 'agentEnv name is not a valid environment name',
+      mutate: (f) => { f.agentEnv = { 'HTTPS-PROXY': 'http://127.0.0.1:7897' } },
+      expect: /invalid environment name/,
+    },
+    {
+      name: 'agentEnv value contains NUL',
+      mutate: (f) => { f.agentEnv = { HTTPS_PROXY: 'http://proxy\0suffix' } },
+      expect: /NUL/,
+    },
+    {
+      name: 'agentEnv tries to replace the coordinator context',
+      mutate: (f) => { f.agentEnv = { NORN_AGENT_CONTEXT: '{}' } },
+      expect: /reserved environment name/,
+    },
+    {
+      name: 'agentEnv tries to set __proto__',
+      mutate: (f) => {
+        f.agentEnv = JSON.parse('{"__proto__":"value"}') as Record<string, string>
+      },
+      expect: /reserved environment name/,
+    },
+    {
+      name: 'agentEnv contains a GitHub token',
+      mutate: (f) => { f.agentEnv = { GITHUB_TOKEN: 'secret' } },
+      expect: /denied credential/,
+    },
+    {
+      name: 'agentEnv contains an enterprise GitHub token',
+      mutate: (f) => { f.agentEnv = { GH_ENTERPRISE_TOKEN: 'secret' } },
+      expect: /denied credential/,
+    },
+    {
+      name: 'agentEnv contains push credential configuration',
+      mutate: (f) => { f.agentEnv = { GIT_CONFIG_VALUE_0: 'credential.helper=store' } },
+      expect: /denied credential/,
+    },
     { name: 'missing worker', mutate: (f) => { delete f.worker } },
     { name: 'worker without model', mutate: (f) => { f.worker = { thinking: 'low', timeoutMs: 1 } } },
     { name: 'worker with empty model', mutate: (f) => { f.worker = { ...(f.worker as object), model: '' } } },
