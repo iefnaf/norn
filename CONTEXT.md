@@ -76,6 +76,18 @@ _Avoid_: Agent handoff, completion claim
 The unmarked, run-bound GitHub comment Norn posts on a Ticket between Work and its push: the worker's sealed PR-style summary plus deterministic gate facts. Its marker line binds it to one sealed candidate, making reposts idempotent.
 _Avoid_: Status update, work log
 
+**Round Comments**:
+The pair of marker-idempotent GitHub comments Norn posts on a Ticket during one Work round: the work handoff comment after the worker settles a verified candidate, and the review verdict comment after the reviewer settles (pass, or iterate with axis-labelled findings). Unmarked prose to every parser and replayable side records — never shared writes or evidence.
+_Avoid_: Progress notes, status comments, work log
+
+**Park Comment**:
+The run-bound GitHub comment Norn posts on a Ticket when it parks for the run: the outcome code and reason, plus reviewer findings when a re-gated ship review did not pass. Reconciled before the run's terminal report persists.
+_Avoid_: Failure note, block comment
+
+**Completion Findings Comment**:
+The run-bound GitHub comment Norn posts on the Map issue when a map-completion gate fails: the gate that failed and its findings — the completion reviewer's verdict, or a bounded command excerpt.
+_Avoid_: Map status comment, completion block
+
 **Comment Language**:
 The Run Config field (`en` or `zh`) selecting the language of every human-readable string Norn renders into issue comments, including the worker's summary instruction.
 _Avoid_: Locale, i18n bundle

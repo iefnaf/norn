@@ -221,6 +221,59 @@ export type AgentLaunchPlan = {
   readonly env?: Readonly<Record<string, string>>
 }
 
+// ---------------------------------------------------------------------------
+// Staged round comments (#40, §10.2)
+// ---------------------------------------------------------------------------
+
+/** One staged round-comment emission: a handoff or a verdict event. */
+export type RoundCommentEvent =
+  | {
+      readonly kind: 'handoff'
+      readonly round: number
+      /** The worker's delivery summary of this round. */
+      readonly summary: string
+      /** The base the candidate was judged against, for the facts line. */
+      readonly base: GitObjectOid
+      /** The independently verified candidate facts of this round. */
+      readonly candidate: {
+        readonly commit: GitObjectOid
+        readonly treeOid: GitObjectOid
+        readonly zeroDelta: boolean
+      }
+    }
+  | {
+      readonly kind: 'verdict'
+      readonly round: number
+      /** The settled reviewer verdict: pass, or iterate with findings. */
+      readonly verdict: SettledVerdict
+    }
+
+/** A settled reviewer verdict a staged comment may render: pass or iterate. */
+export type SettledVerdict = Extract<ReviewerCompletion, { readonly discriminant: 'pass' | 'iterate' }>
+
+/**
+ * The staged round-comment sink (#40): the coordinator renders and posts
+ * the issue comments from these events. Round comments are idempotent,
+ * replayable side records (§9) — the sink must never fail the attempt, and
+ * the gate treats every sink failure (including a throw) as a non-event.
+ */
+export interface RoundCommentSink {
+  emit(event: RoundCommentEvent): Promise<void>
+}
+
+/** Emit one round-comment event; a failing side record never affects the attempt. */
+async function emitRoundComment(deps: RoundGateDeps, event: RoundCommentEvent): Promise<void> {
+  const sink = deps.roundComments
+  if (sink === undefined) return
+  try {
+    await sink.emit(event)
+  } catch {
+    // Side-record semantics (#40): posting progress must never change a
+    // Work outcome. The posting wiring records its own warnings; anything
+    // that still throws is swallowed here by policy.
+  }
+}
+
 export type WorkerLaunchPlanner = (input: WorkerLaunchInput) => AgentLaunchPlan
 export type ReviewerLaunchPlanner = (input: ReviewerLaunchInput) => AgentLaunchPlan
 
@@ -302,7 +355,8 @@ function renderWorkerPrompt(input: WorkerLaunchInput): string {
     'a diff-sketch, shallow file tree, or pseudocode view; "## Evidence" with concrete ' +
     'before/after (the exact test or command output that failed before and passes now); ' +
     '"## Merge Danger" naming a one-way or two-way door and a one-word blast radius. ' +
-    'Norn renders your summary verbatim into the ticket\'s delivered comment; keep prose ' +
+    'Norn renders your summary verbatim into the ticket issue comments — the round handoff ' +
+    'comment of each round and the delivered comment at Ship; keep prose ' +
     'brief and never write the text "norn:record". ' +
     summaryLanguageInstruction(input.commentLanguage) +
     (carried
@@ -480,6 +534,8 @@ export type RoundGateDeps = {
   readonly slotWaitMs?: number
   /** Poll interval while waiting for shared capacity; default 100 ms. */
   readonly slotPollMs?: number
+  /** The staged round-comment sink (#40); absent posts no round comments. */
+  readonly roundComments?: RoundCommentSink
 }
 
 /** The immutable input plus everything the gate needs to execute one attempt. */
@@ -1241,6 +1297,18 @@ async function runRound(
   }
   const zeroDelta = candidate.treeOid === input.target.baseTreeOid
 
+  // --- staged record: the round handoff comment (#40, §10.2) -------------
+
+  // Posted after the candidate verification accepted the handoff, before
+  // the round's setup and test gates — a side record, never a gate.
+  await emitRoundComment(deps, {
+    kind: 'handoff',
+    round: round.round,
+    summary: handoff.summary,
+    base: input.target.baseSha,
+    candidate: { commit: candidate.head, treeOid: candidate.treeOid, zeroDelta },
+  })
+
   // --- setup again at the candidate tree ----------------------------------
 
   const setup = await runGateCommandList(round.gateDeps, {
@@ -1343,6 +1411,17 @@ async function runRound(
       }),
     }
   }
+
+  // --- staged record: the review verdict comment (#40, §10.2) ------------
+
+  // pass and iterate both surface; a reviewer block parks the Ticket and
+  // its park comment carries the code and reason instead.
+  await emitRoundComment(deps, {
+    kind: 'verdict',
+    round: round.round,
+    verdict,
+  })
+
   if (verdict.discriminant === 'iterate') {
     return {
       kind: 'continue',

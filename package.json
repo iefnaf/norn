@@ -1,6 +1,6 @@
 {
   "name": "norn",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Weave the graph. Prove the outcome. A deterministic runner for GitHub Task Maps.",
   "keywords": [
     "pi-package"
