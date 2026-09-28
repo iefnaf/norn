@@ -171,7 +171,7 @@ describe('productionLaunchPlans', () => {
       model: 'provider-a/model-x',
       thinking: 'medium',
       timeoutMs: 1_000,
-    })({ round: 1, previousCandidateCommit: null, feedback: [] })
+    })({ round: 1, previousCandidateCommit: null, feedback: [], commentLanguage: 'en' })
     assert.match(workerPlan.argv.join(' '), /pi --model provider-a\/model-x/)
     assert.match(workerPlan.argv.join(' '), /--session-id wa-w1-t1-worker-r1-pi/)
 

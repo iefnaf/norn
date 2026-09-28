@@ -101,4 +101,5 @@ export const defaultWorkerCandidate = {
   discriminant: 'candidate',
   claimedCommit: `sha1:${'a'.repeat(40)}`,
   claimedTreeOid: `sha1:${'b'.repeat(40)}`,
+  summary: 'fake worker delivery summary',
 } as const

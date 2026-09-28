@@ -61,7 +61,7 @@ import type { CanonicalJsonValue } from '../core/canonical-json.ts'
 import type { GitHubIssueWriter } from '../adapters/github-gateway.ts'
 import { evaluateDeliveryEvidence } from '../evidence/delivery.ts'
 import type { DeliveryEvidenceFinding } from '../evidence/delivery.ts'
-import { formatRecordEnvelope, parseRecordEnvelope } from '../evidence/envelope.ts'
+import { parseRecordEnvelope } from '../evidence/envelope.ts'
 import type {
   EvidenceIssueLocator,
   IssueEvidenceReader,
@@ -70,6 +70,8 @@ import type {
 import { classifyMapChange } from '../map/map-extension.ts'
 import type { MapRef, TaskMapSnapshot } from '../map/snapshot.ts'
 import type { StableSnapshotOutcome } from '../map/stable-read.ts'
+import type { CommentLanguage } from '../config/run-config.ts'
+import { renderMergedRecordComment } from './render-comments.ts'
 import { acceptedSnapshotFrom, snapshotMapPayload } from './reconcile.ts'
 import type { ShipExtensionAdoption, ShipFacts } from './reconcile.ts'
 import type {
@@ -181,6 +183,8 @@ export type ShipCloseParams = {
   readonly trustedEvidenceAuthorIds: readonly string[]
   /** Whether this run already shipped an earlier Ticket (§11.3). */
   readonly alreadyShipped: boolean
+  /** The language of generated comment prose (§8). */
+  readonly commentLanguage: CommentLanguage
 }
 
 /** The production workspace cleanup: idempotent recursive deletion (§13.2). */
@@ -730,7 +734,12 @@ async function writeOrReuseRecord(
 
   const written = await deps.writer.writeIssueComment(
     locatorOf(params.ticket),
-    formatRecordEnvelope(sealedText),
+    renderMergedRecordComment({
+      record: sealed,
+      canonicalText: sealedText,
+      zeroDelta: ctx.current.checkpoint.zeroDelta,
+      language: params.commentLanguage,
+    }),
   )
   if (written.kind !== 'ok') {
     return {

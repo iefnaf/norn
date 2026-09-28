@@ -37,10 +37,11 @@ const FULLY_EXPANDED = {
   maxPushRetries: 2,
   concurrency: 4,
   agentEnv: {},
+  commentLanguage: 'en',
 }
 
 /** Independently computed: SHA-256 over RFC 8785 canonical JSON of FULLY_EXPANDED. */
-const EXPECTED_FULL_DIGEST = 'sha256:a37b8a407b04d8a09a7857cf2fb16ecc55453c216ab0084bd9f79990fbbfaff1'
+const EXPECTED_FULL_DIGEST = 'sha256:efae75bbf17fdfc20b5d4a7cdbfcd724bffc0590400b3dc8aa427e17bfbaceae'
 
 function resolveOrThrow(input: unknown) {
   const outcome = resolveRunConfig(input, resolveFamily)
@@ -62,7 +63,10 @@ describe('resolveRunConfig: defaults expand from fixed constants', () => {
   })
 
   it('the defaults are the §8 constants, not derived from anywhere', () => {
-    assert.deepEqual({ ...RUN_CONFIG_DEFAULTS }, { maxWorkRounds: 3, maxPushRetries: 2, concurrency: 4 })
+    assert.deepEqual(
+      { ...RUN_CONFIG_DEFAULTS },
+      { maxWorkRounds: 3, maxPushRetries: 2, concurrency: 4, commentLanguage: 'en' },
+    )
   })
 
   it('keeps explicit values instead of defaults', () => {
@@ -273,6 +277,22 @@ describe('resolveRunConfig: validation blocks violations with invalid-config', (
       }
     })
   }
+
+  it('expands commentLanguage from the default and accepts exactly en or zh', () => {
+    const { config } = resolveOrThrow(BASE_FILE)
+    assert.equal(config.commentLanguage, 'en')
+    assert.equal(resolveOrThrow({ ...BASE_FILE, commentLanguage: 'zh' }).config.commentLanguage, 'zh')
+    for (const bad of ['fr', 'EN', 1, null, [], {}, '']) {
+      const outcome = resolveRunConfig({ ...BASE_FILE, commentLanguage: bad })
+      assert.equal(outcome.kind, 'blocked', JSON.stringify(bad))
+    }
+  })
+
+  it('binds commentLanguage into the revision', () => {
+    const en = resolveOrThrow({ ...BASE_FILE, commentLanguage: 'en' })
+    const zh = resolveOrThrow({ ...BASE_FILE, commentLanguage: 'zh' })
+    assert.notEqual(en.configRevision, zh.configRevision)
+  })
 
   it('blocks non-object documents', () => {
     for (const input of [null, [], 'norn-run:v1', 42, true]) {

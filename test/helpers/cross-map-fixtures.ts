@@ -355,12 +355,12 @@ export class GatedRunner implements VisibleAgentRunner {
     const spec = this.behaviorOf(world, issueId)
     if (spec.zeroDelta) {
       const oids = readWorkspaceOids(request.cwd)
-      return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+      return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: 'zero-delta summary' }
     }
     const round = request.context.work?.round ?? 1
     const name = spec.file ?? `work-${issueId}-r${round}.txt`
     const oids = commitInWorkspace(request.cwd, name, `work ${issueId} round ${round}\n`)
-    return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+    return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: `work summary round ${round}` }
   }
 }
 

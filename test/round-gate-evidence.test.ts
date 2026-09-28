@@ -275,7 +275,7 @@ describe('the read-only reviewer launch policy', () => {
       { kind: 'review' as const, round: 1, feedback: 'tighten' },
     ]
     const withinRun = piWorkerLaunch(
-      { round: 2, previousCandidateCommit: 'sha1:' + 'a'.repeat(40), feedback },
+      { round: 2, previousCandidateCommit: 'sha1:' + 'a'.repeat(40), feedback, commentLanguage: 'en' },
       { model: 'provider-a/model-x', thinking: 'medium', extensionPath: '/norn/extension.ts', piSessionId: 'pi-2' },
     )
     const withinRunPrompt = withinRun.argv.at(-1)!.toString()
@@ -287,6 +287,7 @@ describe('the read-only reviewer launch policy', () => {
       {
         round: 1,
         previousCandidateCommit: null,
+        commentLanguage: 'zh',
         feedback: [
           ...feedback,
           { kind: 'terminal', outcome: 'blocked', code: 'work-rounds-exhausted', reason: 'three cold rounds' },

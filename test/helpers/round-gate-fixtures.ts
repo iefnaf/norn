@@ -243,7 +243,7 @@ function failNoReviewerInput(): ReviewerLaunchInput {
 export function committingWorker(): WorkerScript {
   return ({ workspacePath, round }) => {
     const oids = commitInWorkspace(workspacePath, `work-${round}.txt`, `round ${round}\n`)
-    return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+    return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: `committing worker round ${round}` }
   }
 }
 
@@ -253,6 +253,7 @@ export function zeroDeltaWorker(): WorkerScript {
     discriminant: 'candidate',
     claimedCommit: tools.baseOids().commit,
     claimedTreeOid: tools.baseOids().treeOid,
+    summary: 'zero-delta worker summary',
   })
 }
 
@@ -504,6 +505,7 @@ export type Harness = {
 
 export type HarnessOptions = {
   readonly label: string
+  readonly commentLanguage?: 'en' | 'zh'
   readonly worker?: WorkerScript
   readonly reviewer?: ReviewerScript
   readonly workerMode?: AgentMode
@@ -572,6 +574,7 @@ export function makeHarness(options: HarnessOptions): Harness {
   const params: WorkAttemptParams = {
     input,
     workAttemptId: WORK_ATTEMPT_ID,
+    commentLanguage: options.commentLanguage ?? 'en',
     ...(options.carriedFeedback === undefined ? {} : { carriedFeedback: options.carriedFeedback }),
     map: { githubHost: HOST, repositoryId: REPOSITORY_ID, issueId: MAP_ISSUE_ID },
     repositoryRoot: repo.root,

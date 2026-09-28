@@ -397,8 +397,9 @@ describe('ship order — issue-number order, restart, and later extensions', () 
           // After ticket #1's close, every later record-comment write fails
           // with an unknown result: a recoverable interruption after a
           // confirmed shared write (§13.2). The failure precedes the close,
-          // so the issue stays OPEN without a record — resumable preflight.
-          when: (observed) => observed.closeCalls >= 1,
+          // Arm after #2's delivered comment (comment #3): the push must
+          // verify before the record write turns unknown — resumable preflight.
+          when: (observed) => observed.commentCalls >= 3,
           apply: (store) => {
             store.script.writeCommentFails = 'scripted unknown comment result'
           },
@@ -1220,6 +1221,43 @@ describe('resume reconciliation', () => {
 
       const state = harness.runState()!
       assert.equal(state.activeProcesses[0]?.state, 'settled')
+    } finally {
+      harness.cleanup()
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Human-readable delivery comments (§10.2, §11.3 — ticket #35)
+// ---------------------------------------------------------------------------
+
+describe('human-readable delivery comments', () => {
+  it('posts the delivered comment before the merged record comment on a passing run', async () => {
+    const harness = await makeRunHarness({ label: 'delivery-comments', members: [ticketA()] })
+    try {
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+
+      const comments = harness.store.issues.get(1)!.comments
+      assert.equal(comments.length, 2)
+
+      // The delivered comment: run-bound identity marker, the fake worker's
+      // sealed summary verbatim, gate facts, and the not-yet-merged note.
+      const delivered = comments[0]!.body
+      assert.match(delivered, /^<!-- norn:delivered run-1#1@[0-9a-f]{40} -->$/m)
+      assert.match(delivered, /Delivered on branch `norn\/run-1\/1\/wa-/)
+      assert.match(delivered, /work summary round 1/)
+      assert.match(delivered, /\*\*Gate\*\*: /)
+      assert.match(delivered, /Not merged to `main` yet\./)
+
+      // The merged record comment: merge headline plus the folded machine
+      // envelope carrying the sealed record, exactly once each.
+      const merged = comments[1]!.body
+      assert.match(merged, /^Merged to `main` \(`/m)
+      assert.match(merged, /^<details>$/m)
+      assert.equal(merged.match(/```json/g)?.length, 1)
+      assert.match(merged, /<!-- norn:record -->/)
+      assert.equal(harness.store.issues.get(1)!.state, 'CLOSED')
     } finally {
       harness.cleanup()
     }

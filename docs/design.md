@@ -415,6 +415,7 @@ Required fields have no default; everything else expands from a fixed constant o
 | `worker` | — (required) | agent role (below) |
 | `reviewer` | — (required) | agent role; different provider family from `worker` |
 | `trustedEvidenceAuthorIds` | — (required) | one or more opaque GitHub node IDs |
+| `commentLanguage` | `en` | the language of Norn's human-readable issue comments: exactly `en` or `zh`; it drives the worker's summary-language instruction and every generated comment string (§10.2, §11.3) |
 
 A command entry is `{ argv, timeoutMs }` with non-empty `argv` and `timeoutMs > 0`. An agent role is `{ model, thinking, timeoutMs }` where `timeoutMs > 0` is the wall-clock budget of one launched agent invocation.
 
@@ -600,7 +601,7 @@ Configured setup and test commands execute sequentially in Run Config order and 
 
 A protocol-valid command passes only when it exits with code zero before timeout. A non-zero exit or a timeout whose process group was successfully terminated is structured feedback, not machine evidence. Initial-setup feedback is supplied to the first worker; candidate-setup or test feedback advances to the next worker round when one remains. Failure to start or settle a command, or any unexpected repository mutation, is a protocol error. Ignored dependency and cache directories may remain, but they are not part of evidence.
 
-A typed worker handoff is either `candidate`, carrying claimed commit and tree OIDs, or `block`, carrying a closed machine code and operator-facing reason. Only the discriminant and code control orchestration.
+A typed worker handoff is either `candidate`, carrying claimed commit and tree OIDs plus a human-readable delivery `summary`, or `block`, carrying a closed machine code and operator-facing reason. Only the discriminant and code control orchestration. The `summary` is PR-body markdown — a "Summary" view (diff-sketch, shallow file tree, or pseudocode), "Evidence" (concrete before/after), and "Merge Danger" (one-way or two-way door, blast radius) — written in the configured `commentLanguage`. It is validated as a non-empty string of at most 16,000 characters that must never contain the text `norn:record`, so a summary can never imitate the §14 machine-comment marker. Norn seals the summary verbatim into the `ShippableChange` and renders it into the ticket's delivered comment; seals produced before the field existed load fine and render a facts-only comment.
 
 After a worker invocation settles, Norn accepts a `candidate` only when:
 
@@ -758,6 +759,8 @@ A Compatible Map Extension observed after the push is persisted and adopted befo
 Before issuing close, Norn inspects the timeline after the selected Delivery Record comment. If a close followed by a reopen occurred, that operator-visible state change stops this Ship instead of being silently overwritten. If the Ticket is already closed with no later reopen and the record predates that close, Norn skips the close call and proceeds to validation. A close response is not completion evidence by itself. After comment and close, Norn repeats a stable Map read, re-reads the Ticket, blockers, current closing event, and remote target, and evaluates every predicate in §14. A Compatible Map Extension is adopted before completion is persisted. If the post-close read finds stale specification, membership, blocker, chronology, or target facts that would have prevented this Ship, Norn reopens the Ticket if necessary. A confirmed repair ends the run as `blocked(changed-input)` with the partial shared writes recorded; an unknown close or reopen result is a recoverable run-scoped `error`. Only a successfully persisted post-close validation makes the Ticket a Completed Ticket. Later changes are handled by §14's normal Completed Ticket validation.
 
 A cleanup failure is a warning and cannot undo a verified Completed Ticket.
+
+Before its push, each Ticket's Ship posts the **delivered comment**: the worker's sealed summary verbatim, followed by deterministic gate facts (branch, candidate commit, ordered tests, worker and reviewer models) and a not-yet-merged note, rendered in the configured `commentLanguage`. The comment is unmarked prose the §14 envelope grammar ignores; a first line `<!-- norn:delivered <runId>#<ticketNumber>@<candidateHex> -->` binds it to one sealed candidate, and Ship scans for that line before writing, so an interrupted and resumed invocation never duplicates it. Finding this run's delivered comment remotely is itself a proven shared write and restores exact shared-write accounting on resume; an unknown write result is a recoverable run-scoped error. The Delivery Record comment written during close is the **merged record comment**: a merge (or zero-delta) headline plus the machine envelope folded inside a `<details>` element. The envelope bytes inside are exactly §14's, so every predicate treats it exactly like the bare envelope; the surrounding prose is Norn-generated, never agent prose, and contains no additional machine block.
 
 ## 12. Waves and map execution
 
@@ -1042,7 +1045,7 @@ A CLOSED Map with no matching local checkpoint follows normal preflight and is n
 
 ## 14. Delivery evidence
 
-Norn machine comments use one parsing envelope: RFC 8785 canonical JSON in the only fenced `json` block immediately following the exact marker `<!-- norn:record -->`. Human-readable prose may appear outside that envelope. Parsers ignore unmarked prose, reject a marked comment with a missing, malformed, or additional machine block, and follow every comment and timeline pagination cursor before deciding uniqueness or chronology.
+Norn machine comments use one parsing envelope: RFC 8785 canonical JSON in the only fenced `json` block immediately following the exact marker `<!-- norn:record -->`. Human-readable prose may appear outside that envelope. Parsers ignore unmarked prose, reject a marked comment with a missing, malformed, or additional machine block, and follow every comment and timeline pagination cursor before deciding uniqueness or chronology. Norn itself writes two kinds of human-readable prose under this rule (§10.2, §11.3): the unmarked, run-bound delivered comment and the merge headline plus `<details>` wrapper around the machine envelope. Worker summaries are validated to never contain the marker, so no Norn-authored comment can imitate or poison the envelope; duplicate selection and chronology compare the canonical machine bytes only, so the prose never affects any predicate.
 
 Remote evidence seals the gate that applied when it was produced:
 

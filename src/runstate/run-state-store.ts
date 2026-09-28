@@ -25,7 +25,7 @@ import { isCanonicalJsonValue } from '../core/canonical-json.ts'
 import type { CanonicalJsonValue } from '../core/canonical-json.ts'
 import { canonicalJsonDigest, isSha256Digest } from '../core/digest.ts'
 import type { Sha256Digest } from '../core/digest.ts'
-import { GIT_OBJECT_OID_PATTERN, isGitObjectOid } from '../agents/completion.ts'
+import { GIT_OBJECT_OID_PATTERN, isGitObjectOid, WORKER_SUMMARY_FORBIDDEN, WORKER_SUMMARY_MAX_LENGTH } from '../agents/completion.ts'
 import { MAP_REVISION_SCHEMA } from '../core/revision.ts'
 import { mapsDir, runStatePath } from '../config/paths.ts'
 import { writeDocumentAtomic } from './atomic-write.ts'
@@ -541,6 +541,8 @@ function checkShippableChange(value: unknown, where: string, violations: string[
     ],
     where,
     violations,
+    // §10.2: seals produced before the summary field existed load fine.
+    { allowOptional: ['summary'] },
   )
   checkStableIssueRef(value.ticket, 'ticket', `${where}.ticket`, violations)
   checkDigest(value.mapRevision, `${where}.mapRevision`, violations)
@@ -551,6 +553,15 @@ function checkShippableChange(value: unknown, where: string, violations: string[
   checkWorkspaceRef(value.workspace, `${where}.workspace`, violations)
   checkTestEvidenceList(value.tests, `${where}.tests`, violations, { phases: ['work'] })
   checkReviewEvidence(value.review, `${where}.review`, violations)
+  if (value.summary !== undefined) {
+    if (typeof value.summary !== 'string' || value.summary.length === 0) {
+      violations.push(`${where}.summary must be a non-empty markdown string when present`)
+    } else if (value.summary.length > WORKER_SUMMARY_MAX_LENGTH) {
+      violations.push(`${where}.summary must not exceed ${WORKER_SUMMARY_MAX_LENGTH} characters`)
+    } else if (value.summary.includes(WORKER_SUMMARY_FORBIDDEN)) {
+      violations.push(`${where}.summary must not contain "${WORKER_SUMMARY_FORBIDDEN}"`)
+    }
+  }
   if (isPlainObject(value.review) && isPlainObject(value.workspace)) {
     if (value.review.phase === 'work') {
       bindReviewToChange(value, where, violations)
