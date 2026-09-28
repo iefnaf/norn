@@ -47,6 +47,7 @@ import {
   SUGGESTED_REVIEWER_TIMEOUT_MS,
   SUGGESTED_WORKER_TIMEOUT_MS,
 } from '../src/config/run-config.ts'
+import type { CommentLanguage } from '../src/config/run-config.ts'
 import { parseIssueUrl } from '../src/map/issue-url.ts'
 import { stableReadTaskMap } from '../src/map/stable-read.ts'
 import { executeCheckCommand } from '../src/extension/check-command.ts'
@@ -60,6 +61,10 @@ import type { AgentRoleInput, CommandSpecInput, InitInteraction } from '../src/r
 
 const e2eProxy = process.env.NORN_E2E_HTTP_PROXY?.trim()
 const e2eNoProxy = process.env.NORN_E2E_NO_PROXY?.trim()
+const e2eCommentLanguage = process.env.NORN_E2E_COMMENT_LANGUAGE?.trim() ?? 'en'
+if (e2eCommentLanguage !== 'en' && e2eCommentLanguage !== 'zh') {
+  throw new Error(`NORN_E2E_COMMENT_LANGUAGE must be en or zh, got ${e2eCommentLanguage}`)
+}
 
 const CHOICES = {
   targetBranch: 'main',
@@ -89,6 +94,7 @@ const CHOICES = {
   maxWorkRounds: Number(process.env.NORN_E2E_MAX_WORK_ROUNDS ?? 3),
   maxPushRetries: 2,
   concurrency: 2,
+  commentLanguage: e2eCommentLanguage satisfies CommentLanguage,
   agentEnv: {
     ...(e2eProxy === undefined || e2eProxy === ''
       ? {}
@@ -187,6 +193,10 @@ function scriptedInteraction(): InitInteraction {
     chooseTrustedEvidenceAuthors(actor) {
       console.log(`trusted evidence authors: just the authenticated actor ${actor.login}`)
       return Promise.resolve([])
+    },
+    chooseCommentLanguage(suggested) {
+      console.log(`comment language: ${CHOICES.commentLanguage} (suggested ${suggested})`)
+      return Promise.resolve(CHOICES.commentLanguage)
     },
     confirmReplaceConfig(_existing, proposed) {
       console.log('replacing existing configuration with:')
