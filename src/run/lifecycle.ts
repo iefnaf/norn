@@ -1923,7 +1923,7 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
     actorId: ctx.actorId,
   }
 
-  // --- the delivered comment: the worker's summary, before any push (§11.3) --
+  // --- the delivered comment: facts only, before any push (§11.3, #40) ----
 
   const delivered = await postDeliveredComment(ctx, change)
   if (delivered !== undefined) {

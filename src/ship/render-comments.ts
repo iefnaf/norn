@@ -6,11 +6,14 @@
  * Config `commentLanguage` (§8):
  *
  * - the **delivered comment**, posted once per sealed `ShippableChange`
- *   before the push: the worker's PR-style summary verbatim, followed by
- *   deterministic gate facts. It is an unmarked comment — the §14 envelope
- *   grammar ignores it entirely — made replay-idempotent by a
- *   `<!-- norn:delivered … -->` identity line the Ship stage scans for
- *   before writing;
+ *   before the push: deterministic gate facts — branch, candidate commit,
+ *   ordered tests, worker and reviewer models — plus the not-yet-merged
+ *   note. Since #40's staged record it carries no worker summary: the
+ *   round handoff comment (`src/run/progress-comments.ts`) owns the
+ *   summary, so a one-round Ticket reads without repetition. It is an
+ *   unmarked comment — the §14 envelope grammar ignores it entirely — made
+ *   replay-idempotent by a `<!-- norn:delivered … -->` identity line the
+ *   Ship stage scans for before writing;
  * - the **merged record comment**, what the close stage writes around the
  *   sealed Delivery Record: a merge headline plus the machine envelope
  *   folded into `<details>` (§14 prose-outside-the-envelope). The machine
@@ -88,22 +91,21 @@ export type DeliveredCommentInput = {
 }
 
 /**
- * Render the delivered comment: identity marker, delivery headline, the
- * worker's sealed summary verbatim (when the seal carries one), gate facts,
- * and the not-yet-merged note. Legacy seals without a summary render the
- * facts-only shape.
+ * Render the delivered comment: identity marker, delivery headline, gate
+ * facts, and the not-yet-merged note — facts only. The worker's sealed
+ * summary is not rendered here: the round handoff comment of #40 already
+ * carried it at the moment the worker settled, so repeating it at Ship
+ * would duplicate the prose on every one-round Ticket.
  */
 export function renderDeliveredComment(input: DeliveredCommentInput): string {
   const { change, gate, language, runId, targetBranch } = input
   const marker = deliveredMarker(runId, change.ticket.number, change.candidateCommit)
   const branch = change.workspace.kind === 'ticket' ? change.workspace.branch : '(detached)'
-  const summary = change.summary === undefined ? '' : `${change.summary.trim()}\n\n`
   const facts = `${gateFactsLine(change, gate)}\n${baseToCandidateLine(change, language)}\n`
   if (language === 'zh') {
     return (
       `${marker}\n` +
       `已在分支 \`${branch}\` 完成实现（候选提交 \`${shortOid(change.candidateCommit)}\`）。\n\n` +
-      `${summary}` +
       `---\n\n` +
       `${facts}` +
       `尚未合并进 \`${targetBranch}\`。\n`
@@ -112,7 +114,6 @@ export function renderDeliveredComment(input: DeliveredCommentInput): string {
   return (
     `${marker}\n` +
     `Delivered on branch \`${branch}\` (commit \`${shortOid(change.candidateCommit)}\`).\n\n` +
-    `${summary}` +
     `---\n\n` +
     `${facts}` +
     `Not merged to \`${targetBranch}\` yet.\n`

@@ -121,7 +121,7 @@ function record(zeroDelta: boolean): DeliveryRecordV1 {
 }
 
 describe('renderDeliveredComment', () => {
-  it('renders the marker, the worker summary verbatim, gate facts, and the not-merged note', () => {
+  it('renders the marker, gate facts, and the not-merged note — facts only, no summary repetition', () => {
     const body = renderDeliveredComment({
       runId: 'run-x1',
       change: change(),
@@ -134,7 +134,9 @@ describe('renderDeliveredComment', () => {
       '<!-- norn:delivered run-x1#7@' + '4'.repeat(40) + ' -->',
     )
     assert.match(body, /Delivered on branch `norn\/run-x1\/7\/wa-1` \(commit `4444444`\)/)
-    assert.match(body, /## Summary\n\nthe shape of the change/)
+    // The sealed summary stays sealed: the round handoff comment owns it.
+    assert.doesNotMatch(body, /## Summary/)
+    assert.doesNotMatch(body, /before\/after/)
     assert.match(body, /\*\*Gate\*\*: `npm test` ✅ exit 0/)
     assert.match(body, /worker `zai-coding-cn\/glm-5.3` \(low\)/)
     assert.match(body, /reviewer `openai-codex\/gpt-5.6-luna` \(minimal\) → \*\*pass\*\*/)
@@ -150,20 +152,8 @@ describe('renderDeliveredComment', () => {
       language: 'zh',
     })
     assert.match(body, /已在分支 `norn\/run-x1\/7\/wa-1` 完成实现（候选提交 `4444444`）。/)
-    assert.match(body, /尚未合并进 `main`。/)
-  })
-
-  it('falls back to a facts-only shape for legacy seals without a summary', () => {
-    const body = renderDeliveredComment({
-      runId: 'run-x1',
-      change: change({ summary: undefined }),
-      gate: GATE,
-      targetBranch: 'main',
-      language: 'en',
-    })
     assert.doesNotMatch(body, /## Summary/)
-    assert.match(body, /\*\*Gate\*\*: `npm test`/)
-    assert.match(body, /Not merged to `main` yet\./)
+    assert.match(body, /尚未合并进 `main`。/)
   })
 
   it('is an unmarked comment the §14 envelope grammar ignores', () => {

@@ -355,8 +355,7 @@ function renderWorkerPrompt(input: WorkerLaunchInput): string {
     'a diff-sketch, shallow file tree, or pseudocode view; "## Evidence" with concrete ' +
     'before/after (the exact test or command output that failed before and passes now); ' +
     '"## Merge Danger" naming a one-way or two-way door and a one-word blast radius. ' +
-    'Norn renders your summary verbatim into the ticket issue comments — the round handoff ' +
-    'comment of each round and the delivered comment at Ship; keep prose ' +
+    'Norn renders your summary verbatim into the ticket\'s round handoff comment of each round; keep prose ' +
     'brief and never write the text "norn:record". ' +
     summaryLanguageInstruction(input.commentLanguage) +
     (carried
