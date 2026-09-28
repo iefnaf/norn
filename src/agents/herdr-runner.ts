@@ -136,15 +136,28 @@ export function herdrAgentName(invocationId: string): string {
  * a fleet of concurrent agents readable — splitting the coordinator's pane
  * would crowd it with splits instead. `--no-focus` keeps the operator where
  * they are.
+ *
+ * When `workspace` is set the tab is pinned to that Herdr workspace. Without
+ * `--workspace`, Herdr 0.9 places new tabs in the operator's currently
+ * focused workspace, so an operator who switches workspaces mid-run scatters
+ * agent tabs across them; `--workspace` keeps every invocation of one run in
+ * the workspace that run was launched from. It is omitted when Norn runs
+ * outside Herdr and no workspace identity exists.
  */
 export function planHerdrTabCreate(
   options: {
     readonly cwd: string
     readonly label: string
     readonly env: readonly HerdrEnvEntry[]
+    /** Herdr workspace identity inherited by the coordinator, if any. */
+    readonly workspace?: string
   },
 ): HerdrPlan {
-  const args = ['tab', 'create', '--cwd', options.cwd, '--label', options.label]
+  const args = ['tab', 'create']
+  if (options.workspace !== undefined) {
+    args.push('--workspace', options.workspace)
+  }
+  args.push('--cwd', options.cwd, '--label', options.label)
   for (const entry of options.env) {
     args.push('--env', `${entry.key}=${entry.value}`)
   }
@@ -451,6 +464,9 @@ export class HerdrAgentRunner implements VisibleAgentRunner {
    */
   private readonly startReadyBudgetMs: number
   private readonly startReadyIntervalMs: number
+  /** Herdr workspace that agent tabs are pinned to, when Norn itself runs
+   * inside a Herdr workspace; undefined leaves tab placement to Herdr. */
+  private readonly workspaceId: string | undefined
 
   constructor(
     exec: HerdrExec = execHerdr,
@@ -458,12 +474,14 @@ export class HerdrAgentRunner implements VisibleAgentRunner {
     blockedPollIntervalMs = 1_000,
     startReadyBudgetMs = HERDR_START_READY_BUDGET_MS,
     startReadyIntervalMs = HERDR_START_READY_INTERVAL_MS,
+    workspaceId: string | undefined = undefined,
   ) {
     this.exec = exec
     this.exitConfirmTimeoutMs = exitConfirmTimeoutMs
     this.blockedPollIntervalMs = blockedPollIntervalMs
     this.startReadyBudgetMs = startReadyBudgetMs
     this.startReadyIntervalMs = startReadyIntervalMs
+    this.workspaceId = workspaceId
   }
 
   /**
@@ -546,6 +564,7 @@ export class HerdrAgentRunner implements VisibleAgentRunner {
         planHerdrTabCreate({
           cwd: request.cwd,
           label: agentName,
+          workspace: this.workspaceId,
           env: herdrAgentEnvironment(
             request.context as unknown as CanonicalJsonValue,
             request.env,
