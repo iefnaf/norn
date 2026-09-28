@@ -20,8 +20,13 @@ import type { CanonicalJsonValue } from '../src/core/canonical-json.ts'
 import { canonicalJsonDigest } from '../src/core/digest.ts'
 import { resolveRunConfigText } from '../src/config/run-config.ts'
 import { computeDeliveryId } from '../src/evidence/delivery.ts'
-import { computeCompletionId, mapCompletionRecordProblems } from '../src/run/completion.ts'
-import { MAP_COMPLETION_RECORD_SCHEMA } from '../src/run/completion.ts'
+import {
+  MAP_COMPLETION_RECORD_SCHEMA,
+  computeCompletionId,
+  mapCompletionRecordProblems,
+  piMapCompletionReviewerLaunch,
+} from '../src/run/completion.ts'
+import type { MapCompletionReviewerLaunchInput } from '../src/run/completion.ts'
 import { formatRecordEnvelope, parseRecordEnvelope } from '../src/evidence/envelope.ts'
 import type { IssueTimelineEvent } from '../src/evidence/read.ts'
 import { runMap } from '../src/run/lifecycle.ts'
@@ -33,6 +38,7 @@ import type {
   RunState,
   TestEvidence,
 } from '../src/runstate/types.ts'
+import { assertTwoAxisReviewerProtocol } from './helpers/agent-prompt-fixtures.ts'
 import { commandFailure } from './helpers/ship-fixtures.ts'
 import { recordingLock } from './helpers/push-fixtures.ts'
 import { advanceRemoteTarget } from './helpers/push-fixtures.ts'
@@ -70,6 +76,51 @@ const ticket9 = (overrides: Partial<MemberSpec> = {}): MemberSpec => ({
   issueId: 'I_9',
   number: 9,
   ...overrides,
+})
+
+// ---------------------------------------------------------------------------
+// The Task Map completion Reviewer prompt (§15)
+// ---------------------------------------------------------------------------
+
+describe('the Task Map completion Reviewer prompt', () => {
+  it('applies the shared two-axis protocol to the complete normalized map', () => {
+    const input: MapCompletionReviewerLaunchInput = {
+      invocationId: 'run-1-map-completion-reviewer',
+      map: {
+        title: 'Map',
+        body: 'Shared intent',
+        mapRevision: 'sha256:' + '1'.repeat(64),
+        members: [
+          {
+            issueId: 'I_A',
+            number: 1,
+            title: 'Ticket A',
+            body: 'Requirement A',
+            ticketRevision: 'sha256:' + '2'.repeat(64),
+            blockedBy: [],
+          },
+        ],
+      },
+      target: {
+        branch: 'main',
+        completionSha: 'sha1:' + '3'.repeat(40),
+        treeOid: 'sha1:' + '4'.repeat(40),
+      },
+      tests: [],
+      testOutput: [],
+    }
+    const plan = piMapCompletionReviewerLaunch(input, {
+      model: 'provider-b/model-y',
+      thinking: 'high',
+      extensionPath: '/norn/extension.ts',
+      piSessionId: 'map-completion-review-pi',
+    })
+    const prompt = plan.argv.at(-1)!
+
+    assertTwoAxisReviewerProtocol(prompt)
+    assert.match(prompt, /complete Task Map/)
+    assert.match(prompt, /norn-map-completion-review-brief:v1/)
+  })
 })
 
 const configRevisionOfFixture = (() => {

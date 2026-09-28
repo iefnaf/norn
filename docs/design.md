@@ -562,6 +562,8 @@ workspace: <repository-home>/runs/<run-id>/workspaces/<ticket-number>/<work-atte
 
 The branch is created exactly at `baseSha`; Norn verifies that commit resolves to `baseTreeOid` and that the workspace belongs to the expected repository and object format. The same branch and workspace are reused across the attempt's rounds so a later worker can amend the current candidate in response to feedback. Each individual worker or reviewer process is instead an **agent invocation** with its own identity and completion sidecar (§17).
 
+Norn owns and versions the role instructions in those launch prompts. It neither discovers nor invokes user-level Skills: the Worker receives a built-in implementation protocol, and every independent Reviewer receives the same built-in two-axis review protocol. These instructions guide agent judgment only; they do not move scheduling, retries, gates, or side effects out of coordinator code, so the Skill-driven execution-path non-goal in §4 remains intact.
+
 The Work slot remains charged until the coordinator has persisted the attempt outcome and every child process group launched by that attempt is known to have exited or been terminated. Branches and workspaces are run-qualified, contain only attempt-local data, and never contain Run State. A later run never reuses them.
 
 ### 10.2 Round gate
@@ -592,6 +594,8 @@ repeat at most maxWorkRounds times:
 
 That accumulated feedback is persisted with the attempt checkpoint before the next worker process is created, so a coordinator restart resumes the same warm context. When an attempt parks, its Ticket retains the full accumulated feedback plus one `terminal` entry recording how the attempt ended. A later run for the same map carries those entries into the Ticket's first Work round, keeping their original round numbers. Feedback is context, never evidence: it is never bound to a tree or counted as a gate result, and it crosses a run boundary only through persisted Run State. A new run never reuses an earlier run's branches, workspaces, or test and review evidence to reconstruct it.
 
+The Worker is instructed to work test-first where practical at stable, pre-agreed seams, run typechecking and focused tests regularly, run the appropriate full suite before handoff when supported, and commit the completed work to the attempt branch. It must not perform or launch a self-review: Norn owns the fresh independent review after the coordinator's setup and test gates. Worker-run checks improve the implementation loop but never replace the coordinator-owned gates below.
+
 Configured setup and test commands execute sequentially in Run Config order and stop at the first non-pass. A command execution is protocol-valid only when:
 
 - its complete process group has exited, or has been terminated and settled after timeout, before repository inspection;
@@ -613,7 +617,9 @@ After a worker invocation settles, Norn accepts a `candidate` only when:
 
 `HEAD == baseSha` is a valid zero-delta candidate; the worker need not create an empty commit. Worker intermediate commits may otherwise form any linear sequence because Ship replaces them with one canonical integration commit.
 
-The reviewer receives the Effective Ticket Spec, exact base and candidate OIDs, the coordinator-generated base-to-candidate diff, the ordered successful `TestEvidence` list and captured test output, and the repository at the candidate tree. Its typed verdict is `pass`, `iterate`, or `block` and binds those inputs. Verdict enums control orchestration; findings and other prose are feedback only. The reviewer has no write-capable Pi tools, and Norn re-verifies the same branch, `HEAD`, tree, and cleanliness after it exits.
+The reviewer receives the Effective Ticket Spec, exact base and candidate OIDs, the coordinator-generated base-to-candidate diff, the ordered successful `TestEvidence` list and captured test output, and the repository at the candidate tree. It judges two separate axes: **Standards**, against repository-authored instructions and coding standards plus material judgment-based quality findings; and **Spec**, against the complete bound Ticket specification for missing, partial, incorrect, or materially risky unrequested behavior. It passes only when both axes pass and labels every actionable `iterate` finding by axis. The same protocol applies to a reconciled Ship review and to Task Map completion review, with each phase retaining its own bound specification, candidate facts, and test evidence.
+
+Its typed verdict is `pass`, `iterate`, or `block` and binds those inputs. Verdict enums control orchestration; findings and other prose are feedback only. The reviewer has no write-capable Pi tools, never launches nested agents or user-level Skills, and Norn re-verifies the same branch, `HEAD`, tree, and cleanliness after it exits.
 
 A protocol-valid setup or test non-pass and reviewer `iterate` advance to the next round. A typed worker block, reviewer `block`, specification contradiction, exhausted rounds, or child user interruption returns ticket-scoped `blocked` with `sharedWrite: 'none'`. Failure to launch or settle an agent, a malformed sidecar, or an attempt-local repository invariant violation returns ticket-scoped `error` with `sharedWrite: 'none'`. Failure of the Local control store, slot registry, or a held shared lock is run-scoped under §9. Every process group is settled before Norn fingerprints a final tree or returns the attempt outcome.
 

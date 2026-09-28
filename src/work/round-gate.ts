@@ -74,6 +74,7 @@ import {
   NORN_REVIEWER_TOOL_ALLOWLIST,
 } from '../agents/completion-extension.ts'
 import { herdrAgentName, planAgentPiArgv } from '../agents/herdr-runner.ts'
+import { REVIEWER_TWO_AXIS_PROTOCOL, WORKER_IMPLEMENTATION_PROTOCOL } from '../agents/role-protocol.ts'
 import { interruptAgentInvocation, settleAgentInvocation } from '../agents/runner.ts'
 import type {
   AgentSettlementBlockCode,
@@ -290,8 +291,10 @@ function renderWorkerPrompt(input: WorkerLaunchInput): string {
   return (
     'You are the Norn Worker for this Ticket. The launch context bound in NORN_AGENT_CONTEXT ' +
     'carries the Effective Ticket Spec and the exact target base. Amend the attempt-owned ' +
-    'branch in this workspace; finish with the norn_complete tool, handing off your ' +
-    'candidate commit and tree OIDs together with a delivery summary, or a typed block. ' +
+    'branch in this workspace. ' +
+    WORKER_IMPLEMENTATION_PROTOCOL +
+    'Finish with the norn_complete tool, handing off your candidate commit and tree OIDs ' +
+    'together with a delivery summary, or a typed block. ' +
     'The summary is PR-body markdown with three sections — "## Summary" showing the change as ' +
     'a diff-sketch, shallow file tree, or pseudocode view; "## Evidence" with concrete ' +
     'before/after (the exact test or command output that failed before and passes now); ' +
@@ -348,6 +351,7 @@ function renderReviewerPrompt(input: ReviewerLaunchInput): string {
     'You are the independent Norn Reviewer. You have read-only tools. Judge whether the ' +
     'candidate satisfies the open Ticket against the bound base and complete candidate ' +
     'tree, using the coordinator-generated diff and the ordered test evidence. ' +
+    REVIEWER_TWO_AXIS_PROTOCOL +
     (input.candidate.zeroDelta
       ? 'This is a zero-delta candidate: the tree equals the base tree, so judge the ' +
         'assertion that the existing target already satisfies the Ticket. '

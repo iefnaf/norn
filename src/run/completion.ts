@@ -77,6 +77,7 @@ import type {
   ReviewerCompletion,
 } from '../agents/completion.ts'
 import { planAgentPiArgv } from '../agents/herdr-runner.ts'
+import { REVIEWER_TWO_AXIS_PROTOCOL } from '../agents/role-protocol.ts'
 import { runAgentInvocation } from '../agents/runner.ts'
 import type { AgentSettlementErrorCode, VisibleAgentRunner } from '../agents/runner.ts'
 import type { RunConfigAgentRole, RunConfigCommand } from '../config/run-config.ts'
@@ -934,9 +935,10 @@ function renderMapCompletionReviewerPrompt(input: MapCompletionReviewerLaunchInp
     'You are the independent Norn Reviewer for Task Map completion. You have read-only tools. ' +
     'Judge whether the complete Task Map — its shared specification, every member Ticket ' +
     'specification, membership, and dependency topology — is satisfied by the repository at ' +
-    'the bound completion commit, using the ordered completion test evidence. Every member ' +
-    'Ticket is already a verified Completed Ticket; your verdict completes the map. Finish ' +
-    'with the norn_complete tool: pass, iterate with feedback, or a typed block. ' +
+    'the bound completion commit, using the ordered completion test evidence. ' +
+    REVIEWER_TWO_AXIS_PROTOCOL +
+    'Every member Ticket is already a verified Completed Ticket; your verdict completes the map. ' +
+    'Finish with the norn_complete tool: pass, iterate with feedback, or a typed block. ' +
     'Review briefing (JSON):\n' +
     canonicalJson(brief as CanonicalJsonValue)
   )
