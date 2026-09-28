@@ -301,6 +301,9 @@ describe('the read-only reviewer launch policy', () => {
     assert.match(prompt, /## Summary/)
     assert.match(prompt, /## Evidence/)
     assert.match(prompt, /## Merge Danger/)
+    // #40: the summary is rendered into the staged issue comments, so the
+    // worker knows where its prose lands.
+    assert.match(prompt, /round handoff comment/)
     assert.doesNotMatch(prompt, /\/skill:/)
   })
 

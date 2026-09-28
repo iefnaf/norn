@@ -33,6 +33,8 @@ import type { CommandExecution, CommandExecutionRequest, CommandRunner } from '.
 import type {
   AgentLaunchPlan,
   ReviewerLaunchInput,
+  RoundCommentEvent,
+  RoundCommentSink,
   RoundFeedback,
   RoundGateDeps,
   RoundGateStore,
@@ -255,6 +257,19 @@ export function zeroDeltaWorker(): WorkerScript {
     claimedTreeOid: tools.baseOids().treeOid,
     summary: 'zero-delta worker summary',
   })
+}
+
+/** A recording round-comment sink, for staged-comment tests (#40). */
+export function recordingRoundCommentSink(): RoundCommentSink & {
+  readonly events: readonly RoundCommentEvent[]
+} {
+  const events: RoundCommentEvent[] = []
+  return {
+    events,
+    async emit(event) {
+      events.push(event)
+    },
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -528,6 +543,8 @@ export type HarnessOptions = {
   readonly onLaunch?: (role: 'worker' | 'reviewer', invocationId: string) => void
   readonly reviewerPlannerOverride?: (input: ReviewerLaunchInput) => AgentLaunchPlan
   readonly git?: GitCommandRunner
+  /** A staged round-comment sink to observe emissions (#40); none by default. */
+  readonly roundComments?: RoundCommentSink
 }
 
 /** Build a complete round-gate harness over a fresh real repository. */
@@ -599,6 +616,7 @@ export function makeHarness(options: HarnessOptions): Harness {
     slots,
     slotWaitMs: options.slotWaitMs ?? 0,
     slotPollMs: 1,
+    ...(options.roundComments === undefined ? {} : { roundComments: options.roundComments }),
     planWorker: (launchInput) => {
       workerInputs.push(launchInput)
       events.push(`planWorker:${launchInput.round}`)

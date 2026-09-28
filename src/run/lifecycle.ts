@@ -85,6 +85,19 @@ import type {
   MapCompletionReviewerPlanner,
 } from './completion.ts'
 import { runStateMapCompletionStore } from './completion.ts'
+import {
+  completionGateDetailOf,
+  findingsMarker,
+  handoffMarker,
+  parkedMarker,
+  postProgressComment,
+  renderCompletionFindingsComment,
+  renderHandoffComment,
+  renderParkedComment,
+  renderVerdictComment,
+  verdictMarker,
+} from './progress-comments.ts'
+import type { RoundCommentIdentity } from './progress-comments.ts'
 import { reconcileResumedRun, resumeExecutorMismatches } from './recovery.ts'
 import type { ProcessGroupLivenessProbe } from '../runstate/slot-registry.ts'
 import type { ReleaseOutcome } from '../runstate/slot-registry.ts'
@@ -103,6 +116,7 @@ import type {
 } from '../runstate/types.ts'
 import { fsWorkspaceCleanup, shipClose } from '../ship/close.ts'
 import type { ShipCloseDeps, ShipCloseParams } from '../ship/close.ts'
+import type { EvidenceIssueLocator } from '../evidence/read.ts'
 import { deliveredMarker, renderDeliveredComment } from '../ship/render-comments.ts'
 import type { ShippableChange } from '../runstate/types.ts'
 import { osTargetLock, runStateShipCheckpointStore, shipPush } from '../ship/push.ts'
@@ -121,6 +135,8 @@ import {
 import type {
   AgentLaunchPlan,
   ReviewerLaunchPlanner,
+  RoundCommentEvent,
+  RoundCommentSink,
   RoundGateDeps,
   WorkAttemptParams,
   WorkerLaunchPlanner,
@@ -714,7 +730,7 @@ async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapO
     initial,
   )
   if (reconciled.kind !== 'ok') {
-    return runFailure(ctx, reconciled.code, `the resume reconciliation failed: ${reconciled.reason}`, [
+    return await runFailure(ctx, reconciled.code, `the resume reconciliation failed: ${reconciled.reason}`, [
       ...reconciled.evidence,
     ])
   }
@@ -727,7 +743,7 @@ async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapO
   // coordinator's — stays charged to its own resume or abort reconciliation.
   const reclaimed = await reconcileStaleWorkSlots(ctx.repositoryHome)
   if (reclaimed.kind !== 'ok') {
-    return runFailure(ctx, reclaimed.code as never,
+    return await runFailure(ctx, reclaimed.code as never,
       `reconciling stale Work-slot reservations failed: ${reclaimed.reason}`)
   }
 
@@ -742,7 +758,7 @@ async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapO
     if (state.activeWave !== undefined && state.activeWave.shipQueueTicketIssueIds.length > 0) {
       const shipped = await shipWaveQueue(ctx, state)
       if (shipped.kind === 'stop') return shipped.outcome
-      const cleared = clearActiveWave(ctx, shipped.state)
+      const cleared = await clearActiveWave(ctx, shipped.state)
       if (cleared.kind === 'stop') return cleared.outcome
       state = cleared.state
       continue
@@ -794,11 +810,11 @@ async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapO
 
     // --- the persisted ship queue, in issue-number order (§12) --------------
 
-    const queued = persistShipQueue(ctx, state)
+    const queued = await persistShipQueue(ctx, state)
     if (queued.kind === 'stop') return queued.outcome
     state = queued.state
     if (state.activeWave!.shipQueueTicketIssueIds.length === 0) {
-      const cleared = clearActiveWave(ctx, state)
+      const cleared = await clearActiveWave(ctx, state)
       if (cleared.kind === 'stop') return cleared.outcome
       state = cleared.state
       continue
@@ -806,7 +822,7 @@ async function executeWaves(ctx: RunContext, initial: RunState): Promise<RunMapO
 
     const shipped = await shipWaveQueue(ctx, state)
     if (shipped.kind === 'stop') return shipped.outcome
-    const cleared = clearActiveWave(ctx, shipped.state)
+    const cleared = await clearActiveWave(ctx, shipped.state)
     if (cleared.kind === 'stop') return cleared.outcome
     state = cleared.state
   }
@@ -835,23 +851,23 @@ function readMapSnapshot(ctx: RunContext): Promise<StableSnapshotOutcome> {
 }
 
 /** Map one stable-read failure onto the run outcome (§7.4: unstable is incompatible). */
-function mapReadFailure(
+async function mapReadFailure(
   ctx: RunContext,
   read: Extract<StableSnapshotOutcome, { readonly kind: 'blocked' | 'error' }>,
-): RunMapOutcome {
+): Promise<RunMapOutcome> {
   if (read.kind === 'error') {
-    return runFailure(ctx, normalizeErrorCode(read.code), `the stable Task Map read failed: ${read.reason}`, [
+    return await runFailure(ctx, normalizeErrorCode(read.code), `the stable Task Map read failed: ${read.reason}`, [
       ...read.evidence,
     ])
   }
-  return terminalFailure(ctx, undefined, 'blocked', 'changed-input',
+  return await terminalFailure(ctx, undefined, 'blocked', 'changed-input',
     `the Task Map can no longer be read stably (${read.code})`, [...read.evidence])
 }
 
 /** One stable read plus §7.4 classification and extension adoption. */
 async function stabilizeMap(ctx: RunContext, state: RunState): Promise<Step<TaskMapSnapshot>> {
   const read = await readMapSnapshot(ctx)
-  if (read.kind !== 'ok') return { kind: 'stop', outcome: mapReadFailure(ctx, read) }
+  if (read.kind !== 'ok') return { kind: 'stop', outcome: await mapReadFailure(ctx, read) }
   const snapshot = read.value
   ctx.lastSnapshot = snapshot
   for (const ticket of snapshot.tickets) ctx.ticketRefs.set(ticket.ref.issueId, ticket.ref)
@@ -860,7 +876,7 @@ async function stabilizeMap(ctx: RunContext, state: RunState): Promise<Step<Task
     // §12: a Task Map that is no longer OPEN ships nothing further.
     return {
       kind: 'stop',
-      outcome: terminalFailure(ctx, state, 'blocked', 'changed-input',
+      outcome: await terminalFailure(ctx, state, 'blocked', 'changed-input',
         `the Task Map is no longer OPEN (state: ${snapshot.state}); no remaining result ships`,
         [{ mapState: snapshot.state, mapRevision: snapshot.mapRevision }]),
     }
@@ -871,7 +887,7 @@ async function stabilizeMap(ctx: RunContext, state: RunState): Promise<Step<Task
   if (classification.kind === 'incompatible') {
     return {
       kind: 'stop',
-      outcome: terminalFailure(ctx, state, 'blocked', 'changed-input',
+      outcome: await terminalFailure(ctx, state, 'blocked', 'changed-input',
         'the Task Map changed incompatibly against the accepted revision; ' +
           'no remaining result from this run ships',
         [{ kind: 'incompatible', reasons: classification.reasons }]),
@@ -931,7 +947,7 @@ async function validateMembers(
     if (read.kind === 'error') {
       return {
         kind: 'stop',
-        outcome: runFailure(ctx, 'evidence-read',
+        outcome: await runFailure(ctx, 'evidence-read',
           `reading delivery evidence of member #${ticket.ref.number} failed: ${read.reason}`,
           [{ ticketIssueId: ticket.ref.issueId }]),
       }
@@ -939,7 +955,7 @@ async function validateMembers(
     if (read.kind === 'blocked') {
       return {
         kind: 'stop',
-        outcome: terminalFailure(ctx, next, 'blocked', 'changed-input',
+        outcome: await terminalFailure(ctx, next, 'blocked', 'changed-input',
           `delivery evidence of member #${ticket.ref.number} could not be read: ${read.reason}`,
           [{ ticketIssueId: ticket.ref.issueId, code: read.code }]),
       }
@@ -959,7 +975,7 @@ async function validateMembers(
     if (evaluation.status === 'error') {
       return {
         kind: 'stop',
-        outcome: runFailure(ctx, 'target-read',
+        outcome: await runFailure(ctx, 'target-read',
           `validating member #${ticket.ref.number} failed: ${evaluation.reason}`,
           [{ ticketIssueId: ticket.ref.issueId, code: evaluation.code }]),
       }
@@ -984,7 +1000,7 @@ async function validateMembers(
     // otherwise-valid evidence, is integrity- or operator-blocked (§14).
     return {
       kind: 'stop',
-      outcome: terminalFailure(ctx, next, 'blocked', 'changed-input',
+      outcome: await terminalFailure(ctx, next, 'blocked', 'changed-input',
         `member #${ticket.ref.number} fails delivery-evidence validation; ` +
           'the operator must resolve it before Norn continues',
         [
@@ -1003,7 +1019,7 @@ async function validateMembers(
     if (saved.kind !== 'ok') {
       return {
         kind: 'stop',
-        outcome: runFailure(ctx, saved.code as never,
+        outcome: await runFailure(ctx, saved.code as never,
           `persisting member validation failed: ${saved.reason}`),
       }
     }
@@ -1165,12 +1181,12 @@ async function adoptExtension(
   if (preflight.kind === 'failure') {
     return {
       kind: 'stop',
-      outcome: preflight.outcome.kind === 'blocked'
+      outcome: await (preflight.outcome.kind === 'blocked'
         ? terminalFailure(ctx, state, 'blocked', 'changed-input',
             preflight.outcome.reason, [...preflight.outcome.evidence],
             preflight.outcome.sharedWrite)
         : runFailure(ctx, preflight.outcome.code, preflight.outcome.reason,
-            [...preflight.outcome.evidence]),
+            [...preflight.outcome.evidence])),
     }
   }
   const newRecords = preflight.records
@@ -1179,12 +1195,12 @@ async function adoptExtension(
 
   const overlap = await claimedByOtherRun(ctx, state.runId, addedTicketIssueIds)
   if (overlap.kind !== 'ok') {
-    return { kind: 'stop', outcome: runFailure(ctx, overlap.code, overlap.reason) }
+    return { kind: 'stop', outcome: await runFailure(ctx, overlap.code, overlap.reason) }
   }
   if (overlap.value !== undefined) {
     return {
       kind: 'stop',
-      outcome: terminalFailure(ctx, state, 'blocked', 'changed-input',
+      outcome: await terminalFailure(ctx, state, 'blocked', 'changed-input',
         `added ticket(s) ${overlap.value.join(', ')} are already claimed by another active run; ` +
           'adoption is prevented',
         [{ claimedTicketIssueIds: overlap.value }]),
@@ -1206,7 +1222,7 @@ async function adoptExtension(
     // and is treated as an incompatible change.
     return {
       kind: 'stop',
-      outcome: terminalFailure(ctx, state, 'blocked', 'changed-input', adopted.reason, [
+      outcome: await terminalFailure(ctx, state, 'blocked', 'changed-input', adopted.reason, [
         ...adopted.evidence,
       ]),
     }
@@ -1214,7 +1230,7 @@ async function adoptExtension(
   if (adopted.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, adopted.code,
+      outcome: await runFailure(ctx, adopted.code,
         `adopting a Compatible Map Extension failed: ${adopted.reason}`,
         [...adopted.evidence]),
     }
@@ -1478,14 +1494,14 @@ async function beginWave(
   if (target.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, target.code, `capturing the wave's target snapshot failed: ${target.reason}`),
+      outcome: await runFailure(ctx, target.code, `capturing the wave's target snapshot failed: ${target.reason}`),
     }
   }
   const loaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
   if (loaded.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, loaded.code as never,
+      outcome: await runFailure(ctx, loaded.code as never,
         `reloading run state to begin the wave failed: ${loaded.reason}`),
     }
   }
@@ -1511,7 +1527,7 @@ async function beginWave(
   if (saved.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, saved.code as never, `persisting the new wave failed: ${saved.reason}`),
+      outcome: await runFailure(ctx, saved.code as never, `persisting the new wave failed: ${saved.reason}`),
     }
   }
   return { kind: 'next', state: next, value: null }
@@ -1569,12 +1585,12 @@ async function runFrontierWork(
   if (reloaded.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, reloaded.code as never,
+      outcome: await runFailure(ctx, reloaded.code as never,
         `reloading run state after Work failed: ${reloaded.reason}`),
     }
   }
   if (failure !== undefined) {
-    return { kind: 'stop', outcome: runFailure(ctx, failure.code, failure.reason, failure.evidence) }
+    return { kind: 'stop', outcome: await runFailure(ctx, failure.code, failure.reason, failure.evidence) }
   }
   return { kind: 'next', state: reloaded.value!, value: null }
 }
@@ -1643,6 +1659,7 @@ async function runOneWork(
       ctx.config.agentEnv,
     ),
     reviewerPlanIsReadOnly: ctx.deps.launches.reviewerPlanIsReadOnly,
+    roundComments: roundCommentSinkFor(ctx, state.runId, entry.ref, entry.workAttemptId),
     ...(ctx.deps.slotWaitMs === undefined ? {} : { slotWaitMs: ctx.deps.slotWaitMs }),
     ...(ctx.deps.slotPollMs === undefined ? {} : { slotPollMs: ctx.deps.slotPollMs }),
   }
@@ -1685,7 +1702,13 @@ async function runOneWork(
     },
     signal: ctx.deps.signal,
   }
-  return runWorkAttempt(gateDeps, params)
+  const outcome = await runWorkAttempt(gateDeps, params)
+  if (outcome.kind !== 'ok' && outcome.scope === 'ticket') {
+    // The staged record's terminal entry (#40): the park comment explains
+    // why this Ticket stopped for this run.
+    await postParkComment(ctx, state.runId, entry.ref, outcome)
+  }
+  return outcome
 }
 
 /** Run `task` over `items` with at most `limit` concurrent executions. */
@@ -1729,12 +1752,12 @@ async function waveBarrier(ctx: RunContext, state: RunState): Promise<StepResult
  * order; it is built once, before anything ships, and is never rebuilt —
  * not by restart, not by a later Compatible Map Extension.
  */
-function persistShipQueue(ctx: RunContext, state: RunState): StepResult {
+async function persistShipQueue(ctx: RunContext, state: RunState): Promise<StepResult> {
   const loaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
   if (loaded.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, loaded.code as never,
+      outcome: await runFailure(ctx, loaded.code as never,
         `loading run state to persist the ship queue failed: ${loaded.reason}`),
     }
   }
@@ -1757,7 +1780,7 @@ function persistShipQueue(ctx: RunContext, state: RunState): StepResult {
   if (saved.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, saved.code as never, `persisting the ship queue failed: ${saved.reason}`),
+      outcome: await runFailure(ctx, saved.code as never, `persisting the ship queue failed: ${saved.reason}`),
     }
   }
   return { kind: 'next', state: next, value: null }
@@ -1788,14 +1811,14 @@ async function shipWaveQueue(ctx: RunContext, state: RunState): Promise<StepResu
     const issueId = wave.shipQueueTicketIssueIds[wave.nextShipIndex]!
     const record = current.tickets[issueId]
     if (record !== undefined && (record.phase === 'completed' || record.phase === 'parked')) {
-      const advanced = advanceShipIndex(ctx, current)
+      const advanced = await advanceShipIndex(ctx, current)
       if (advanced.kind === 'stop') return advanced
       current = advanced.state
       continue
     }
     const shipped = await shipOne(ctx, current, issueId)
     if (shipped.kind === 'stop') return shipped
-    const advanced = advanceShipIndex(ctx, shipped.state)
+    const advanced = await advanceShipIndex(ctx, shipped.state)
     if (advanced.kind === 'stop') return advanced
     current = advanced.state
   }
@@ -1807,7 +1830,7 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
   if (record === undefined || (record.phase !== 'shippable' && record.phase !== 'shipping')) {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, 'state-integrity', `queued ticket ${issueId} is not shippable or shipping`),
+      outcome: await runFailure(ctx, 'state-integrity', `queued ticket ${issueId} is not shippable or shipping`),
     }
   }
   const change = record.change
@@ -1909,7 +1932,7 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
 
   const pushed = await shipPush(pushDeps, pushParams)
   if (pushed.kind === 'error') {
-    return { kind: 'stop', outcome: failureOutcome(ctx, pushed) }
+    return { kind: 'stop', outcome: await failureOutcome(ctx, pushed) }
   }
   if (pushed.kind === 'blocked') {
     if (pushed.scope === 'ticket') {
@@ -1920,7 +1943,7 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
       }
       return parkQueuedTicket(ctx, issueId, pushed)
     }
-    return { kind: 'stop', outcome: failureOutcome(ctx, pushed) }
+    return { kind: 'stop', outcome: await failureOutcome(ctx, pushed) }
   }
   if (pushed.value.pushes > 0) ctx.sharedWrite = true
 
@@ -1938,7 +1961,7 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
   if (reloaded.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, reloaded.code as never,
+      outcome: await runFailure(ctx, reloaded.code as never,
         `reloading run state before the close of #${ticket.number} failed: ${reloaded.reason}`),
     }
   }
@@ -1964,14 +1987,209 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
   }
   const closed = await shipClose(closeDeps, closeParams)
   if (closed.kind === 'error') {
-    return { kind: 'stop', outcome: failureOutcome(ctx, closed) }
+    return { kind: 'stop', outcome: await failureOutcome(ctx, closed) }
   }
   if (closed.kind === 'blocked') {
-    return { kind: 'stop', outcome: failureOutcome(ctx, closed) }
+    return { kind: 'stop', outcome: await failureOutcome(ctx, closed) }
   }
   ctx.sharedWrite = true
   ctx.warnings.push(...closed.value.warnings)
   return { kind: 'next', state: reloaded.value!, value: null }
+}
+
+// ---------------------------------------------------------------------------
+// Staged progress comments (#40, §9 side records)
+// ---------------------------------------------------------------------------
+
+/** The evidence locator of one issue reference. */
+function stagedLocatorOf(ref: {
+  readonly githubHost: string
+  readonly number: number
+  readonly url: string
+}): EvidenceIssueLocator {
+  return { githubHost: ref.githubHost, number: ref.number, url: ref.url }
+}
+
+/**
+ * Post one staged comment through the scan-before-write engine, recording
+ * any warning on the run context. Side-record semantics (#40): a failed or
+ * unknown post degrades to a warning and never changes an outcome.
+ */
+async function postStagedComment(
+  ctx: RunContext,
+  locator: EvidenceIssueLocator,
+  expected: string,
+  marker: string,
+  what: string,
+): Promise<void> {
+  const warnings = await postProgressComment(
+    {
+      loadComments: ctx.deps.evidence.loadIssueEvidence,
+      writeComment: ctx.deps.writer.writeIssueComment,
+    },
+    locator,
+    expected,
+    marker,
+    what,
+  )
+  ctx.warnings.push(...warnings)
+}
+
+/**
+ * The staged round-comment sink of one Work attempt (#40): renders each
+ * emitted handoff or verdict event and posts it on the Ticket issue in the
+ * configured comment language. Posting is best-effort — a warning never
+ * fails the attempt.
+ */
+function roundCommentSinkFor(
+  ctx: RunContext,
+  runId: string,
+  ref: TicketRef,
+  workAttemptId: string,
+): RoundCommentSink {
+  const language = ctx.config.commentLanguage
+  const reviewer = { model: ctx.config.reviewer.model, thinking: ctx.config.reviewer.thinking }
+  return {
+    async emit(event: RoundCommentEvent) {
+      const identity: RoundCommentIdentity = {
+        runId,
+        ticketNumber: ref.number,
+        workAttemptId,
+        round: event.round,
+      }
+      if (event.kind === 'handoff') {
+        await postStagedComment(
+          ctx,
+          stagedLocatorOf(ref),
+          renderHandoffComment({
+            identity,
+            language,
+            summary: event.summary,
+            base: event.base,
+            candidate: event.candidate,
+          }),
+          handoffMarker(identity),
+          `round ${event.round} handoff of #${ref.number}`,
+        )
+        return
+      }
+      await postStagedComment(
+        ctx,
+        stagedLocatorOf(ref),
+        renderVerdictComment({ identity, language, verdict: event.verdict, reviewer }),
+        verdictMarker(identity),
+        `round ${event.round} review verdict of #${ref.number}`,
+      )
+    },
+  }
+}
+
+/**
+ * The reviewer findings of a failed ship review gate, when the parked
+ * outcome's evidence carries them (§11.2): `{ gate: 'review', detail: … }`.
+ */
+function shipReviewFindingsOf(evidence: readonly Evidence[]): string | undefined {
+  for (const entry of evidence) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) continue
+    const record = entry as Record<string, unknown>
+    if (record.gate !== 'review') continue
+    const detail = completionGateDetailOf(record.detail)
+    if (detail.kind === 'review-iterate') return detail.feedback
+    return undefined
+  }
+  return undefined
+}
+
+/** Post the terminal park comment of one Ticket (#40, §12). */
+async function postParkComment(
+  ctx: RunContext,
+  runId: string,
+  ref: TicketRef,
+  outcome: {
+    readonly kind: 'blocked' | 'error'
+    readonly code: string
+    readonly reason: string
+    readonly evidence: readonly Evidence[]
+  },
+): Promise<void> {
+  await postStagedComment(
+    ctx,
+    stagedLocatorOf(ref),
+    renderParkedComment({
+      runId,
+      ticketNumber: ref.number,
+      language: ctx.config.commentLanguage,
+      code: outcome.code,
+      reason: outcome.reason,
+      ...(shipReviewFindingsOf(outcome.evidence) === undefined
+        ? {}
+        : { findings: shipReviewFindingsOf(outcome.evidence) }),
+    }),
+    parkedMarker(runId, ref.number),
+    `park comment of #${ref.number}`,
+  )
+}
+
+/**
+ * Ensure every parked Ticket of a terminalizing run carries its park
+ * comment (#40, §12): live posts cover work and ship parks as they happen;
+ * this reconciliation closes the crash window between a persisted park and
+ * its comment, and covers parks created by invalidation, before the run's
+ * terminal report is persisted. Scan-before-write keeps it idempotent.
+ */
+async function ensureParkedComments(ctx: RunContext, state: RunState): Promise<void> {
+  for (const ref of state.parkedTickets) {
+    const record = state.tickets[ref.issueId]
+    if (record === undefined || record.phase !== 'parked') continue
+    await postParkComment(ctx, state.runId, ref, record.outcome)
+  }
+}
+
+/**
+ * Post the completion-findings comment on the Map issue when the map
+ * completion gates failed (#40, §15): the gate that failed, its findings —
+ * the completion reviewer's verdict for a review gate, a bounded command
+ * excerpt for setup or tests — and why the Map stays open.
+ */
+async function postCompletionFindings(
+  ctx: RunContext,
+  state: RunState,
+  outcome: { readonly evidence: readonly Evidence[] },
+): Promise<void> {
+  const entries = outcome.evidence as readonly unknown[]
+  const finding = entries.find(
+    (entry): entry is Record<string, unknown> =>
+      typeof entry === 'object' && entry !== null && !Array.isArray(entry) && 'attemptId' in entry,
+  )
+  if (
+    finding === undefined ||
+    typeof finding.attemptId !== 'string' ||
+    (finding.gate !== 'setup' && finding.gate !== 'tests' && finding.gate !== 'review')
+  ) {
+    // Side-record semantics: an unrecognized gate-failure evidence shape
+    // posts nothing and warns rather than guessing a marker or gate.
+    ctx.warnings.push(
+      'the map completion findings comment was skipped: the gate-failure evidence ' +
+        'carried no recognizable completion attempt',
+    )
+    return
+  }
+  const attemptId = finding.attemptId
+  const gate = finding.gate
+  await postStagedComment(
+    ctx,
+    stagedLocatorOf(state.map),
+    renderCompletionFindingsComment({
+      runId: state.runId,
+      completionAttemptId: attemptId,
+      language: ctx.config.commentLanguage,
+      gate,
+      detail: completionGateDetailOf(finding.detail),
+      reviewer: { model: ctx.config.reviewer.model, thinking: ctx.config.reviewer.thinking },
+    }),
+    findingsMarker(state.runId, attemptId),
+    `map completion findings of attempt ${attemptId}`,
+  )
 }
 
 /**
@@ -2002,12 +2220,12 @@ async function postDeliveredComment(
   }
   const read = await ctx.deps.evidence.loadIssueEvidence(locator)
   if (read.kind === 'error') {
-    return runFailure(ctx, 'evidence-read',
+    return await runFailure(ctx, 'evidence-read',
       `reading ticket #${change.ticket.number} before its delivered comment failed: ${read.reason}`,
       [{ ticketIssueId: change.ticket.issueId }])
   }
   if (read.kind === 'blocked') {
-    return terminalFailure(ctx, undefined, 'blocked', 'changed-input',
+    return await terminalFailure(ctx, undefined, 'blocked', 'changed-input',
       `delivery evidence of ticket #${change.ticket.number} could not be read before its ` +
         `delivered comment: ${read.reason}`,
       [{ ticketIssueId: change.ticket.issueId, code: read.code }])
@@ -2068,7 +2286,7 @@ async function requeueIntegrationConflict(
   if (loaded.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, loaded.code as never,
+      outcome: await runFailure(ctx, loaded.code as never,
         `reloading run state to re-queue ticket ${issueId} failed: ${loaded.reason}`),
     }
   }
@@ -2110,7 +2328,7 @@ async function requeueIntegrationConflict(
   if (saved.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, saved.code as never,
+      outcome: await runFailure(ctx, saved.code as never,
         `persisting the re-queue of ticket ${issueId} failed: ${saved.reason}`),
     }
   }
@@ -2127,7 +2345,7 @@ async function requeueIntegrationConflict(
 }
 
 /** Persist one queued Ticket's ticket-scoped Ship failure as parked (§12). */
-function parkQueuedTicket(
+async function parkQueuedTicket(
   ctx: RunContext,
   issueId: string,
   outcome: {
@@ -2136,12 +2354,12 @@ function parkQueuedTicket(
     readonly reason: string
     readonly evidence: readonly Evidence[]
   },
-): StepResult {
+): Promise<StepResult> {
   const loaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
   if (loaded.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, loaded.code as never,
+      outcome: await runFailure(ctx, loaded.code as never,
         `reloading run state to park ticket ${issueId} failed: ${loaded.reason}`),
     }
   }
@@ -2179,20 +2397,26 @@ function parkQueuedTicket(
   if (saved.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, saved.code as never,
+      outcome: await runFailure(ctx, saved.code as never,
         `persisting the parked ship outcome of ticket ${issueId} failed: ${saved.reason}`),
     }
+  }
+  if (ref !== undefined) {
+    // The staged record's terminal entry (#40): a ship-phase park explains
+    // itself on the Ticket issue, carrying the failed gate's reviewer
+    // findings when a re-gated review did not pass.
+    await postParkComment(ctx, current.runId, ref, outcome)
   }
   return { kind: 'next', state: next, value: null }
 }
 
 /** Advance the persisted ship-queue cursor past the current entry. */
-function advanceShipIndex(ctx: RunContext, state: RunState): StepResult {
+async function advanceShipIndex(ctx: RunContext, state: RunState): Promise<StepResult> {
   const loaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
   if (loaded.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, loaded.code as never,
+      outcome: await runFailure(ctx, loaded.code as never,
         `reloading run state to advance the ship queue failed: ${loaded.reason}`),
     }
   }
@@ -2209,7 +2433,7 @@ function advanceShipIndex(ctx: RunContext, state: RunState): StepResult {
   if (saved.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, saved.code as never,
+      outcome: await runFailure(ctx, saved.code as never,
         `persisting the ship queue cursor failed: ${saved.reason}`),
     }
   }
@@ -2217,13 +2441,13 @@ function advanceShipIndex(ctx: RunContext, state: RunState): StepResult {
 }
 
 /** Clear the finished Wave so the next one plans from scratch. */
-function clearActiveWave(ctx: RunContext, state: RunState): StepResult {
+async function clearActiveWave(ctx: RunContext, state: RunState): Promise<StepResult> {
   if (state.activeWave === undefined) return { kind: 'next', state, value: null }
   const loaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
   if (loaded.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, loaded.code as never,
+      outcome: await runFailure(ctx, loaded.code as never,
         `reloading run state to close the wave failed: ${loaded.reason}`),
     }
   }
@@ -2233,7 +2457,7 @@ function clearActiveWave(ctx: RunContext, state: RunState): StepResult {
   if (saved.kind !== 'ok') {
     return {
       kind: 'stop',
-      outcome: runFailure(ctx, saved.code as never, `closing the wave failed: ${saved.reason}`),
+      outcome: await runFailure(ctx, saved.code as never, `closing the wave failed: ${saved.reason}`),
     }
   }
   return { kind: 'next', state: next, value: null }
@@ -2256,7 +2480,7 @@ async function finishRun(
   snapshot: TaskMapSnapshot,
 ): Promise<Step<TaskMapSnapshot>> {
   const read = await readMapSnapshot(ctx)
-  if (read.kind !== 'ok') return { kind: 'stop', outcome: mapReadFailure(ctx, read) }
+  if (read.kind !== 'ok') return { kind: 'stop', outcome: await mapReadFailure(ctx, read) }
   const final = read.value
   ctx.lastSnapshot = final
   for (const ticket of final.tickets) ctx.ticketRefs.set(ticket.ref.issueId, ticket.ref)
@@ -2264,7 +2488,7 @@ async function finishRun(
   if (final.state !== 'OPEN') {
     return {
       kind: 'stop',
-      outcome: terminalFailure(ctx, state, 'blocked', 'changed-input',
+      outcome: await terminalFailure(ctx, state, 'blocked', 'changed-input',
         `the Task Map is no longer OPEN (state: ${final.state})`, [{ mapState: final.state }]),
     }
   }
@@ -2273,7 +2497,7 @@ async function finishRun(
   if (classification.kind === 'incompatible') {
     return {
       kind: 'stop',
-      outcome: terminalFailure(ctx, state, 'blocked', 'changed-input',
+      outcome: await terminalFailure(ctx, state, 'blocked', 'changed-input',
         'the final stable read found an incompatible change',
         [{ kind: 'incompatible', reasons: classification.reasons }]),
     }
@@ -2293,7 +2517,7 @@ async function finishRun(
       ctx.sharedWrite ? 'confirmed' : 'none', undefined, undefined)
     return {
       kind: 'stop',
-      outcome: persistTerminal(ctx, invalidated, report, {
+      outcome: await persistTerminal(ctx, invalidated, report, {
         kind: 'blocked',
         code: 'no-eligible-frontier',
         reason:
@@ -2422,7 +2646,7 @@ function refOfRecord(state: RunState, issueId: string): TicketRef | undefined {
  * outcome (§13.2): `passed` is the final `ok`; blocked and terminal errors
  * carry the report as machine evidence.
  */
-function persistTerminal(
+async function persistTerminal(
   ctx: RunContext,
   state: RunState,
   report: RunReport,
@@ -2434,7 +2658,12 @@ function persistTerminal(
         readonly reason: string
         readonly scope: 'operation' | 'ticket' | 'run'
       },
-): RunMapOutcome {
+): Promise<RunMapOutcome> {
+  // Reconcile the staged record before the run terminalizes (#40): every
+  // parked Ticket carries its park comment, closing the crash window
+  // between a persisted park and its comment. Scan-before-write keeps this
+  // idempotent for parks whose comment already landed.
+  await ensureParkedComments(ctx, state)
   const next: RunState = { ...state, status: 'terminal', report }
   const saved = saveRunState(ctx.repositoryHome, ctx.encodedMapIssueId, next)
   if (saved.kind !== 'ok') {
@@ -2707,14 +2936,19 @@ async function driveMapCompletion(ctx: RunContext, state: RunState): Promise<Ste
     nornVersion: NORN_VERSION,
   })
   if (outcome.kind !== 'ok') {
-    return { kind: 'stop', outcome: failureOutcome(ctx, outcome) }
+    // The staged record of a failed completion attempt (#40, §15): the
+    // findings comment explains on the Map issue why it remains open.
+    if (outcome.kind === 'blocked' && outcome.code === 'map-completion-gate-failed') {
+      await postCompletionFindings(ctx, current, outcome)
+    }
+    return { kind: 'stop', outcome: await failureOutcome(ctx, outcome) }
   }
   if (outcome.value.kind === 'replan') {
     const reloaded = loadRunState(ctx.repositoryHome, ctx.encodedMapIssueId)
     if (reloaded.kind !== 'ok') {
       return {
         kind: 'stop',
-        outcome: runFailure(ctx, reloaded.code as never,
+        outcome: await runFailure(ctx, reloaded.code as never,
           `reloading run state after extension adoption failed: ${reloaded.reason}`),
       }
     }
@@ -2746,7 +2980,7 @@ async function finishCompletion(
     result.completionSha,
     warnings,
   )
-  const terminalized = persistTerminal(ctx, finalState, report, { kind: 'ok' })
+  const terminalized = await persistTerminal(ctx, finalState, report, { kind: 'ok' })
 
   const cleaned = await (ctx.deps.cleanup ?? fsWorkspaceCleanup())(result.workspace)
   if (cleaned.kind !== 'ok') {
@@ -2863,7 +3097,7 @@ type FailureLike = {
  * or unknown shared write is a recoverable interruption that leaves Run
  * State `running` and resumable (§13.2).
  */
-function failureOutcome(ctx: RunContext, failure: FailureLike): RunMapOutcome {
+async function failureOutcome(ctx: RunContext, failure: FailureLike): Promise<RunMapOutcome> {
   const state = currentStateOf(ctx)
   if (failure.kind === 'error') {
     const sharedWrite =
@@ -2882,13 +3116,13 @@ function failureOutcome(ctx: RunContext, failure: FailureLike): RunMapOutcome {
         ],
       })
     }
-    return terminalFailure(ctx, state, 'error', normalizeErrorCode(failure.code), failure.reason, [
+    return await terminalFailure(ctx, state, 'error', normalizeErrorCode(failure.code), failure.reason, [
       ...failure.evidence,
     ])
   }
   const sharedWrite =
     failure.sharedWrite === 'confirmed' || ctx.sharedWrite ? 'confirmed' : 'none'
-  return terminalFailure(ctx, state, 'blocked', failure.code, failure.reason, [
+  return await terminalFailure(ctx, state, 'blocked', failure.code, failure.reason, [
     ...failure.evidence,
   ], sharedWrite)
 }
@@ -2897,7 +3131,7 @@ function failureOutcome(ctx: RunContext, failure: FailureLike): RunMapOutcome {
  * Terminalize a blocked or terminal-error run: invalidate remaining results,
  * persist `status: 'terminal'` with the report, and return the outcome.
  */
-function terminalFailure(
+async function terminalFailure(
   ctx: RunContext,
   state: RunState | undefined,
   kind: 'blocked' | 'error',
@@ -2905,7 +3139,7 @@ function terminalFailure(
   reason: string,
   evidence: readonly Evidence[],
   sharedWrite?: 'none' | 'confirmed',
-): RunMapOutcome {
+): Promise<RunMapOutcome> {
   const current = state ?? currentStateOf(ctx)
   if (current === undefined) {
     return kind === 'blocked'
@@ -2917,7 +3151,7 @@ function terminalFailure(
   const invalidated = invalidateRemaining(ctx, current, kind, code)
   const snapshot = ctx.lastSnapshot ?? emptySnapshotOf(current)
   const report = buildReport(ctx, invalidated, snapshot, kind, code, finalSharedWrite, undefined, undefined)
-  return persistTerminal(ctx, invalidated, report, { kind, code, reason, scope: 'run' })
+  return await persistTerminal(ctx, invalidated, report, { kind, code, reason, scope: 'run' })
 }
 
 /** An empty snapshot fallback when no stable read ever succeeded. */
@@ -2939,7 +3173,7 @@ function runFailure(
   code: RunErrorCode,
   reason: string,
   evidence: readonly Evidence[] = [],
-): RunMapOutcome {
+): Promise<RunMapOutcome> {
   return failureOutcome(ctx, { kind: 'error', code, reason, evidence, sharedWrite: 'none' })
 }
 

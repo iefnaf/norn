@@ -921,15 +921,17 @@ describe('ship fault injection (§13.3)', () => {
       const shipping = state.tickets.I_A!
       assert.equal(shipping.phase === 'shipping' ? shipping.checkpoint.stage : '', 'delivery-recorded')
       assert.equal(harness.store.issues.get(1)!.state, 'OPEN')
-      assert.equal(harness.store.issues.get(1)!.comments.length, 2)
+      // Handoff, verdict, delivered, and record (#40): the close died after
+      // the record comment landed.
+      assert.equal(harness.store.issues.get(1)!.comments.length, 4)
 
       const outcome = await runToCompletion(harness, wraps)
       assert.equal(outcome.kind, 'ok')
       assertConverged(reference, safeOutcomeOf(harness, outcome), label)
 
-      // The delivered comment and the record each stand exactly once; the
-      // close happened once.
-      assert.equal(harness.store.issues.get(1)!.comments.length, 2)
+      // The staged round pair, the delivered comment, and the record each
+      // stand exactly once; the close happened once.
+      assert.equal(harness.store.issues.get(1)!.comments.length, 4)
       assert.equal(harness.store.observed.closeCalls, 1)
       assert.equal(harness.runState()!.runId, 'run-1')
     } finally {

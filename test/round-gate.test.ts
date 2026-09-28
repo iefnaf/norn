@@ -37,6 +37,7 @@ import {
   passed,
   preCreateWorkspace,
   readWorkspaceOids,
+  recordingRoundCommentSink,
   writeUntracked,
   zeroDeltaWorker,
 } from './helpers/round-gate-fixtures.ts'
@@ -635,6 +636,181 @@ describe('runWorkAttempt: the read-only reviewer and its re-verification', () =>
       expectError(outcome, 'reviewer-verification')
       assert.ok(outcome.kind === 'error')
       assert.match(JSON.stringify(outcome.evidence), /symbolicHead/)
+    } finally {
+      harness.cleanup()
+    }
+  })
+})
+
+describe('runWorkAttempt: staged round comments (#40)', () => {
+  it('emits a handoff and a verdict event after each settlement of a passing round', async () => {
+    const sink = recordingRoundCommentSink()
+    const harness = makeHarness({
+      label: 'staged-pass',
+      worker: committingWorker(),
+      reviewer: passReviewer,
+      roundComments: sink,
+    })
+    try {
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+      const oids = readWorkspaceOids(harness.workspacePath)
+
+      assert.deepEqual(sink.events, [
+        {
+          kind: 'handoff',
+          round: 1,
+          summary: 'committing worker round 1',
+          base: harness.input.target.baseSha,
+          candidate: {
+            commit: oids.commit,
+            treeOid: oids.treeOid,
+            zeroDelta: false,
+          },
+        },
+        { kind: 'verdict', round: 1, verdict: { discriminant: 'pass' } },
+      ])
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('emits one pair per round across an iterate round, with the findings carried', async () => {
+    const sink = recordingRoundCommentSink()
+    const harness = makeHarness({
+      label: 'staged-iterate',
+      worker: committingWorker(),
+      reviewer: iterateThenPass(),
+      maxWorkRounds: 3,
+      roundComments: sink,
+    })
+    try {
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+
+      assert.deepEqual(
+        sink.events.map((event) => `${event.kind}:${event.round}`),
+        ['handoff:1', 'verdict:1', 'handoff:2', 'verdict:2'],
+      )
+      assert.deepEqual(sink.events[1], {
+        kind: 'verdict',
+        round: 1,
+        verdict: { discriminant: 'iterate', feedback: 'cover the failure path too' },
+      })
+      assert.deepEqual(sink.events[3], { kind: 'verdict', round: 2, verdict: { discriminant: 'pass' } })
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('flags a zero-delta handoff event', async () => {
+    const sink = recordingRoundCommentSink()
+    const harness = makeHarness({
+      label: 'staged-zero-delta',
+      worker: zeroDeltaWorker(),
+      reviewer: passReviewer,
+      roundComments: sink,
+    })
+    try {
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+      assert.equal(sink.events.length, 2)
+      assert.equal(sink.events[0]!.kind, 'handoff')
+      const handoff = sink.events[0] as Extract<(typeof sink.events)[number], { kind: 'handoff' }>
+      assert.equal(handoff.candidate.zeroDelta, true)
+      assert.equal(handoff.candidate.commit, harness.input.target.baseSha)
+      assert.equal(handoff.base, harness.input.target.baseSha)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('emits no handoff event when candidate verification or the handoff fails', async () => {
+    const sink = recordingRoundCommentSink()
+    const mismatchWorker: WorkerScript = ({ workspacePath }) => ({
+      discriminant: 'candidate',
+      claimedCommit: 'sha1:' + 'f'.repeat(40),
+      claimedTreeOid: 'sha1:' + 'e'.repeat(40),
+      summary: 'claims a commit that does not exist',
+    })
+    void mismatchWorker
+    const wrongOidWorker: WorkerScript = (launch) => {
+      const oids = commitInWorkspace(launch.workspacePath, 'work-1.txt', 'round 1\n')
+      return {
+        discriminant: 'candidate',
+        claimedCommit: 'sha1:' + 'f'.repeat(40),
+        claimedTreeOid: oids.treeOid,
+        summary: 'mismatched claimed commit',
+      }
+    }
+    const harness = makeHarness({
+      label: 'staged-mismatch',
+      worker: wrongOidWorker,
+      reviewer: passReviewer,
+      roundComments: sink,
+    })
+    try {
+      const outcome = await harness.run()
+      expectError(outcome, 'handoff-mismatch')
+      assert.deepEqual(sink.events, [])
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('emits no events for typed worker or reviewer blocks', async () => {
+    const blockSink = recordingRoundCommentSink()
+    const blocked = makeHarness({
+      label: 'staged-worker-block',
+      worker: () => ({
+        discriminant: 'block',
+        code: 'cannot-satisfy-spec',
+        reason: 'the spec is internally contradictory',
+      }),
+      reviewer: passReviewer,
+      roundComments: blockSink,
+    })
+    try {
+      const outcome = await blocked.run()
+      expectBlocked(outcome, 'worker-block')
+      assert.deepEqual(blockSink.events, [])
+    } finally {
+      blocked.cleanup()
+    }
+
+    const verdictSink = recordingRoundCommentSink()
+    const reviewBlocked = makeHarness({
+      label: 'staged-reviewer-block',
+      worker: committingWorker(),
+      reviewer: () => ({ discriminant: 'block', code: 'spec-defect', reason: 'contradiction' }),
+      roundComments: verdictSink,
+    })
+    try {
+      const outcome = await reviewBlocked.run()
+      expectBlocked(outcome, 'reviewer-block')
+      assert.equal(verdictSink.events.length, 1)
+      assert.equal(verdictSink.events[0]!.kind, 'handoff')
+    } finally {
+      reviewBlocked.cleanup()
+    }
+  })
+
+  it('never fails the attempt when the sink itself fails — side records are not outcomes', async () => {
+    const throwing: import('../src/work/round-gate.ts').RoundCommentSink = {
+      async emit() {
+        throw new Error('gateway is down')
+      },
+    }
+    const harness = makeHarness({
+      label: 'staged-sink-failure',
+      worker: committingWorker(),
+      reviewer: passReviewer,
+      roundComments: throwing,
+    })
+    try {
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+      assert.equal(outcome.value.summary, 'committing worker round 1')
     } finally {
       harness.cleanup()
     }

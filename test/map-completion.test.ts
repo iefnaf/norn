@@ -625,10 +625,19 @@ describe('map completion — gate failures', () => {
       assert.equal(outcome.scope, 'run')
       assert.equal(outcome.sharedWrite, 'confirmed')
 
-      // The Map remains open with findings; nothing closed or commented.
+      // The Map remains open; nothing closed. The staged findings comment
+      // of #40 posts the completion reviewer's verdict on the Map issue.
       assert.equal(mapIssueOf(harness).state, 'OPEN')
       assert.equal(harness.store.observed.mapCloseCalls, 0)
-      assert.equal(harness.store.observed.mapCommentCalls, 0)
+      assert.equal(harness.store.observed.mapCommentCalls, 1)
+      const mapComments = mapIssueOf(harness).comments
+      assert.equal(mapComments.length, 1)
+      const findings = mapComments[0]!.body
+      assert.match(findings, /^<!-- norn:findings run-1@run-1-mc1 -->$/m)
+      assert.match(findings, /Map completion review failed: \*\*iterate\*\*/)
+      assert.match(findings, /the map is not done/)
+      assert.match(findings, /\*\*Reviewer\*\* `provider-b\/model-y` \(high\)/)
+      assert.match(findings, /The Map remains open/)
       const state = harness.runState()!
       assert.equal(state.status, 'terminal')
       assert.equal(state.report?.code, 'map-completion-gate-failed')
@@ -667,6 +676,14 @@ describe('map completion — gate failures', () => {
 
       assert.equal(mapIssueOf(harness).state, 'OPEN')
       assert.equal(harness.store.observed.mapCloseCalls, 0)
+      // The staged findings comment of #40: a failed completion test gate
+      // posts the bounded command excerpt on the Map issue.
+      assert.equal(harness.store.observed.mapCommentCalls, 1)
+      const findings = mapIssueOf(harness).comments[0]!.body
+      assert.match(findings, /^<!-- norn:findings run-crafted@run-crafted-mc1 -->$/m)
+      assert.match(findings, /Map completion tests failed:/)
+      assert.match(findings, /`npm test`/)
+      assert.match(findings, /completion tests fail/)
       const state = harness.runState()!
       assert.equal(state.report?.sharedWrite, 'none')
       assert.equal(state.report?.code, 'map-completion-gate-failed')

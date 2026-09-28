@@ -27,7 +27,9 @@ import type {
   ReworkFeedback,
 } from '../src/runstate/types.ts'
 import { createTicketWorkspace } from '../src/work/workspace.ts'
-import { makeRunHarness } from './helpers/run-fixtures.ts'
+import { runMap } from '../src/run/lifecycle.ts'
+import type { RunLifecycleDeps } from '../src/run/lifecycle.ts'
+import { makeRunHarness, MAP_URL } from './helpers/run-fixtures.ts'
 import type { MemberSpec, RunHarness } from './helpers/run-fixtures.ts'
 import {
   ACTOR_ID,
@@ -397,9 +399,12 @@ describe('ship order — issue-number order, restart, and later extensions', () 
           // After ticket #1's close, every later record-comment write fails
           // with an unknown result: a recoverable interruption after a
           // confirmed shared write (§13.2). The failure precedes the close,
-          // Arm after #2's delivered comment (comment #3): the push must
-          // verify before the record write turns unknown — resumable preflight.
-          when: (observed) => observed.commentCalls >= 3,
+          // so #2's push is verified but its record and close are missing.
+          // Arm after #2's delivered comment — with the staged round
+          // comments of #40 that is comment #7 (two round pairs, two
+          // delivered comments, one record): the push must verify before
+          // the record write turns unknown — resumable preflight.
+          when: (observed) => observed.commentCalls >= 7,
           apply: (store) => {
             store.script.writeCommentFails = 'scripted unknown comment result'
           },
@@ -946,6 +951,24 @@ describe('rework context across runs', () => {
         ['review', 'review', 'terminal'],
       )
 
+      // The staged record of the parked run (#40): two round pairs — each
+      // handoff followed by its iterate verdict — and the terminal park
+      // comment explaining why the run stopped. No delivered or merged
+      // comment exists because nothing shipped.
+      const parkedComments = harness.store.issues.get(1)!.comments
+      assert.equal(parkedComments.length, 5)
+      assert.match(parkedComments[0]!.body, /^<!-- norn:handoff run-1#1@wa-w1-t1\/r1 -->$/m)
+      assert.match(parkedComments[1]!.body, /^<!-- norn:verdict run-1#1@wa-w1-t1\/r1 -->$/m)
+      assert.match(parkedComments[1]!.body, /Round 1 review: \*\*iterate\*\*/)
+      assert.match(parkedComments[1]!.body, /cover the failure path/)
+      assert.match(parkedComments[2]!.body, /^<!-- norn:handoff run-1#1@wa-w1-t1\/r2 -->$/m)
+      assert.match(parkedComments[3]!.body, /^<!-- norn:verdict run-1#1@wa-w1-t1\/r2 -->$/m)
+      assert.match(parkedComments[3]!.body, /the predicate is still wrong/)
+      const park = parkedComments[4]!.body
+      assert.match(park, /^<!-- norn:parked run-1#1 -->$/m)
+      assert.match(park, /Parked for this run: `work-rounds-exhausted`/)
+      assert.match(park, /without a passing setup, test, and review gate/)
+
       // Remove the parked run's complete run-owned area before the next run:
       // the carry can only come from the persisted Run State document.
       rmSync(join(harness.repositoryHome, 'runs', 'run-1'), { recursive: true, force: true })
@@ -1051,6 +1074,69 @@ describe('rework context across runs', () => {
           reason: 'the run ended before this result shipped; it was invalidated',
         },
       ])
+
+      // The terminal reconciliation of #40 posted the missing park comments
+      // of both parked Tickets — the crafted one that never posted live, and
+      // the invalidated in-flight attempt — each exactly once (#12).
+      const ticketNumber = (issueId: string): number =>
+        issueId === 'I_A' ? 1 : 2
+      const parksOfA = harness.store.issues.get(ticketNumber('I_A'))!.comments
+      assert.equal(parksOfA.length, 1)
+      assert.match(parksOfA[0]!.body, /^<!-- norn:parked run-crafted#1 -->$/m)
+      assert.match(parksOfA[0]!.body, /Parked for this run: `no-eligible-frontier`/)
+      assert.match(parksOfA[0]!.body, /the run ended before this result shipped/)
+      const parksOfB = harness.store.issues.get(ticketNumber('I_B'))!.comments
+      assert.equal(parksOfB.length, 1)
+      assert.match(parksOfB[0]!.body, /^<!-- norn:parked run-crafted#2 -->$/m)
+      assert.match(parksOfB[0]!.body, /Parked for this run: `worker-block`/)
+      assert.match(parksOfB[0]!.body, /scripted/)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('posts the ship-review findings in the park comment of a re-gated ticket that iterates at Ship', async () => {
+    // A and B touch different files. A ships first, advancing the target, so
+    // B's Ship reconciles and runs a fresh review — which iterates: B parks
+    // ship-gate-failed and its park comment carries the reviewer's findings.
+    const reviewerCalls = new Map<string, number>()
+    const harness = await makeRunHarness({
+      label: 'ship-iterate-park',
+      members: [
+        ticketA({ worker: { kind: 'file', name: 'a.txt', content: 'from A\n' } }),
+        ticketB({ worker: { kind: 'file', name: 'b.txt', content: 'from B\n' } }),
+      ],
+      reviewer: (issueId) => {
+        const call = (reviewerCalls.get(issueId) ?? 0) + 1
+        reviewerCalls.set(issueId, call)
+        return issueId === 'I_B' && call === 2
+          ? { discriminant: 'iterate' as const, feedback: 'Spec axis: b.txt needs its own test. Standards axis: trailing newline.' }
+          : { discriminant: 'pass' as const }
+      },
+    })
+    try {
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'blocked')
+      assert.equal(outcome.code, 'no-eligible-frontier')
+      assert.equal(ticketStateOf(harness, 'I_A').phase, 'completed')
+      const parked = ticketStateOf(harness, 'I_B')
+      assert.equal(parked.phase, 'parked')
+      assert.equal(parked.phase === 'parked' ? parked.outcome.code : '', 'ship-gate-failed')
+
+      // #2's staged record: round pair, delivered comment, then the park
+      // comment with the failed ship review's findings — exactly once (the
+      // terminal reconciliation found the live post already present).
+      const comments = harness.store.issues.get(2)!.comments
+      assert.equal(comments.length, 4)
+      assert.match(comments[0]!.body, /^<!-- norn:handoff run-1#2@wa-w1-t2\/r1 -->$/m)
+      assert.match(comments[1]!.body, /^<!-- norn:verdict run-1#2@wa-w1-t2\/r1 -->$/m)
+      assert.match(comments[2]!.body, /^<!-- norn:delivered run-1#2@/m)
+      const park = comments[3]!.body
+      assert.match(park, /^<!-- norn:parked run-1#2 -->$/m)
+      assert.match(park, /Parked for this run: `ship-gate-failed`/)
+      assert.match(park, /\*\*Reviewer findings:\*\*/)
+      assert.match(park, /Spec axis: b\.txt needs its own test\./)
+      assert.match(park, /Standards axis: trailing newline\./)
     } finally {
       harness.cleanup()
     }
@@ -1232,18 +1318,33 @@ describe('resume reconciliation', () => {
 // ---------------------------------------------------------------------------
 
 describe('human-readable delivery comments', () => {
-  it('posts the delivered comment before the merged record comment on a passing run', async () => {
+  it('posts the staged round comments around the delivered and merged record comments on a passing run', async () => {
     const harness = await makeRunHarness({ label: 'delivery-comments', members: [ticketA()] })
     try {
       const outcome = await harness.run()
       assert.equal(outcome.kind, 'ok')
 
+      // The staged record of #40: one handoff and one verdict comment per
+      // worker round, then the delivered comment, then the merged record.
       const comments = harness.store.issues.get(1)!.comments
-      assert.equal(comments.length, 2)
+      assert.equal(comments.length, 4)
+
+      // The round handoff comment: identity marker, the fake worker's
+      // summary verbatim, and the candidate facts.
+      const handoff = comments[0]!.body
+      assert.match(handoff, /^<!-- norn:handoff run-1#1@wa-w1-t1\/r1 -->$/m)
+      assert.match(handoff, /^Round 1 work handoff: the worker settled candidate `/m)
+      assert.match(handoff, /work summary round 1/)
+
+      // The review verdict comment: pass with the reviewer identity.
+      const verdict = comments[1]!.body
+      assert.match(verdict, /^<!-- norn:verdict run-1#1@wa-w1-t1\/r1 -->$/m)
+      assert.match(verdict, /Round 1 review: \*\*pass\*\*/)
+      assert.match(verdict, /\*\*Reviewer\*\* `provider-b\/model-y` \(high\)/)
 
       // The delivered comment: run-bound identity marker, the fake worker's
       // sealed summary verbatim, gate facts, and the not-yet-merged note.
-      const delivered = comments[0]!.body
+      const delivered = comments[2]!.body
       assert.match(delivered, /^<!-- norn:delivered run-1#1@[0-9a-f]{40} -->$/m)
       assert.match(delivered, /Delivered on branch `norn\/run-1\/1\/wa-/)
       assert.match(delivered, /work summary round 1/)
@@ -1252,12 +1353,98 @@ describe('human-readable delivery comments', () => {
 
       // The merged record comment: merge headline plus the folded machine
       // envelope carrying the sealed record, exactly once each.
-      const merged = comments[1]!.body
+      const merged = comments[3]!.body
       assert.match(merged, /^Merged to `main` \(`/m)
       assert.match(merged, /^<details>$/m)
       assert.equal(merged.match(/```json/g)?.length, 1)
       assert.match(merged, /<!-- norn:record -->/)
       assert.equal(harness.store.issues.get(1)!.state, 'CLOSED')
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('posts one handoff and verdict pair per iterate round, in commentLanguage zh', async () => {
+    const harness = await makeRunHarness({
+      label: 'delivery-comments-iterate-zh',
+      members: [ticketA()],
+      reviewer: iterateEachThenPass(['Spec axis: the CLI flag is not handled. Standards axis: missing coverage.']),
+    })
+    try {
+      const config = JSON.parse(RUN_CONFIG_JSON) as Record<string, unknown>
+      config.commentLanguage = 'zh'
+      writeFileSync(join(harness.repositoryHome, 'config.json'), `${JSON.stringify(config)}\n`)
+
+      const outcome = await harness.run()
+      assert.equal(outcome.kind, 'ok')
+
+      const comments = harness.store.issues.get(1)!.comments
+      // round 1: handoff + iterate verdict; round 2: handoff + pass verdict;
+      // then delivered and merged.
+      assert.equal(comments.length, 6)
+      assert.match(comments[0]!.body, /^<!-- norn:handoff run-1#1@wa-w1-t1\/r1 -->$/m)
+      assert.match(comments[0]!.body, /第 1 轮实现交付/)
+      assert.match(comments[1]!.body, /^<!-- norn:verdict run-1#1@wa-w1-t1\/r1 -->$/m)
+      assert.match(comments[1]!.body, /第 1 轮评审：\*\*iterate\*\*/)
+      assert.match(comments[1]!.body, /Spec axis: the CLI flag is not handled\./)
+      assert.match(comments[2]!.body, /^<!-- norn:handoff run-1#1@wa-w1-t1\/r2 -->$/m)
+      assert.match(comments[2]!.body, /work summary round 2/)
+      assert.match(comments[3]!.body, /第 2 轮评审：\*\*pass\*\*/)
+      assert.match(comments[4]!.body, /^<!-- norn:delivered run-1#1@/m)
+      assert.match(comments[4]!.body, /已在分支 `norn\/run-1\/1\/wa-/)
+      assert.match(comments[5]!.body, /^已在 `main` 合并/m)
+    } finally {
+      harness.cleanup()
+    }
+  })
+
+  it('degrades staged round-comment failures to warnings — the run still ships (§9 side records)', async () => {
+    const harness = await makeRunHarness({ label: 'staged-comment-failures', members: [ticketA()] })
+    try {
+      // Every staged round-comment write returns an unknown result, while
+      // the guarded delivered and record comments succeed: the side records'
+      // failures must never change the outcome, only record warnings.
+      const base = harness.deps()
+      const stagedFailure = {
+        kind: 'error' as const,
+        scope: 'operation' as const,
+        code: 'github-unavailable' as const,
+        reason: 'scripted unknown staged-comment result',
+        sharedWrite: 'none' as const,
+        evidence: [],
+      }
+      const outcome = await runMap(
+        {
+          ...base,
+          writer: {
+            writeIssueComment: async (locator, body) => {
+              if (body.includes('norn:handoff ') || body.includes('norn:verdict ')) {
+                return stagedFailure
+              }
+              return base.writer.writeIssueComment(locator, body)
+            },
+            closeIssue: base.writer.closeIssue,
+            reopenIssue: base.writer.reopenIssue,
+          },
+        } satisfies RunLifecycleDeps,
+        MAP_URL,
+      )
+      assert.equal(outcome.kind, 'ok', JSON.stringify(outcome, null, 2))
+      assert.equal(outcome.value.label, 'passed')
+      assert.ok(
+        outcome.value.warnings.some((warning) => warning.includes('round 1 handoff of #1')),
+        `expected a handoff warning, got ${JSON.stringify(outcome.value.warnings)}`,
+      )
+      assert.ok(
+        outcome.value.warnings.some((warning) => warning.includes('round 1 review verdict of #1')),
+        `expected a verdict warning, got ${JSON.stringify(outcome.value.warnings)}`,
+      )
+
+      // The guarded comments still landed: delivered and merged record.
+      const bodies = harness.store.issues.get(1)!.comments.map((comment) => comment.body)
+      assert.equal(bodies.length, 2)
+      assert.match(bodies[0]!, /norn:delivered /)
+      assert.match(bodies[1]!, /norn:record/)
     } finally {
       harness.cleanup()
     }
