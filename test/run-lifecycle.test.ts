@@ -1342,12 +1342,13 @@ describe('human-readable delivery comments', () => {
       assert.match(verdict, /Round 1 review: \*\*pass\*\*/)
       assert.match(verdict, /\*\*Reviewer\*\* `provider-b\/model-y` \(high\)/)
 
-      // The delivered comment: run-bound identity marker, the fake worker's
-      // sealed summary verbatim, gate facts, and the not-yet-merged note.
+      // The delivered comment: run-bound identity marker, gate facts, and
+      // the not-yet-merged note — facts only; the sealed summary lives in
+      // the handoff comment above, not repeated here (#40 adjustment).
       const delivered = comments[2]!.body
       assert.match(delivered, /^<!-- norn:delivered run-1#1@[0-9a-f]{40} -->$/m)
       assert.match(delivered, /Delivered on branch `norn\/run-1\/1\/wa-/)
-      assert.match(delivered, /work summary round 1/)
+      assert.doesNotMatch(delivered, /work summary round 1/)
       assert.match(delivered, /\*\*Gate\*\*: /)
       assert.match(delivered, /Not merged to `main` yet\./)
 

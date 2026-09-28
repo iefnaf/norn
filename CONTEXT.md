@@ -73,7 +73,7 @@ A structured GitHub comment that binds a Ticket and its specification revisions 
 _Avoid_: Agent handoff, completion claim
 
 **Delivered Comment**:
-The unmarked, run-bound GitHub comment Norn posts on a Ticket between Work and its push: the worker's sealed PR-style summary plus deterministic gate facts. Its marker line binds it to one sealed candidate, making reposts idempotent.
+The unmarked, run-bound GitHub comment Norn posts on a Ticket between Work and its push: deterministic gate facts and the not-yet-merged note. Its marker line binds it to one sealed candidate, making reposts idempotent. The worker's summary lives in the Round Comments' work handoff comment, never repeated here.
 _Avoid_: Status update, work log
 
 **Round Comments**:
