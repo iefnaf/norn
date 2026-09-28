@@ -33,10 +33,12 @@ import {
   GITHUB_AUTO_CLOSE_KEYWORDS,
   canonicalCommitMessage,
   containsAutoCloseKeyword,
+  piShipReviewerLaunch,
   reconcileFinalCandidate,
   runStateAdoptExtension,
   snapshotMapPayload,
 } from '../src/ship/reconcile.ts'
+import type { ReviewerLaunchInput } from '../src/work/round-gate.ts'
 import type {
   FinalCandidate,
   ShipExtensionAdoption,
@@ -46,6 +48,7 @@ import type {
   ShipReconcileParams,
 } from '../src/ship/reconcile.ts'
 
+import { assertTwoAxisReviewerInstructions } from './helpers/agent-prompt-fixtures.ts'
 import {
   ACTOR_ID,
   evidenceRead,
@@ -77,6 +80,51 @@ import {
   ticket7,
 } from './helpers/ship-fixtures.ts'
 import type { RepoHarness } from './helpers/ship-fixtures.ts'
+
+// ---------------------------------------------------------------------------
+// The reconciled Ship Reviewer prompt (§11.2)
+// ---------------------------------------------------------------------------
+
+describe('the reconciled Ship Reviewer prompt', () => {
+  it('applies the shared two-axis instructions while preserving Ship-specific context', () => {
+    const input: ReviewerLaunchInput = {
+      spec: {
+        mapTitle: 'map',
+        mapBody: 'shared intent',
+        mapRevision: 'sha256:' + '1'.repeat(64),
+        ticketTitle: 'ticket',
+        ticketBody: 'requirement',
+        ticketRevision: 'sha256:' + '2'.repeat(64),
+      },
+      target: {
+        branch: 'main',
+        baseSha: 'sha1:' + '3'.repeat(40),
+        baseTreeOid: 'sha1:' + '4'.repeat(40),
+      },
+      candidate: {
+        commit: 'sha1:' + '5'.repeat(40),
+        treeOid: 'sha1:' + '4'.repeat(40),
+        zeroDelta: true,
+      },
+      diff: 'reconciled diff',
+      tests: [],
+      testOutput: [],
+    }
+    const plan = piShipReviewerLaunch(input, {
+      model: 'provider-b/model-y',
+      thinking: 'high',
+      extensionPath: '/norn/extension.ts',
+      piSessionId: 'ship-review-pi',
+    })
+    const prompt = plan.argv.at(-1)!
+
+    assertTwoAxisReviewerInstructions(prompt)
+    assert.match(prompt, /reconciled Ship candidate/)
+    assert.match(prompt, /zero-delta finale/)
+    assert.match(prompt, /reconciled diff/)
+    assert.doesNotMatch(prompt, /\/skill:/)
+  })
+})
 
 // ---------------------------------------------------------------------------
 // The canonical commit template (§11.2)

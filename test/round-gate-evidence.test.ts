@@ -28,6 +28,7 @@ import {
 } from '../src/work/round-gate.ts'
 import type { ReviewerLaunchInput, SealCheckFacts } from '../src/work/round-gate.ts'
 
+import { assertTwoAxisReviewerInstructions } from './helpers/agent-prompt-fixtures.ts'
 import {
   commitInWorkspace,
   committingWorker,
@@ -251,6 +252,18 @@ describe('the read-only reviewer launch policy', () => {
     }
   })
 
+  it('owns the two-axis Reviewer instructions without nested agents or runtime skills', () => {
+    const plan = piReadOnlyReviewerLaunch(reviewerInput, {
+      model: 'provider-b/model-y',
+      thinking: 'high',
+      extensionPath: '/norn/extension.ts',
+      piSessionId: 'pi-1',
+    })
+    const prompt = plan.argv.at(-1)!
+
+    assertTwoAxisReviewerInstructions(prompt)
+  })
+
   it('tells the reviewer when it is judging a zero-delta assertion', () => {
     const zero: ReviewerLaunchInput = { ...reviewerInput, candidate: { ...reviewerInput.candidate, zeroDelta: true } }
     const plan = piReadOnlyReviewerLaunch(zero, {
@@ -268,6 +281,27 @@ describe('the read-only reviewer launch policy', () => {
     assert.equal(isReadOnlyAgentArgv(['pi', '--model', 'm']), false)
     assert.equal(isReadOnlyAgentArgv(['pi', '--tools', 'read,grep,find,ls']), false)
     assert.equal(isReadOnlyAgentArgv(['pi', '--tools', '']), false)
+  })
+
+  it('owns the Worker implementation instructions without invoking runtime skills', () => {
+    const plan = piWorkerLaunch(
+      { round: 1, previousCandidateCommit: null, feedback: [], commentLanguage: 'en' },
+      { model: 'provider-a/model-x', thinking: 'medium', extensionPath: '/norn/extension.ts', piSessionId: 'pi-2' },
+    )
+    const prompt = plan.argv.at(-1)!.toString()
+
+    assert.match(prompt, /test-first/)
+    assert.match(prompt, /stable, pre-agreed seams/)
+    assert.match(prompt, /typechecking and focused tests regularly/)
+    assert.match(prompt, /appropriate full test suite/)
+    assert.match(prompt, /Commit the completed work/)
+    assert.match(prompt, /independent Reviewer/)
+    assert.match(prompt, /do not replace Norn's coordinator-owned setup, test, candidate-verification, or seal gates/)
+    assert.match(prompt, /norn_complete/)
+    assert.match(prompt, /## Summary/)
+    assert.match(prompt, /## Evidence/)
+    assert.match(prompt, /## Merge Danger/)
+    assert.doesNotMatch(prompt, /\/skill:/)
   })
 
   it('renders the worker round briefing into the launch prompt', () => {
