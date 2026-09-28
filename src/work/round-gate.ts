@@ -55,10 +55,10 @@ import { canonicalJsonDigest } from '../core/digest.ts'
 import { blocked, error, ok } from '../core/outcome.ts'
 import type { Evidence, Outcome } from '../core/outcome.ts'
 
-import type { RunConfigAgentRole, RunConfigCommand } from '../config/run-config.ts'
+import type { RunConfigAgentRole, RunConfigCommand, CommentLanguage } from '../config/run-config.ts'
 import { encodePathSegment } from '../config/paths.ts'
 import type { GitCommandRunner } from '../adapters/git-repository.ts'
-import { AGENT_COMPLETION_SCHEMA } from '../agents/completion.ts'
+import { AGENT_COMPLETION_SCHEMA, workerSummaryProblem } from '../agents/completion.ts'
 import type {
   AgentCompletionContext,
   AgentMapBinding,
@@ -178,6 +178,11 @@ export type WorkerLaunchInput = {
    * feedback. Entries keep the round numbers they were recorded under.
    */
   readonly feedback: readonly RoundFeedback[]
+  /**
+   * The language the worker's delivery summary must be written in (§8): the
+   * summary is rendered verbatim into the ticket's human-readable comments.
+   */
+  readonly commentLanguage: CommentLanguage
 }
 
 /** The captured output of one passing test, handed to the reviewer. */
@@ -265,6 +270,13 @@ export function modelProvider(modelId: string): string {
   return slash === -1 ? modelId : modelId.slice(0, slash)
 }
 
+/** The one sentence instructing the worker's summary language (§8, §10.2). */
+function summaryLanguageInstruction(language: CommentLanguage): string {
+  return language === 'zh'
+    ? '用中文撰写交付总结（可以用英文代码标识符）。 '
+    : 'Write the delivery summary in English. '
+}
+
 function renderWorkerPrompt(input: WorkerLaunchInput): string {
   const brief = {
     schema: 'norn-worker-brief:v1',
@@ -278,8 +290,15 @@ function renderWorkerPrompt(input: WorkerLaunchInput): string {
   return (
     'You are the Norn Worker for this Ticket. The launch context bound in NORN_AGENT_CONTEXT ' +
     'carries the Effective Ticket Spec and the exact target base. Amend the attempt-owned ' +
-    'branch in this workspace; finish with the norn_complete tool, handing off either your ' +
-    'candidate commit and tree OIDs or a typed block. ' +
+    'branch in this workspace; finish with the norn_complete tool, handing off your ' +
+    'candidate commit and tree OIDs together with a delivery summary, or a typed block. ' +
+    'The summary is PR-body markdown with three sections — "## Summary" showing the change as ' +
+    'a diff-sketch, shallow file tree, or pseudocode view; "## Evidence" with concrete ' +
+    'before/after (the exact test or command output that failed before and passes now); ' +
+    '"## Merge Danger" naming a one-way or two-way door and a one-word blast radius. ' +
+    'Norn renders your summary verbatim into the ticket\'s delivered comment; keep prose ' +
+    'brief and never write the text "norn:record". ' +
+    summaryLanguageInstruction(input.commentLanguage) +
     (carried
       ? "The feedback below was carried from a previous run's parked attempt for this Ticket; " +
         'entries keep the round numbers they were recorded under. '
@@ -479,6 +498,8 @@ export type WorkAttemptParams = {
   readonly setup: readonly RunConfigCommand[]
   readonly tests: readonly RunConfigCommand[]
   readonly maxWorkRounds: number
+  /** The configured comment language (§8); forwarded to every worker launch. */
+  readonly commentLanguage: CommentLanguage
   readonly agents: {
     readonly worker: RunConfigAgentRole
     readonly reviewer: RunConfigAgentRole & { readonly family: string }
@@ -683,6 +704,10 @@ export function verifySealedChange(change: ShippableChange, facts: SealCheckFact
   }
   if (!sameJson(change.workspace, facts.workspace)) {
     violations.push('the sealed workspace must equal the attempt-owned workspace')
+  }
+  const summaryProblem = workerSummaryProblem(change.summary)
+  if (summaryProblem !== undefined) {
+    violations.push(`the sealed summary is invalid: ${summaryProblem}`)
   }
 
   if (change.tests.length !== facts.configuredTests.length) {
@@ -1149,6 +1174,7 @@ async function runRound(
     round: round.round,
     previousCandidateCommit: round.previousCandidate,
     feedback: round.feedback,
+    commentLanguage: params.commentLanguage,
   })
   const workerContext = completionContext(params, state.workspace, {
     invocationId: workerId,
@@ -1350,6 +1376,7 @@ async function runRound(
     workspace: state.workspace,
     tests: evidence,
     review,
+    summary: handoff.summary,
   }
   const violations = verifySealedChange(change, {
     input,

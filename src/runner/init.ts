@@ -41,6 +41,7 @@ import {
   resolveRunConfigText,
   runConfigToJson,
 } from '../config/run-config.ts'
+import type { CommentLanguage } from '../config/run-config.ts'
 import type { Sha256Digest } from '../core/digest.ts'
 
 /** One plausible GitHub repository identity reachable from local remotes. */
@@ -100,6 +101,8 @@ export type InitInteraction = {
   chooseAgentEnvironment(): Promise<AgentEnvironmentInput | undefined>
   /** Additional trusted evidence author IDs beyond the authenticated actor. */
   chooseTrustedEvidenceAuthors(actor: GitHubActor): Promise<readonly string[] | undefined>
+  /** The language Norn renders human-readable issue comments in (§8). */
+  chooseCommentLanguage(suggested: CommentLanguage): Promise<CommentLanguage | undefined>
   /** Show existing configuration and the proposed replacement; confirm. */
   confirmReplaceConfig(
     existing: { readonly configJson: string; readonly metadataJson: string | undefined },
@@ -193,6 +196,7 @@ type InitAnswers = {
   readonly concurrency: number
   readonly agentEnv: AgentEnvironmentInput
   readonly trustedEvidenceAuthorIds: readonly string[]
+  readonly commentLanguage: CommentLanguage
 }
 
 /** Run the whole `/norn init` flow; every step returns a typed outcome. */
@@ -406,6 +410,11 @@ async function askInitChoices(
   )
   if (concurrency === undefined) return cancelled('concurrency')
 
+  const commentLanguage = await interaction.chooseCommentLanguage(
+    RUN_CONFIG_DEFAULTS.commentLanguage,
+  )
+  if (commentLanguage === undefined) return cancelled('commentLanguage')
+
   const agentEnv = await interaction.chooseAgentEnvironment()
   if (agentEnv === undefined) return cancelled('child agent environment')
 
@@ -423,6 +432,7 @@ async function askInitChoices(
     concurrency,
     agentEnv,
     trustedEvidenceAuthorIds: additionalTrustedAuthors,
+    commentLanguage,
   })
 }
 
@@ -486,6 +496,7 @@ function validateAnswersAndBuildConfig(
     worker: answers.worker,
     reviewer: answers.reviewer,
     trustedEvidenceAuthorIds: [...new Set([actor.id, ...additionalAuthors])],
+    commentLanguage: answers.commentLanguage,
   }
 
   const resolved = resolveRunConfig(document, modelFamilyResolver(models))

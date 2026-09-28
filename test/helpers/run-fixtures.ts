@@ -349,7 +349,7 @@ function performWorker(behavior: WorkerBehavior, request: AgentLaunchRequest): W
   }
   if (behavior.kind === 'zero-delta') {
     const oids = readWorkspaceOids(request.cwd)
-    return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+    return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: 'zero-delta summary' }
   }
   const round = request.context.work?.round ?? 1
   const file =
@@ -357,7 +357,7 @@ function performWorker(behavior: WorkerBehavior, request: AgentLaunchRequest): W
       ? { name: behavior.name, content: behavior.content }
       : { name: `work-${request.context.ticket!.issueId}-r${round}.txt`, content: `work ${round}\n` }
   const oids = commitInWorkspace(request.cwd, file.name, file.content)
-  return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+  return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: `work summary round ${round}` }
 }
 
 // ---------------------------------------------------------------------------

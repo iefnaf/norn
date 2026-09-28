@@ -97,6 +97,16 @@ const NORN_COMPLETE_PARAMETERS = {
       type: 'string',
       description: 'Worker candidate only: the claimed tree OID of that commit.',
     },
+    summary: {
+      type: 'string',
+      description:
+        'Worker candidate only: the delivery summary rendered into the ticket comment. ' +
+        'Markdown in the PR-body structure — "## Summary" (a diff-sketch, file tree, or ' +
+        'call/pseudocode view of what changed), "## Evidence" (concrete before/after: the ' +
+        'exact test or output that failed before and passes now), "## Merge Danger" ' +
+        '(one-way or two-way door, one-word blast radius, optional ramifications). ' +
+        'Keep prose brief; use the ticket\'s domain language; never include the text "norn:record".',
+    },
     code: {
       type: 'string',
       description: 'Block only: the closed machine code for this role.',

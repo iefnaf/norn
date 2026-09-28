@@ -763,6 +763,7 @@ describe('post-settlement cleanup', () => {
         discriminant: 'candidate',
         claimedCommit: `sha1:${'a'.repeat(40)}`,
         claimedTreeOid: `sha1:${'b'.repeat(40)}`,
+        summary: 'herdr worker summary',
       },
       agentRecordedAt(),
     )

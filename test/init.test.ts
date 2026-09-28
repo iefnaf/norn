@@ -127,6 +127,9 @@ function scriptedInteraction(
     async chooseTrustedEvidenceAuthors() {
       return []
     },
+    async chooseCommentLanguage(suggested) {
+      return suggested
+    },
     async confirmReplaceConfig(existing, proposed) {
       recorder.confirmedExisting = existing
       recorder.confirmedProposed = proposed
@@ -295,6 +298,7 @@ describe('initRepository: successful setup', () => {
         worker: WORKER,
         reviewer: REVIEWER,
         trustedEvidenceAuthorIds: ['I_actor', 'I_alpha', 'I_zeta'],
+        commentLanguage: 'en',
       })
       assert.equal(outcome.value.replacedExistingConfig, false)
       const loaded = await loadRunConfig(environment.store, environment.home)

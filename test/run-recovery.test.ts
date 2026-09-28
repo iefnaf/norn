@@ -195,7 +195,9 @@ function buildDeps(harness: RunHarness, wraps: ScenarioWraps = {}): RunLifecycle
     },
     writer: {
       writeIssueComment: async (locator, body) => {
-        check('comment', locator)
+        // The fault detail carries whether this is a record comment: the
+        // delivered comment must not shift any record-fault die point.
+        check('comment', { number: locator.number, record: body.includes('norn:record') })
         events?.push(`comment:${locator.number}`)
         return base.writer.writeIssueComment(locator, body)
       },
@@ -869,7 +871,9 @@ describe('ship fault injection (§13.3)', () => {
           armed: { fired: false },
           // The Delivery Record comment write of ticket #1 — after the push
           // was remotely verified.
-          match: (detail) => (detail as { number: number }).number === 1,
+          match: (detail) =>
+            (detail as { number: number; record: boolean }).number === 1 &&
+            (detail as { record: boolean }).record,
         },
       }
       const died = await runOnce(harness, wraps)
@@ -917,14 +921,15 @@ describe('ship fault injection (§13.3)', () => {
       const shipping = state.tickets.I_A!
       assert.equal(shipping.phase === 'shipping' ? shipping.checkpoint.stage : '', 'delivery-recorded')
       assert.equal(harness.store.issues.get(1)!.state, 'OPEN')
-      assert.equal(harness.store.issues.get(1)!.comments.length, 1)
+      assert.equal(harness.store.issues.get(1)!.comments.length, 2)
 
       const outcome = await runToCompletion(harness, wraps)
       assert.equal(outcome.kind, 'ok')
       assertConverged(reference, safeOutcomeOf(harness, outcome), label)
 
-      // The record was reused, never duplicated; the close happened once.
-      assert.equal(harness.store.issues.get(1)!.comments.length, 1)
+      // The delivered comment and the record each stand exactly once; the
+      // close happened once.
+      assert.equal(harness.store.issues.get(1)!.comments.length, 2)
       assert.equal(harness.store.observed.closeCalls, 1)
       assert.equal(harness.runState()!.runId, 'run-1')
     } finally {
@@ -1032,7 +1037,9 @@ describe('ship fault injection (§13.3)', () => {
       assert.ok('outcome' in first)
       assert.equal(first.outcome.kind, 'error')
       assert.equal(first.outcome.code, 'comment-write')
-      assert.equal(first.outcome.sharedWrite, 'unknown')
+      // Ticket #1's delivery is already a confirmed shared write, so the
+      // unknown result of #2's record carries the stronger proven state.
+      assert.equal(first.outcome.sharedWrite, 'confirmed')
 
       // Recoverable: the same run ID, queue, and persisted counters remain.
       const interrupted = harness.runState()!
@@ -1146,7 +1153,9 @@ describe('map-completion fault injection (§13.4)', () => {
           label,
           seam: 'comment',
           armed: { fired: false },
-          match: (detail) => (detail as { number: number }).number === MAP_NUMBER,
+          match: (detail) =>
+            (detail as { number: number; record: boolean }).number === MAP_NUMBER &&
+            (detail as { record: boolean }).record,
         },
       }
       const died = await runOnce(harness, wraps)
@@ -1382,7 +1391,9 @@ describe('total local state loss (§13.3)', () => {
           label,
           seam: 'comment',
           armed: { fired: false },
-          match: (detail) => (detail as { number: number }).number === 1,
+          match: (detail) =>
+            (detail as { number: number; record: boolean }).number === 1 &&
+            (detail as { record: boolean }).record,
         },
       }
       const died = await runOnce(harness, wraps)

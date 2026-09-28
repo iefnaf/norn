@@ -251,7 +251,7 @@ describe('runWorkAttempt: the full round gate', () => {
     const worker: WorkerScript = ({ workspacePath, round }) => {
       headsBeforeCommit.push(readWorkspaceOids(workspacePath).commit)
       const oids = commitInWorkspace(workspacePath, `work-${round}.txt`, `round ${round}\n`)
-      return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+      return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: 'round-gate test summary' }
     }
     const harness = makeHarness({ label: 'iterate', worker, reviewer: iterateThenPass() })
     try {
@@ -488,6 +488,7 @@ describe('runWorkAttempt: candidate acceptance', () => {
           discriminant: 'candidate',
           claimedCommit: `sha1:${'f'.repeat(40)}`,
           claimedTreeOid: `sha1:${'e'.repeat(40)}`,
+          summary: 'handoff-mismatch summary',
         }
       },
       reviewer: passReviewer,
@@ -510,7 +511,7 @@ describe('runWorkAttempt: candidate acceptance', () => {
         execFileSync('git', ['-C', workspacePath, 'checkout', '-q', 'norn/run-9/7/wa-1'])
         execFileSync('git', ['-C', workspacePath, 'merge', '--quiet', '--no-ff', '-m', 'merge', 'side'])
         const oids = readWorkspaceOids(workspacePath)
-        return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+        return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: 'round-gate test summary' }
       },
       reviewer: passReviewer,
     })
@@ -530,7 +531,7 @@ describe('runWorkAttempt: candidate acceptance', () => {
       worker: ({ workspacePath }) => {
         writeUntracked(workspacePath, 'worker-leftover.txt')
         const oids = readWorkspaceOids(workspacePath)
-        return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+        return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: 'round-gate test summary' }
       },
       reviewer: passReviewer,
     })
@@ -550,7 +551,7 @@ describe('runWorkAttempt: candidate acceptance', () => {
       worker: ({ workspacePath }) => {
         execFileSync('git', ['-C', workspacePath, 'checkout', '-q', '--detach'])
         const oids = readWorkspaceOids(workspacePath)
-        return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid }
+        return { discriminant: 'candidate', claimedCommit: oids.commit, claimedTreeOid: oids.treeOid, summary: 'round-gate test summary' }
       },
       reviewer: passReviewer,
     })

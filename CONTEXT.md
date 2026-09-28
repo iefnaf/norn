@@ -71,3 +71,11 @@ _Avoid_: Task Map configuration, Run Definition
 **Delivery Record**:
 A structured GitHub comment that binds a Ticket and its specification revisions to the exact tested, reviewed, and integrated Git tree.
 _Avoid_: Agent handoff, completion claim
+
+**Delivered Comment**:
+The unmarked, run-bound GitHub comment Norn posts on a Ticket between Work and its push: the worker's sealed PR-style summary plus deterministic gate facts. Its marker line binds it to one sealed candidate, making reposts idempotent.
+_Avoid_: Status update, work log
+
+**Comment Language**:
+The Run Config field (`en` or `zh`) selecting the language of every human-readable string Norn renders into issue comments, including the worker's summary instruction.
+_Avoid_: Locale, i18n bundle

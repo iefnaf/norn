@@ -103,6 +103,8 @@ import type {
 } from '../runstate/types.ts'
 import { fsWorkspaceCleanup, shipClose } from '../ship/close.ts'
 import type { ShipCloseDeps, ShipCloseParams } from '../ship/close.ts'
+import { deliveredMarker, renderDeliveredComment } from '../ship/render-comments.ts'
+import type { ShippableChange } from '../runstate/types.ts'
 import { osTargetLock, runStateShipCheckpointStore, shipPush } from '../ship/push.ts'
 import type { ShipPushDeps, ShipPushParams, ShipTargetLock } from '../ship/push.ts'
 import { acceptedSnapshotFrom, snapshotMapPayload } from '../ship/reconcile.ts'
@@ -1676,6 +1678,7 @@ async function runOneWork(
     setup: ctx.config.setup,
     tests: ctx.config.tests,
     maxWorkRounds: ctx.config.maxWorkRounds,
+    commentLanguage: ctx.config.commentLanguage,
     agents: {
       worker: ctx.config.worker,
       reviewer: { ...ctx.config.reviewer, family: ctx.reviewerFamily },
@@ -1897,6 +1900,13 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
     actorId: ctx.actorId,
   }
 
+  // --- the delivered comment: the worker's summary, before any push (§11.3) --
+
+  const delivered = await postDeliveredComment(ctx, change)
+  if (delivered !== undefined) {
+    return { kind: 'stop', outcome: delivered }
+  }
+
   const pushed = await shipPush(pushDeps, pushParams)
   if (pushed.kind === 'error') {
     return { kind: 'stop', outcome: failureOutcome(ctx, pushed) }
@@ -1950,6 +1960,7 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
     targetBranch: ctx.branch,
     trustedEvidenceAuthorIds: ctx.config.trustedEvidenceAuthorIds,
     alreadyShipped: ctx.sharedWrite,
+    commentLanguage: ctx.config.commentLanguage,
   }
   const closed = await shipClose(closeDeps, closeParams)
   if (closed.kind === 'error') {
@@ -1961,6 +1972,76 @@ async function shipOne(ctx: RunContext, state: RunState, issueId: string): Promi
   ctx.sharedWrite = true
   ctx.warnings.push(...closed.value.warnings)
   return { kind: 'next', state: reloaded.value!, value: null }
+}
+
+/**
+ * Post the ticket's delivered comment before its push (§10.2, §11.3): the
+ * worker's sealed PR-style summary plus deterministic gate facts, rendered
+ * in the configured comment language. The comment is unmarked prose the §14
+ * envelope grammar ignores; replay idempotency comes from the identity
+ * marker line — an identical existing comment is reused, a divergent one is
+ * left untouched with a warning, and an unknown write result is a
+ * recoverable run-scoped error with the shared-write state recorded.
+ */
+async function postDeliveredComment(
+  ctx: RunContext,
+  change: ShippableChange,
+): Promise<RunMapOutcome | undefined> {
+  const expected = renderDeliveredComment({
+    runId: ctx.runId,
+    change,
+    gate: ctx.gate,
+    targetBranch: ctx.branch,
+    language: ctx.config.commentLanguage,
+  })
+  const marker = deliveredMarker(ctx.runId, change.ticket.number, change.candidateCommit)
+  const locator = {
+    githubHost: change.ticket.githubHost,
+    number: change.ticket.number,
+    url: change.ticket.url,
+  }
+  const read = await ctx.deps.evidence.loadIssueEvidence(locator)
+  if (read.kind === 'error') {
+    return runFailure(ctx, 'evidence-read',
+      `reading ticket #${change.ticket.number} before its delivered comment failed: ${read.reason}`,
+      [{ ticketIssueId: change.ticket.issueId }])
+  }
+  if (read.kind === 'blocked') {
+    return terminalFailure(ctx, undefined, 'blocked', 'changed-input',
+      `delivery evidence of ticket #${change.ticket.number} could not be read before its ` +
+        `delivered comment: ${read.reason}`,
+      [{ ticketIssueId: change.ticket.issueId, code: read.code }])
+  }
+  const existing = read.value.comments.find(
+    (comment) => comment.body.split('\n')[0] === marker,
+  )
+  if (existing !== undefined) {
+    // The marker binds this run: a remotely present delivered comment this
+    // run authored is a proven shared write, so an interrupted coordinator
+    // that resumes over it restores exact shared-write accounting (§9).
+    ctx.sharedWrite = true
+    if (existing.body !== expected) {
+      ctx.warnings.push(
+        `the delivered comment of ticket #${change.ticket.number} already exists with different ` +
+          'bytes; it was left untouched',
+      )
+    }
+    return undefined
+  }
+  const written = await ctx.deps.writer.writeIssueComment(locator, expected)
+  if (written.kind !== 'ok') {
+    return error({
+      scope: 'run',
+      code: 'comment-write',
+      reason:
+        `writing the delivered comment of ticket #${change.ticket.number} returned an unknown ` +
+        `result: ${written.reason}`,
+      sharedWrite: ctx.sharedWrite ? 'confirmed' : 'unknown',
+      evidence: [...written.evidence, { ticketIssueId: change.ticket.issueId }],
+    })
+  }
+  ctx.sharedWrite = true
+  return undefined
 }
 
 /**

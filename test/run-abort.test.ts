@@ -165,6 +165,7 @@ async function runOnce(
     /** Fire this controller's abort once the given issue's close succeeded. */
     readonly interruptAfterCloseOf?: { readonly controller: AbortController; readonly number: number }
     readonly push?: GitPushSeam
+    /** Die at the first record comment of this issue number (§14 envelope). */
     readonly dieAtCommentOf?: number
     readonly dieAroundPush?: boolean
     /** Die at the map's evidence read once its record comment is written. */
@@ -197,7 +198,12 @@ async function runOnce(
       : {
           writer: {
             writeIssueComment: async (locator, body) => {
-              if (locator.number === wraps.dieAtCommentOf) throw new CoordinatorDeath('comment')
+              if (
+                locator.number === wraps.dieAtCommentOf &&
+                body.includes('norn:record')
+              ) {
+                throw new CoordinatorDeath('comment')
+              }
               return base.writer.writeIssueComment(locator, body)
             },
             closeIssue: base.writer.closeIssue,
@@ -505,8 +511,9 @@ describe('confirmed abort reconciliation (§2.3, §13.2)', () => {
   it('records aborted with the confirmed integration write, leaving the pushed commit and all remote evidence intact', async () => {
     const harness = await makeRunHarness({ label: 'abort-confirmed', members: [ticketA({ worker: FILE_BEHAVIOR })] })
     try {
-      // Coordinator dies after the push was remotely verified but before any
-      // GitHub write: a confirmed shared write nothing later reconciled.
+      // Coordinator dies after the push was remotely verified, before the
+      // record comment (the delivered comment already landed): a confirmed
+      // shared write nothing later reconciled.
       const died = await runOnce(harness, { dieAtCommentOf: 1 })
       assert.ok('died' in died)
       const midShip = harness.runState()!
@@ -531,14 +538,15 @@ describe('confirmed abort reconciliation (§2.3, §13.2)', () => {
         },
       ])
 
-      // Remote evidence intact: same target history, no record comment, no
-      // close, no reopen, nothing rolled back.
+      // Remote evidence intact: same target history, no record comment (the
+      // delivered comment stands as unmarked prose), no close, no reopen.
       assert.deepEqual(harness.remoteLog(), remoteLogAfterPush)
       assert.equal(harness.store.issues.get(1)!.state, 'OPEN')
-      assert.equal(harness.store.issues.get(1)!.comments.length, 0)
+      assert.equal(harness.store.issues.get(1)!.comments.length, 1)
       assert.equal(harness.store.observed.closeCalls, 0)
       assert.equal(harness.store.observed.reopenCalls, 0)
-      assert.equal(harness.store.observed.commentCalls, 0)
+      // One comment total: the run's delivered comment; the abort wrote none.
+      assert.equal(harness.store.observed.commentCalls, 1)
 
       // Run State is retained with the aborted decision, never deleted.
       const state = harness.runState()!
@@ -573,9 +581,10 @@ describe('confirmed abort reconciliation (§2.3, §13.2)', () => {
       assert.equal(writes[0]!.provenBy, 'remote-probe')
       assert.equal(writes[0]!.integratedSha, checkpoint.integratedSha)
 
-      // The pushed commit stays on the target; the open Ticket keeps no record.
+      // The pushed commit stays on the target; the open Ticket keeps no
+      // record — only the pre-push delivered comment.
       assert.equal(harness.remoteLog().length, 2)
-      assert.equal(harness.store.issues.get(1)!.comments.length, 0)
+      assert.equal(harness.store.issues.get(1)!.comments.length, 1)
       assert.equal(harness.runState()!.status, 'aborted')
     } finally {
       harness.cleanup()
@@ -869,7 +878,7 @@ describe('the next run after abort starts fresh (§2.5)', () => {
         ? aborted.tickets.I_B.change.workspace.path
         : undefined
       assert.ok(runOneBWorkspace !== undefined && existsSync(runOneBWorkspace))
-      assert.equal(harness.store.issues.get(1)!.comments.length, 1)
+      assert.equal(harness.store.issues.get(1)!.comments.length, 2)
 
       // The next run works from current facts: a new run ID, an empty parked
       // set, and only #2 reworked — #1's remote Delivery Record retains it.
@@ -894,7 +903,7 @@ describe('the next run after abort starts fresh (§2.5)', () => {
         !runTwoLaunches.some((entry) => entry.cwd === runOneBWorkspace),
         'no agent of the fresh run ever ran in the aborted run workspace',
       )
-      assert.equal(harness.store.issues.get(1)!.comments.length, 1)
+      assert.equal(harness.store.issues.get(1)!.comments.length, 2)
       assert.equal(harness.store.observed.closeCalls, 2) // #1 once, #2 once
     } finally {
       harness.cleanup()
@@ -926,7 +935,7 @@ describe('the next run after abort starts fresh (§2.5)', () => {
       assert.equal(state.tickets.I_A!.phase, 'completed')
       assert.equal(harness.store.observed.pushes, 1)
       assert.equal(harness.remoteLog().length, 2)
-      assert.equal(harness.store.issues.get(1)!.comments.length, 1)
+      assert.equal(harness.store.issues.get(1)!.comments.length, 3)
       assert.equal(harness.store.issues.get(1)!.state, 'CLOSED')
       assert.equal(harness.store.issues.get(MAP_NUMBER)!.state, 'CLOSED')
     } finally {
