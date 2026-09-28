@@ -130,6 +130,24 @@ describe('herdr CLI plans', () => {
     })
   })
 
+  it('pins the created tab to a given workspace, keeping the flag off without one', () => {
+    const pinned = planHerdrTabCreate({
+      cwd: '/ws/att-1',
+      label: 'norn-ag-invocation-1',
+      env: [],
+      workspace: 'w53',
+    })
+    assert.deepEqual(pinned.args.slice(0, 4), ['tab', 'create', '--workspace', 'w53'])
+    assert.ok(pinned.args.includes('--no-focus'))
+
+    const unpinned = planHerdrTabCreate({
+      cwd: '/ws/att-1',
+      label: 'norn-ag-invocation-1',
+      env: [],
+    })
+    assert.ok(!unpinned.args.includes('--workspace'))
+  })
+
   it('closes the owned tab, and keeps closing the pane of a tab-less handle', () => {
     assert.deepEqual(planHerdrTabClose('w10:t9'), {
       file: 'herdr',
@@ -418,6 +436,37 @@ describe('herdr version gate', () => {
 })
 
 describe('HerdrAgentRunner against a scripted CLI', () => {
+  it('pins the agent tab to the workspace the runner was constructed with', async () => {
+    const { exec, plans } = execRecorder([
+      { stdout: HERDR_VERSION_OK },
+      { stdout: TAB_CREATED },
+      { stdout: AGENT_STARTED },
+      { stdout: AGENT_PROMPTED },
+    ])
+    const runner = new HerdrAgentRunner(
+      exec,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'w53',
+    )
+    const area = await createRunArea('pinned')
+    const context = buildContext(area, { role: 'worker', phase: 'work' })
+
+    await runner.launch({
+      context,
+      argv: ['pi', '--', 'brief text'],
+      cwd: area.workspacePath,
+      env: {},
+    })
+
+    const tabCreate = plans[1]
+    assert.equal(tabCreate.args[0], 'tab')
+    assert.equal(tabCreate.args[1], 'create')
+    assert.deepEqual(tabCreate.args.slice(2, 4), ['--workspace', 'w53'])
+  })
+
   it('launches into a fresh tab, then starts kind pi in that tab\'s root pane', async () => {
     const { exec, plans, executionTimeouts } = execRecorder([
       { stdout: HERDR_VERSION_OK },
