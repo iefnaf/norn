@@ -38,7 +38,7 @@ import type {
   RunState,
   TestEvidence,
 } from '../src/runstate/types.ts'
-import { assertTwoAxisReviewerProtocol } from './helpers/agent-prompt-fixtures.ts'
+import { assertTwoAxisReviewerInstructions } from './helpers/agent-prompt-fixtures.ts'
 import { commandFailure } from './helpers/ship-fixtures.ts'
 import { recordingLock } from './helpers/push-fixtures.ts'
 import { advanceRemoteTarget } from './helpers/push-fixtures.ts'
@@ -83,7 +83,7 @@ const ticket9 = (overrides: Partial<MemberSpec> = {}): MemberSpec => ({
 // ---------------------------------------------------------------------------
 
 describe('the Task Map completion Reviewer prompt', () => {
-  it('applies the shared two-axis protocol to the complete normalized map', () => {
+  it('applies the shared two-axis instructions to the complete normalized map', () => {
     const input: MapCompletionReviewerLaunchInput = {
       invocationId: 'run-1-map-completion-reviewer',
       map: {
@@ -117,7 +117,7 @@ describe('the Task Map completion Reviewer prompt', () => {
     })
     const prompt = plan.argv.at(-1)!
 
-    assertTwoAxisReviewerProtocol(prompt)
+    assertTwoAxisReviewerInstructions(prompt)
     assert.match(prompt, /complete Task Map/)
     assert.match(prompt, /norn-map-completion-review-brief:v1/)
   })

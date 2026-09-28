@@ -48,7 +48,7 @@ import type {
   ShipReconcileParams,
 } from '../src/ship/reconcile.ts'
 
-import { assertTwoAxisReviewerProtocol } from './helpers/agent-prompt-fixtures.ts'
+import { assertTwoAxisReviewerInstructions } from './helpers/agent-prompt-fixtures.ts'
 import {
   ACTOR_ID,
   evidenceRead,
@@ -86,7 +86,7 @@ import type { RepoHarness } from './helpers/ship-fixtures.ts'
 // ---------------------------------------------------------------------------
 
 describe('the reconciled Ship Reviewer prompt', () => {
-  it('applies the shared two-axis protocol while preserving Ship-specific context', () => {
+  it('applies the shared two-axis instructions while preserving Ship-specific context', () => {
     const input: ReviewerLaunchInput = {
       spec: {
         mapTitle: 'map',
@@ -118,7 +118,7 @@ describe('the reconciled Ship Reviewer prompt', () => {
     })
     const prompt = plan.argv.at(-1)!
 
-    assertTwoAxisReviewerProtocol(prompt)
+    assertTwoAxisReviewerInstructions(prompt)
     assert.match(prompt, /reconciled Ship candidate/)
     assert.match(prompt, /zero-delta finale/)
     assert.match(prompt, /reconciled diff/)

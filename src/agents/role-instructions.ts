@@ -1,22 +1,22 @@
 /**
  * Norn-owned agent role instructions.
  *
- * These strings are part of Norn's versioned launch protocol. They adapt
- * useful implementation practices without discovering or invoking external
- * skills from an operator's machine.
+ * These strings are versioned with Norn's launch code. They adapt useful
+ * implementation practices without discovering or invoking external skills
+ * from an operator's machine.
  */
 
-/** The implementation discipline shared by every Worker invocation. */
-export const WORKER_IMPLEMENTATION_PROTOCOL =
-  'Implementation protocol: implement the bound Effective Ticket Spec on this attempt-owned branch. ' +
+/** The implementation guidance shared by every Worker invocation. */
+export const WORKER_IMPLEMENTATION_INSTRUCTIONS =
+  'Implementation instructions: implement the bound Effective Ticket Spec on this attempt-owned branch. ' +
   'Work test-first where practical, at stable, pre-agreed seams. Run typechecking and focused tests regularly ' +
   'while working, then run the appropriate full test suite before handoff when the repository supports it. ' +
   'Commit the completed work to the current attempt branch. Do not perform or launch a self-review; Norn ' +
   "launches a fresh independent Reviewer after its setup and test gates. Your checks guide implementation but do not replace Norn's " +
   'coordinator-owned setup, test, candidate-verification, or seal gates. '
 
-/** The two-axis judgment discipline shared by every independent Reviewer. */
-export const REVIEWER_TWO_AXIS_PROTOCOL =
+/** The two-axis judgment guidance shared by every independent Reviewer. */
+export const REVIEWER_TWO_AXIS_INSTRUCTIONS =
   'Review on two separate axes. Standards axis: inspect repository-authored instructions and coding standards with your ' +
   'read-only tools, and report material code-quality findings that require judgment; do not duplicate checks already proven ' +
   'by the supplied tool evidence. Spec axis: judge the complete candidate against the bound specification, identifying ' +

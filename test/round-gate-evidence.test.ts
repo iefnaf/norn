@@ -28,7 +28,7 @@ import {
 } from '../src/work/round-gate.ts'
 import type { ReviewerLaunchInput, SealCheckFacts } from '../src/work/round-gate.ts'
 
-import { assertTwoAxisReviewerProtocol } from './helpers/agent-prompt-fixtures.ts'
+import { assertTwoAxisReviewerInstructions } from './helpers/agent-prompt-fixtures.ts'
 import {
   commitInWorkspace,
   committingWorker,
@@ -252,7 +252,7 @@ describe('the read-only reviewer launch policy', () => {
     }
   })
 
-  it('owns the two-axis Reviewer protocol without nested agents or runtime skills', () => {
+  it('owns the two-axis Reviewer instructions without nested agents or runtime skills', () => {
     const plan = piReadOnlyReviewerLaunch(reviewerInput, {
       model: 'provider-b/model-y',
       thinking: 'high',
@@ -261,7 +261,7 @@ describe('the read-only reviewer launch policy', () => {
     })
     const prompt = plan.argv.at(-1)!
 
-    assertTwoAxisReviewerProtocol(prompt)
+    assertTwoAxisReviewerInstructions(prompt)
   })
 
   it('tells the reviewer when it is judging a zero-delta assertion', () => {
@@ -283,7 +283,7 @@ describe('the read-only reviewer launch policy', () => {
     assert.equal(isReadOnlyAgentArgv(['pi', '--tools', '']), false)
   })
 
-  it('owns the Worker implementation protocol without invoking runtime skills', () => {
+  it('owns the Worker implementation instructions without invoking runtime skills', () => {
     const plan = piWorkerLaunch(
       { round: 1, previousCandidateCommit: null, feedback: [], commentLanguage: 'en' },
       { model: 'provider-a/model-x', thinking: 'medium', extensionPath: '/norn/extension.ts', piSessionId: 'pi-2' },

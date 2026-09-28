@@ -77,7 +77,7 @@ import type {
   ReviewerCompletion,
 } from '../agents/completion.ts'
 import { planAgentPiArgv } from '../agents/herdr-runner.ts'
-import { REVIEWER_TWO_AXIS_PROTOCOL } from '../agents/role-protocol.ts'
+import { REVIEWER_TWO_AXIS_INSTRUCTIONS } from '../agents/role-instructions.ts'
 import { runAgentInvocation } from '../agents/runner.ts'
 import type { AgentSettlementErrorCode, VisibleAgentRunner } from '../agents/runner.ts'
 import type { RunConfigAgentRole, RunConfigCommand } from '../config/run-config.ts'
@@ -936,7 +936,7 @@ function renderMapCompletionReviewerPrompt(input: MapCompletionReviewerLaunchInp
     'Judge whether the complete Task Map — its shared specification, every member Ticket ' +
     'specification, membership, and dependency topology — is satisfied by the repository at ' +
     'the bound completion commit, using the ordered completion test evidence. ' +
-    REVIEWER_TWO_AXIS_PROTOCOL +
+    REVIEWER_TWO_AXIS_INSTRUCTIONS +
     'Every member Ticket is already a verified Completed Ticket; your verdict completes the map. ' +
     'Finish with the norn_complete tool: pass, iterate with feedback, or a typed block. ' +
     'Review briefing (JSON):\n' +

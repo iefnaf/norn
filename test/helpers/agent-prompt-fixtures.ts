@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 
-/** Assert the Norn-owned protocol common to every independent Reviewer. */
-export function assertTwoAxisReviewerProtocol(prompt: string): void {
+/** Assert the Norn-owned instructions common to every independent Reviewer. */
+export function assertTwoAxisReviewerInstructions(prompt: string): void {
   assert.match(prompt, /Standards axis/)
   assert.match(prompt, /repository-authored instructions and coding standards/)
   assert.match(prompt, /Spec axis/)
