@@ -229,3 +229,43 @@ delivery records plus one map-completion record (`closingEventId`
 `CE_lADOUfl3ds8AAAABR4m41M8AAAAHWg0AyQ`, `completionSha` `fe998e7`).
 Terminal RunReport of run `run-3a2406368f837d59`: `passed`, shared write
 `confirmed`, every member `completed`.
+
+## Staged round and review comments live validation (2026-09-28, #40)
+
+Norn `81b5003` (v0.3.0, PR #41), isolated `PI_CODING_AGENT_DIR`,
+evidence dir `/tmp/norn-e2e-40-20260928T074228Z`. Worker
+`deepseek/deepseek-flash` (low), reviewer `zhipu/glm-5.3` (low),
+`commentLanguage: zh`, proxy `127.0.0.1:7890` via `agentEnv`.
+
+Two non-destructive scenarios on `iefnaf/taskflow-dag-demo` (no reset, no
+force push, no deletions):
+
+1. **Map #13 re-run** (`run-a09d0685a551cb65`): member #12's delivery
+   record validated, completion gates green at `1b9cfb6` (33 tests), and
+   this completion reviewer — unlike the run-6c99e03c reviewer over the
+   same tree — passed the map. `passed`, map closed, one completion
+   record, zero new commits. The completion-findings comment was therefore
+   not exercised live: reviewer attestation varies between invocations
+   over identical facts, and a live non-pass completion gate cannot be
+   forced without deliberately breaking the target. Its L0 coverage
+   (`test/map-completion.test.ts`: iterate findings and command-excerpt
+   shapes, marker `norn:findings`) stands.
+2. **Map #16 / ticket #17** (`run-536c542e09e8b27c`): the aggregator fix
+   (register `count.test.js`, plus a query-string module isolation the
+   worker discovered was required once aggregation shared a process).
+   Ticket #17's comment area is the complete staged record, in order:
+   `norn:handoff …#17@wa-w1-t17/r1` (PR-style summary verbatim, base →
+   candidate facts), `norn:verdict …r1` (pass, both axes, reviewer
+   identity), `norn:delivered …@38cbcd5…`, and the merged record with the
+   folded `norn-delivery:v1` envelope (`nornVersion 0.3.0`). All zh, each
+   marker exactly once, no duplicates. One linear commit
+   `9dfe41a` (`norn: ship ticket #17`, committer
+   `Norn <norn@delivery.invalid>`, tree `6568730…` matching the record);
+   `npm test` at the tip is 37/37 (4 previously-dead count tests now
+   execute). Map #16 closed with one completion record. No leftover
+   agent tabs or active process checkpoints; fixture tree clean.
+
+Not exercised live: the Work-phase iterate verdict comment (this worker
+passed round 1; the verdict machinery is identical for pass and iterate
+and the completion-findings gap above is the same rendering path), the
+park comment, and crash-replay dedup (L3 territory).

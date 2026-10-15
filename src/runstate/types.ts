@@ -127,6 +127,12 @@ export type ShippableChange = {
   readonly workspace: WorkspaceRef
   readonly tests: readonly TestEvidence[]
   readonly review: ReviewEvidence
+  /**
+   * The worker's PR-style delivery summary (§10.2), rendered verbatim into
+   * the ticket's delivered comment. Optional on read: seals produced before
+   * this field existed render a facts-only delivered comment.
+   */
+  readonly summary?: string
 }
 
 /** The sealed execution gate a remote record was produced under (§14). */

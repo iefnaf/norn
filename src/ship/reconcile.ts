@@ -54,6 +54,7 @@ import { AGENT_COMPLETION_SCHEMA, GIT_OBJECT_OID_PATTERN } from '../agents/compl
 import type { AgentCompletionContext, ReviewerCompletion } from '../agents/completion.ts'
 import { NORN_AGENT_CONTEXT_ENV } from '../agents/completion-extension.ts'
 import { planAgentPiArgv } from '../agents/herdr-runner.ts'
+import { REVIEWER_TWO_AXIS_INSTRUCTIONS } from '../agents/role-instructions.ts'
 import { runAgentInvocation } from '../agents/runner.ts'
 import type { AgentSettlementErrorCode, VisibleAgentRunner } from '../agents/runner.ts'
 import { evaluateDeliveryEvidence } from '../evidence/delivery.ts'
@@ -398,6 +399,7 @@ function renderShipReviewerPrompt(input: ReviewerLaunchInput): string {
     'read-only tools. Judge whether the reconciled candidate satisfies the open Ticket ' +
     'against the bound target base and the complete final tree, using the ' +
     'coordinator-generated diff and the ordered ship test evidence. ' +
+    REVIEWER_TWO_AXIS_INSTRUCTIONS +
     (input.candidate.zeroDelta
       ? 'This is a zero-delta finale: the final tree equals the current target tree, so ' +
         'judge the assertion that the existing target already satisfies the Ticket. '

@@ -77,6 +77,7 @@ import type {
   ReviewerCompletion,
 } from '../agents/completion.ts'
 import { planAgentPiArgv } from '../agents/herdr-runner.ts'
+import { REVIEWER_TWO_AXIS_INSTRUCTIONS } from '../agents/role-instructions.ts'
 import { runAgentInvocation } from '../agents/runner.ts'
 import type { AgentSettlementErrorCode, VisibleAgentRunner } from '../agents/runner.ts'
 import type { RunConfigAgentRole, RunConfigCommand } from '../config/run-config.ts'
@@ -934,9 +935,10 @@ function renderMapCompletionReviewerPrompt(input: MapCompletionReviewerLaunchInp
     'You are the independent Norn Reviewer for Task Map completion. You have read-only tools. ' +
     'Judge whether the complete Task Map — its shared specification, every member Ticket ' +
     'specification, membership, and dependency topology — is satisfied by the repository at ' +
-    'the bound completion commit, using the ordered completion test evidence. Every member ' +
-    'Ticket is already a verified Completed Ticket; your verdict completes the map. Finish ' +
-    'with the norn_complete tool: pass, iterate with feedback, or a typed block. ' +
+    'the bound completion commit, using the ordered completion test evidence. ' +
+    REVIEWER_TWO_AXIS_INSTRUCTIONS +
+    'Every member Ticket is already a verified Completed Ticket; your verdict completes the map. ' +
+    'Finish with the norn_complete tool: pass, iterate with feedback, or a typed block. ' +
     'Review briefing (JSON):\n' +
     canonicalJson(brief as CanonicalJsonValue)
   )
@@ -1517,7 +1519,7 @@ async function runCompletionGates(
   if (setup.kind !== 'ok') return setup
   const setupFailure = firstNonPass(setup.value)
   if (setupFailure !== undefined) {
-    return completionGateFailed(params, 'setup', setupFailure.index, setupFailure.detail)
+    return completionGateFailed(params, completionAttemptId, 'setup', setupFailure.index, setupFailure.detail)
   }
   const tests = await runGateCommandList(gateDeps, {
     commands: params.tests,
@@ -1527,7 +1529,7 @@ async function runCompletionGates(
   if (tests.kind !== 'ok') return tests
   const testFailure = firstNonPass(tests.value)
   if (testFailure !== undefined) {
-    return completionGateFailed(params, 'tests', testFailure.index, testFailure.detail)
+    return completionGateFailed(params, completionAttemptId, 'tests', testFailure.index, testFailure.detail)
   }
   const evidence = mapCompletionTests(tests.value, completionSha, treeOid)
   const problem = gateMatchesTests(params.gate, evidence)
@@ -1825,13 +1827,13 @@ async function runCompletionReviewer(
   if (settlement.kind === 'blocked') {
     // Unreachable through this seam (no operator signal is wired into the
     // completion reviewer); a typed block cannot pass the §15 gate anyway.
-    return completionGateFailed(params, 'review', null, { verdict: 'aborted' })
+    return completionGateFailed(params, attempt.completionAttemptId, 'review', null, { verdict: 'aborted' })
   }
   if (settlement.kind !== 'ok') return settlement
 
   const verdict = settlement.value.completion as ReviewerCompletion
   if (verdict.discriminant !== 'pass') {
-    return completionGateFailed(params, 'review', null, {
+    return completionGateFailed(params, attempt.completionAttemptId, 'review', null, {
       verdict: verdict.discriminant,
       ...(verdict.discriminant === 'iterate' ? { feedback: verdict.feedback } : {}),
       ...(verdict.discriminant === 'block' ? { code: verdict.code, reason: verdict.reason } : {}),
@@ -3111,6 +3113,7 @@ function gatesOf(checkpoint: MapCompletionCheckpoint): SealedGates {
 /** The run-scoped `blocked(map-completion-gate-failed)` of §15. */
 function completionGateFailed(
   params: MapCompletionParams,
+  attemptId: string,
   gate: 'setup' | 'tests' | 'review',
   index: number | null,
   detail: CanonicalJsonValue,
@@ -3122,7 +3125,7 @@ function completionGateFailed(
       `the ${gate} gate of the map completion did not pass; the Map remains open with findings ` +
       '(design.md §15)',
     sharedWrite: params.alreadyShipped ? 'confirmed' : 'none',
-    evidence: [{ gate, ...(index === null ? {} : { index }), detail }],
+    evidence: [{ attemptId, gate, ...(index === null ? {} : { index }), detail }],
   })
 }
 

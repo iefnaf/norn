@@ -17,7 +17,7 @@ import { describe, it } from 'node:test'
 
 import { error } from '../src/core/outcome.ts'
 import { canonicalJson } from '../src/core/canonical-json.ts'
-import { formatRecordEnvelope } from '../src/evidence/envelope.ts'
+import { renderMergedRecordComment } from '../src/ship/render-comments.ts'
 import { loadRunState } from '../src/runstate/run-state-store.ts'
 import type { TaskMapSnapshot } from '../src/map/snapshot.ts'
 import { member as memberOf, rawRef } from './helpers/map-fixtures.ts'
@@ -42,9 +42,14 @@ import type { CloseHarness } from './helpers/close-fixtures.ts'
 import { fsWorkspaceCleanup } from '../src/ship/close.ts'
 import { TICKET_ISSUE_ID, memberC, snapshotOf, ticket7 } from './helpers/ship-fixtures.ts'
 
-/** The byte-exact machine comment of the sealed record. */
+/** The byte-exact merged record comment of the sealed record (§11.3 wrapper). */
 function canonicalBody(harness: CloseHarness): string {
-  return formatRecordEnvelope(canonicalJson(harness.fixture.record as never))
+  return renderMergedRecordComment({
+    record: harness.fixture.record,
+    canonicalText: canonicalJson(harness.fixture.record as never),
+    zeroDelta: harness.fixture.checkpoint.zeroDelta,
+    language: 'en',
+  })
 }
 
 /** Seed the identical record comment exactly as a prior invocation left it. */

@@ -41,6 +41,7 @@ const DEFAULT_WORKER: AgentCompletion = {
   discriminant: 'candidate',
   claimedCommit: `sha1:${'a'.repeat(40)}`,
   claimedTreeOid: `sha1:${'b'.repeat(40)}`,
+  summary: 'fake worker delivery summary',
 }
 
 function defaultCompletion(context: { role: string }): AgentCompletion {
@@ -88,7 +89,7 @@ async function writeMalformedSidecar(
   if (kind === 'bad-oid') {
     const doc = sidecarDocument(
       context,
-      { discriminant: 'candidate', claimedCommit: 'deadbeef', claimedTreeOid: 'sha1:' + 'c'.repeat(40) },
+      { discriminant: 'candidate', claimedCommit: 'deadbeef', claimedTreeOid: 'sha1:' + 'c'.repeat(40), summary: 'bad-oid fixture summary' },
       agentRecordedAt(),
     )
     await writeFile(path, encodeSidecar(doc), 'utf8')

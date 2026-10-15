@@ -12,6 +12,7 @@ import type { AgentRoleInput, CommandSpecInput } from '../runner/init.ts'
 import type { AbortInteraction, AbortRunSummary } from '../run/abort.ts'
 import type { CatalogModel, ThinkingLevel } from '../adapters/model-catalog.ts'
 import { SUGGESTED_COMMAND_TIMEOUT_MS } from '../config/run-config.ts'
+import type { CommentLanguage } from '../config/run-config.ts'
 
 /** The dialog slice of Pi's extension UI this adapter needs. */
 export type DialogUi = {
@@ -190,6 +191,18 @@ export function dialogInitInteraction(ui: DialogUi): InitInteraction {
       )
       if (answer === undefined) return undefined
       return parseNumber(answer, suggested)
+    },
+
+    async chooseCommentLanguage(suggested) {
+      const answer = await ui.input(
+        'Comment language for delivery comments (en or zh)',
+        suggested,
+      )
+      if (answer === undefined) return undefined
+      // An empty answer accepts the suggestion, like every other choice.
+      const normalized = answer.trim().toLowerCase()
+      if (normalized === '') return suggested
+      return normalized === 'en' || normalized === 'zh' ? (normalized as CommentLanguage) : undefined
     },
 
     async chooseAgentEnvironment() {

@@ -76,6 +76,13 @@ export type WorkerCompletion =
       readonly discriminant: 'candidate'
       readonly claimedCommit: GitObjectOid
       readonly claimedTreeOid: GitObjectOid
+      /**
+       * The worker's PR-style delivery summary (design.md §10.2): rendered
+       * verbatim into the ticket's delivered comment. Validated by
+       * `workerSummaryProblem` — non-empty markdown, bounded length, and no
+       * machine-comment marker imitation.
+       */
+      readonly summary: string
     }
   | {
       readonly discriminant: 'block'
@@ -260,17 +267,49 @@ function readWorkInput(value: unknown): AgentWorkInputBinding | undefined {
  * for both tool-call parameters arriving in a Pi process and parsed sidecar
  * content; only the closed discriminants and codes pass.
  */
+/**
+ * The worker's human-readable delivery summary (design.md §10.2): markdown
+ * in the PR-body structure — Summary (visual), Evidence (before/after),
+ * Merge Danger (door + blast radius). Sealed into the `ShippableChange` and
+ * rendered into the ticket's delivered comment by Ship.
+ */
+export const WORKER_SUMMARY_MAX_LENGTH = 16_000
+
+/**
+ * A summary must never imitate Norn machine-comment markup: prose carrying
+ * the record marker could make an unmarked comment parse as a Delivery
+ * Record candidate and poison §14 evaluation (§14 envelope grammar).
+ */
+export const WORKER_SUMMARY_FORBIDDEN = 'norn:record'
+
+/** The specific problem with a candidate `summary` value, or `undefined`. */
+export function workerSummaryProblem(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length === 0) {
+    return 'summary must be a non-empty markdown string'
+  }
+  if (value.length > WORKER_SUMMARY_MAX_LENGTH) {
+    return `summary must not exceed ${WORKER_SUMMARY_MAX_LENGTH} characters`
+  }
+  if (value.includes(WORKER_SUMMARY_FORBIDDEN)) {
+    return `summary must not contain "${WORKER_SUMMARY_FORBIDDEN}" (machine-comment marker)`
+  }
+  return undefined
+}
+
 export function validateWorkerCompletion(value: unknown): WorkerCompletion | undefined {
   if (!isPlainObject(value)) return undefined
   switch (value.discriminant) {
-    case 'candidate':
+    case 'candidate': {
       if (!isGitObjectOid(value.claimedCommit)) return undefined
       if (!isGitObjectOid(value.claimedTreeOid)) return undefined
+      if (workerSummaryProblem(value.summary) !== undefined) return undefined
       return {
         discriminant: 'candidate',
         claimedCommit: value.claimedCommit,
         claimedTreeOid: value.claimedTreeOid,
+        summary: value.summary as string,
       }
+    }
     case 'block':
       if (!WORKER_BLOCK_CODES.includes(value.code as WorkerBlockCode)) return undefined
       if (typeof value.reason !== 'string' || value.reason.length === 0) return undefined

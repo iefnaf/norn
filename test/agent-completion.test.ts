@@ -32,6 +32,7 @@ const WORKER_CANDIDATE = {
   discriminant: 'candidate',
   claimedCommit: `sha1:${'c'.repeat(40)}`,
   claimedTreeOid: `sha1:${'d'.repeat(40)}`,
+  summary: 'worker candidate summary',
 } as const
 
 async function writeDoctoredSidecar(
@@ -146,6 +147,22 @@ describe('typed completions', () => {
     assert.deepEqual(validateWorkerCompletion(block), block)
 
     assert.equal(validateWorkerCompletion({ ...WORKER_CANDIDATE, claimedCommit: 'deadbeef' }), undefined)
+    // §10.2: the candidate summary is required, bounded, and may never
+    // imitate the machine-comment marker (§14 envelope forgery guard).
+    assert.equal(validateWorkerCompletion({ ...WORKER_CANDIDATE, summary: undefined }), undefined)
+    assert.equal(validateWorkerCompletion({ ...WORKER_CANDIDATE, summary: '' }), undefined)
+    assert.equal(
+      validateWorkerCompletion({ ...WORKER_CANDIDATE, summary: 'x'.repeat(16_001) }),
+      undefined,
+    )
+    assert.equal(
+      validateWorkerCompletion({ ...WORKER_CANDIDATE, summary: 'see <!-- norn:record --> above' }),
+      undefined,
+    )
+    assert.deepEqual(
+      validateWorkerCompletion({ ...WORKER_CANDIDATE, summary: 'x'.repeat(16_000) }),
+      { ...WORKER_CANDIDATE, summary: 'x'.repeat(16_000) },
+    )
     assert.equal(
       validateWorkerCompletion({ discriminant: 'block', code: 'made-up', reason: 'x' }),
       undefined,

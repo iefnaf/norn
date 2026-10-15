@@ -39,7 +39,7 @@ npm test
 Install the published package from npm into Pi:
 
 ```bash
-pi install npm:@alexlikevibe/norn@0.2.0
+pi install npm:@alexlikevibe/norn
 ```
 
 Or install directly from git:

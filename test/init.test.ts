@@ -139,6 +139,9 @@ function scriptedInteraction(
     async chooseTrustedEvidenceAuthors() {
       return []
     },
+    async chooseCommentLanguage(suggested) {
+      return suggested
+    },
     async confirmReplaceConfig(existing, proposed) {
       recorder.confirmedExisting = existing
       recorder.confirmedProposed = proposed
@@ -312,6 +315,7 @@ describe('initRepository: successful setup', () => {
         worker: WORKER,
         reviewer: REVIEWER,
         trustedEvidenceAuthorIds: ['I_actor', 'I_alpha', 'I_zeta'],
+        commentLanguage: 'en',
       })
       assert.equal(outcome.value.replacedExistingConfig, false)
       const loaded = await loadRunConfig(environment.store, environment.home)
@@ -414,6 +418,7 @@ describe('initRepository: quick flow', () => {
         maxWorkRounds: 3,
         maxPushRetries: 2,
         concurrency: 4,
+        commentLanguage: 'en',
         agentEnv: {},
         worker: { model: 'provider-a/model-x', thinking: 'high', timeoutMs: 3_600_000 },
         reviewer: { model: 'provider-b/model-y', thinking: 'high', timeoutMs: 1_800_000 },

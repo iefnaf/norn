@@ -55,10 +55,10 @@ import { canonicalJsonDigest } from '../core/digest.ts'
 import { blocked, error, ok } from '../core/outcome.ts'
 import type { Evidence, Outcome } from '../core/outcome.ts'
 
-import type { RunConfigAgentRole, RunConfigCommand } from '../config/run-config.ts'
+import type { RunConfigAgentRole, RunConfigCommand, CommentLanguage } from '../config/run-config.ts'
 import { encodePathSegment } from '../config/paths.ts'
 import type { GitCommandRunner } from '../adapters/git-repository.ts'
-import { AGENT_COMPLETION_SCHEMA } from '../agents/completion.ts'
+import { AGENT_COMPLETION_SCHEMA, workerSummaryProblem } from '../agents/completion.ts'
 import type {
   AgentCompletionContext,
   AgentMapBinding,
@@ -74,6 +74,10 @@ import {
   NORN_REVIEWER_TOOL_ALLOWLIST,
 } from '../agents/completion-extension.ts'
 import { herdrAgentName, planAgentPiArgv } from '../agents/herdr-runner.ts'
+import {
+  REVIEWER_TWO_AXIS_INSTRUCTIONS,
+  WORKER_IMPLEMENTATION_INSTRUCTIONS,
+} from '../agents/role-instructions.ts'
 import { interruptAgentInvocation, settleAgentInvocation } from '../agents/runner.ts'
 import type {
   AgentSettlementBlockCode,
@@ -178,6 +182,11 @@ export type WorkerLaunchInput = {
    * feedback. Entries keep the round numbers they were recorded under.
    */
   readonly feedback: readonly RoundFeedback[]
+  /**
+   * The language the worker's delivery summary must be written in (§8): the
+   * summary is rendered verbatim into the ticket's human-readable comments.
+   */
+  readonly commentLanguage: CommentLanguage
 }
 
 /** The captured output of one passing test, handed to the reviewer. */
@@ -210,6 +219,59 @@ export type ReviewerLaunchInput = {
 export type AgentLaunchPlan = {
   readonly argv: readonly string[]
   readonly env?: Readonly<Record<string, string>>
+}
+
+// ---------------------------------------------------------------------------
+// Staged round comments (#40, §10.2)
+// ---------------------------------------------------------------------------
+
+/** One staged round-comment emission: a handoff or a verdict event. */
+export type RoundCommentEvent =
+  | {
+      readonly kind: 'handoff'
+      readonly round: number
+      /** The worker's delivery summary of this round. */
+      readonly summary: string
+      /** The base the candidate was judged against, for the facts line. */
+      readonly base: GitObjectOid
+      /** The independently verified candidate facts of this round. */
+      readonly candidate: {
+        readonly commit: GitObjectOid
+        readonly treeOid: GitObjectOid
+        readonly zeroDelta: boolean
+      }
+    }
+  | {
+      readonly kind: 'verdict'
+      readonly round: number
+      /** The settled reviewer verdict: pass, or iterate with findings. */
+      readonly verdict: SettledVerdict
+    }
+
+/** A settled reviewer verdict a staged comment may render: pass or iterate. */
+export type SettledVerdict = Extract<ReviewerCompletion, { readonly discriminant: 'pass' | 'iterate' }>
+
+/**
+ * The staged round-comment sink (#40): the coordinator renders and posts
+ * the issue comments from these events. Round comments are idempotent,
+ * replayable side records (§9) — the sink must never fail the attempt, and
+ * the gate treats every sink failure (including a throw) as a non-event.
+ */
+export interface RoundCommentSink {
+  emit(event: RoundCommentEvent): Promise<void>
+}
+
+/** Emit one round-comment event; a failing side record never affects the attempt. */
+async function emitRoundComment(deps: RoundGateDeps, event: RoundCommentEvent): Promise<void> {
+  const sink = deps.roundComments
+  if (sink === undefined) return
+  try {
+    await sink.emit(event)
+  } catch {
+    // Side-record semantics (#40): posting progress must never change a
+    // Work outcome. The posting wiring records its own warnings; anything
+    // that still throws is swallowed here by policy.
+  }
 }
 
 export type WorkerLaunchPlanner = (input: WorkerLaunchInput) => AgentLaunchPlan
@@ -265,6 +327,13 @@ export function modelProvider(modelId: string): string {
   return slash === -1 ? modelId : modelId.slice(0, slash)
 }
 
+/** The one sentence instructing the worker's summary language (§8, §10.2). */
+function summaryLanguageInstruction(language: CommentLanguage): string {
+  return language === 'zh'
+    ? '用中文撰写交付总结（可以用英文代码标识符）。 '
+    : 'Write the delivery summary in English. '
+}
+
 function renderWorkerPrompt(input: WorkerLaunchInput): string {
   const brief = {
     schema: 'norn-worker-brief:v1',
@@ -278,8 +347,17 @@ function renderWorkerPrompt(input: WorkerLaunchInput): string {
   return (
     'You are the Norn Worker for this Ticket. The launch context bound in NORN_AGENT_CONTEXT ' +
     'carries the Effective Ticket Spec and the exact target base. Amend the attempt-owned ' +
-    'branch in this workspace; finish with the norn_complete tool, handing off either your ' +
-    'candidate commit and tree OIDs or a typed block. ' +
+    'branch in this workspace. ' +
+    WORKER_IMPLEMENTATION_INSTRUCTIONS +
+    'Finish with the norn_complete tool, handing off your candidate commit and tree OIDs ' +
+    'together with a delivery summary, or a typed block. ' +
+    'The summary is PR-body markdown with three sections — "## Summary" showing the change as ' +
+    'a diff-sketch, shallow file tree, or pseudocode view; "## Evidence" with concrete ' +
+    'before/after (the exact test or command output that failed before and passes now); ' +
+    '"## Merge Danger" naming a one-way or two-way door and a one-word blast radius. ' +
+    'Norn renders your summary verbatim into the ticket\'s round handoff comment of each round; keep prose ' +
+    'brief and never write the text "norn:record". ' +
+    summaryLanguageInstruction(input.commentLanguage) +
     (carried
       ? "The feedback below was carried from a previous run's parked attempt for this Ticket; " +
         'entries keep the round numbers they were recorded under. '
@@ -329,6 +407,7 @@ function renderReviewerPrompt(input: ReviewerLaunchInput): string {
     'You are the independent Norn Reviewer. You have read-only tools. Judge whether the ' +
     'candidate satisfies the open Ticket against the bound base and complete candidate ' +
     'tree, using the coordinator-generated diff and the ordered test evidence. ' +
+    REVIEWER_TWO_AXIS_INSTRUCTIONS +
     (input.candidate.zeroDelta
       ? 'This is a zero-delta candidate: the tree equals the base tree, so judge the ' +
         'assertion that the existing target already satisfies the Ticket. '
@@ -454,6 +533,8 @@ export type RoundGateDeps = {
   readonly slotWaitMs?: number
   /** Poll interval while waiting for shared capacity; default 100 ms. */
   readonly slotPollMs?: number
+  /** The staged round-comment sink (#40); absent posts no round comments. */
+  readonly roundComments?: RoundCommentSink
 }
 
 /** The immutable input plus everything the gate needs to execute one attempt. */
@@ -479,6 +560,8 @@ export type WorkAttemptParams = {
   readonly setup: readonly RunConfigCommand[]
   readonly tests: readonly RunConfigCommand[]
   readonly maxWorkRounds: number
+  /** The configured comment language (§8); forwarded to every worker launch. */
+  readonly commentLanguage: CommentLanguage
   readonly agents: {
     readonly worker: RunConfigAgentRole
     readonly reviewer: RunConfigAgentRole & { readonly family: string }
@@ -683,6 +766,10 @@ export function verifySealedChange(change: ShippableChange, facts: SealCheckFact
   }
   if (!sameJson(change.workspace, facts.workspace)) {
     violations.push('the sealed workspace must equal the attempt-owned workspace')
+  }
+  const summaryProblem = workerSummaryProblem(change.summary)
+  if (summaryProblem !== undefined) {
+    violations.push(`the sealed summary is invalid: ${summaryProblem}`)
   }
 
   if (change.tests.length !== facts.configuredTests.length) {
@@ -1149,6 +1236,7 @@ async function runRound(
     round: round.round,
     previousCandidateCommit: round.previousCandidate,
     feedback: round.feedback,
+    commentLanguage: params.commentLanguage,
   })
   const workerContext = completionContext(params, state.workspace, {
     invocationId: workerId,
@@ -1207,6 +1295,18 @@ async function runRound(
     }
   }
   const zeroDelta = candidate.treeOid === input.target.baseTreeOid
+
+  // --- staged record: the round handoff comment (#40, §10.2) -------------
+
+  // Posted after the candidate verification accepted the handoff, before
+  // the round's setup and test gates — a side record, never a gate.
+  await emitRoundComment(deps, {
+    kind: 'handoff',
+    round: round.round,
+    summary: handoff.summary,
+    base: input.target.baseSha,
+    candidate: { commit: candidate.head, treeOid: candidate.treeOid, zeroDelta },
+  })
 
   // --- setup again at the candidate tree ----------------------------------
 
@@ -1310,6 +1410,17 @@ async function runRound(
       }),
     }
   }
+
+  // --- staged record: the review verdict comment (#40, §10.2) ------------
+
+  // pass and iterate both surface; a reviewer block parks the Ticket and
+  // its park comment carries the code and reason instead.
+  await emitRoundComment(deps, {
+    kind: 'verdict',
+    round: round.round,
+    verdict,
+  })
+
   if (verdict.discriminant === 'iterate') {
     return {
       kind: 'continue',
@@ -1350,6 +1461,7 @@ async function runRound(
     workspace: state.workspace,
     tests: evidence,
     review,
+    summary: handoff.summary,
   }
   const violations = verifySealedChange(change, {
     input,

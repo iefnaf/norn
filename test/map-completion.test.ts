@@ -20,8 +20,13 @@ import type { CanonicalJsonValue } from '../src/core/canonical-json.ts'
 import { canonicalJsonDigest } from '../src/core/digest.ts'
 import { resolveRunConfigText } from '../src/config/run-config.ts'
 import { computeDeliveryId } from '../src/evidence/delivery.ts'
-import { computeCompletionId, mapCompletionRecordProblems } from '../src/run/completion.ts'
-import { MAP_COMPLETION_RECORD_SCHEMA } from '../src/run/completion.ts'
+import {
+  MAP_COMPLETION_RECORD_SCHEMA,
+  computeCompletionId,
+  mapCompletionRecordProblems,
+  piMapCompletionReviewerLaunch,
+} from '../src/run/completion.ts'
+import type { MapCompletionReviewerLaunchInput } from '../src/run/completion.ts'
 import { formatRecordEnvelope, parseRecordEnvelope } from '../src/evidence/envelope.ts'
 import type { IssueTimelineEvent } from '../src/evidence/read.ts'
 import { runMap } from '../src/run/lifecycle.ts'
@@ -33,6 +38,7 @@ import type {
   RunState,
   TestEvidence,
 } from '../src/runstate/types.ts'
+import { assertTwoAxisReviewerInstructions } from './helpers/agent-prompt-fixtures.ts'
 import { commandFailure } from './helpers/ship-fixtures.ts'
 import { recordingLock } from './helpers/push-fixtures.ts'
 import { advanceRemoteTarget } from './helpers/push-fixtures.ts'
@@ -70,6 +76,51 @@ const ticket9 = (overrides: Partial<MemberSpec> = {}): MemberSpec => ({
   issueId: 'I_9',
   number: 9,
   ...overrides,
+})
+
+// ---------------------------------------------------------------------------
+// The Task Map completion Reviewer prompt (§15)
+// ---------------------------------------------------------------------------
+
+describe('the Task Map completion Reviewer prompt', () => {
+  it('applies the shared two-axis instructions to the complete normalized map', () => {
+    const input: MapCompletionReviewerLaunchInput = {
+      invocationId: 'run-1-map-completion-reviewer',
+      map: {
+        title: 'Map',
+        body: 'Shared intent',
+        mapRevision: 'sha256:' + '1'.repeat(64),
+        members: [
+          {
+            issueId: 'I_A',
+            number: 1,
+            title: 'Ticket A',
+            body: 'Requirement A',
+            ticketRevision: 'sha256:' + '2'.repeat(64),
+            blockedBy: [],
+          },
+        ],
+      },
+      target: {
+        branch: 'main',
+        completionSha: 'sha1:' + '3'.repeat(40),
+        treeOid: 'sha1:' + '4'.repeat(40),
+      },
+      tests: [],
+      testOutput: [],
+    }
+    const plan = piMapCompletionReviewerLaunch(input, {
+      model: 'provider-b/model-y',
+      thinking: 'high',
+      extensionPath: '/norn/extension.ts',
+      piSessionId: 'map-completion-review-pi',
+    })
+    const prompt = plan.argv.at(-1)!
+
+    assertTwoAxisReviewerInstructions(prompt)
+    assert.match(prompt, /complete Task Map/)
+    assert.match(prompt, /norn-map-completion-review-brief:v1/)
+  })
 })
 
 const configRevisionOfFixture = (() => {
@@ -574,10 +625,19 @@ describe('map completion — gate failures', () => {
       assert.equal(outcome.scope, 'run')
       assert.equal(outcome.sharedWrite, 'confirmed')
 
-      // The Map remains open with findings; nothing closed or commented.
+      // The Map remains open; nothing closed. The staged findings comment
+      // of #40 posts the completion reviewer's verdict on the Map issue.
       assert.equal(mapIssueOf(harness).state, 'OPEN')
       assert.equal(harness.store.observed.mapCloseCalls, 0)
-      assert.equal(harness.store.observed.mapCommentCalls, 0)
+      assert.equal(harness.store.observed.mapCommentCalls, 1)
+      const mapComments = mapIssueOf(harness).comments
+      assert.equal(mapComments.length, 1)
+      const findings = mapComments[0]!.body
+      assert.match(findings, /^<!-- norn:findings run-1@run-1-mc1 -->$/m)
+      assert.match(findings, /Map completion review failed: \*\*iterate\*\*/)
+      assert.match(findings, /the map is not done/)
+      assert.match(findings, /\*\*Reviewer\*\* `provider-b\/model-y` \(high\)/)
+      assert.match(findings, /The Map remains open/)
       const state = harness.runState()!
       assert.equal(state.status, 'terminal')
       assert.equal(state.report?.code, 'map-completion-gate-failed')
@@ -616,6 +676,14 @@ describe('map completion — gate failures', () => {
 
       assert.equal(mapIssueOf(harness).state, 'OPEN')
       assert.equal(harness.store.observed.mapCloseCalls, 0)
+      // The staged findings comment of #40: a failed completion test gate
+      // posts the bounded command excerpt on the Map issue.
+      assert.equal(harness.store.observed.mapCommentCalls, 1)
+      const findings = mapIssueOf(harness).comments[0]!.body
+      assert.match(findings, /^<!-- norn:findings run-crafted@run-crafted-mc1 -->$/m)
+      assert.match(findings, /Map completion tests failed:/)
+      assert.match(findings, /`npm test`/)
+      assert.match(findings, /completion tests fail/)
       const state = harness.runState()!
       assert.equal(state.report?.sharedWrite, 'none')
       assert.equal(state.report?.code, 'map-completion-gate-failed')

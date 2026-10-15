@@ -24,6 +24,17 @@ import { isDeniedEnvironmentName } from '../work/environment.ts'
 
 export const RUN_CONFIG_SCHEMA = 'norn-run:v1' as const
 
+/**
+ * The language Norn renders human-readable issue comments in (§8): the
+ * worker's summary-language instruction, the delivered comment's generated
+ * facts, and the merged record comment's prose.
+ */
+export type CommentLanguage = 'en' | 'zh'
+
+export const COMMENT_LANGUAGES: readonly CommentLanguage[] = ['en', 'zh']
+
+export const DEFAULT_COMMENT_LANGUAGE: CommentLanguage = 'en'
+
 /** A configured command: an argument array plus a wall-clock budget. */
 export type RunConfigCommand = {
   readonly argv: readonly string[]
@@ -53,6 +64,7 @@ export type ResolvedRunConfig = {
   readonly worker: RunConfigAgentRole
   readonly reviewer: RunConfigAgentRole
   readonly trustedEvidenceAuthorIds: readonly string[]
+  readonly commentLanguage: CommentLanguage
 }
 
 export type RunConfigResolution = {
@@ -81,6 +93,7 @@ export const RUN_CONFIG_DEFAULTS = Object.freeze({
   maxWorkRounds: 3,
   maxPushRetries: 2,
   concurrency: 4,
+  commentLanguage: DEFAULT_COMMENT_LANGUAGE,
 } as const)
 
 /**
@@ -104,6 +117,7 @@ const TOP_LEVEL_KEYS = [
   'worker',
   'reviewer',
   'trustedEvidenceAuthorIds',
+  'commentLanguage',
 ] as const
 
 const COMMAND_KEYS = ['argv', 'timeoutMs'] as const
@@ -332,6 +346,15 @@ function checkTrustedEvidenceAuthorIds(
   return sorted
 }
 
+function checkCommentLanguage(value: unknown, violations: string[]): CommentLanguage | undefined {
+  if (value === undefined) return RUN_CONFIG_DEFAULTS.commentLanguage
+  if (value !== 'en' && value !== 'zh') {
+    violations.push('commentLanguage must be "en" or "zh"')
+    return undefined
+  }
+  return value
+}
+
 /**
  * Validate and expand one parsed `config.json` value into the resolved Run
  * Config document and its `configRevision`. All independently discoverable
@@ -367,6 +390,7 @@ export function resolveRunConfig(
     input.trustedEvidenceAuthorIds,
     violations,
   )
+  const commentLanguage = checkCommentLanguage(input.commentLanguage, violations)
 
   if (resolveModelFamily !== undefined && worker !== undefined && reviewer !== undefined) {
     const workerFamily = resolveModelFamily(worker.model)
@@ -394,6 +418,7 @@ export function resolveRunConfig(
     worker === undefined ||
     reviewer === undefined ||
     trustedEvidenceAuthorIds === undefined ||
+    commentLanguage === undefined ||
     violations.length > 0
   ) {
     return invalidConfig(violations)
@@ -411,6 +436,7 @@ export function resolveRunConfig(
     worker,
     reviewer,
     trustedEvidenceAuthorIds,
+    commentLanguage,
   }
   return ok({ config, configRevision: runConfigRevision(config) })
 }

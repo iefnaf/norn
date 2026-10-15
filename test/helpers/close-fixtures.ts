@@ -424,6 +424,7 @@ export type RunCloseScript = {
 
 export type CloseHarnessOptions = {
   readonly label: string
+  readonly commentLanguage?: 'en' | 'zh'
   readonly zeroDelta?: boolean
   readonly stage?: ShipCheckpoint['stage']
   /** A map with blockers for blocker-revalidation coverage. */
@@ -680,6 +681,7 @@ export function makeCloseHarness(options: CloseHarnessOptions): CloseHarness {
       targetBranch: 'main',
       trustedEvidenceAuthorIds: [ACTOR_ID],
       alreadyShipped: options.alreadyShipped ?? false,
+      commentLanguage: options.commentLanguage ?? 'en',
     }
 
     return shipClose(deps, params)

@@ -67,7 +67,17 @@ export function productionRunAdapters(ctx: RunCommandContext): RunCommandAdapter
     evidence: ghApiEvidenceReader(),
     gitFacts: gitCliDeliveryFacts(),
     store: fsControlStore(resolveNornHome(process.env, homedir())),
-    runner: new HerdrAgentRunner(),
+    // The run command lives in the operator's Herdr pane, so the workspace
+    // identity Herdr exported into this process pins every agent tab of the
+    // run to that workspace instead of wherever the operator's focus is.
+    runner: new HerdrAgentRunner(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      process.env.HERDR_WORKSPACE_ID,
+    ),
     commands: new ProcessGroupCommandRunner(),
     workGit: runGit,
     gitDetailed: runGitDetailed,

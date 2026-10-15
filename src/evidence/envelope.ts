@@ -148,3 +148,21 @@ export function parseRecordEnvelope(body: string): RecordEnvelope {
 export function formatRecordEnvelope(canonicalText: string): string {
   return `${NORN_RECORD_MARKER}\n\`\`\`${RECORD_FENCE_INFO}\n${canonicalText}\n\`\`\`\n`
 }
+
+/**
+ * Render the human-readable record comment (§11.3, §14): a headline and a
+ * collapsed `<details>` block around the exact machine envelope. The prose
+ * lives outside the envelope, which `parseRecordEnvelope` ignores, so the
+ * canonical record bytes, `deliveryId`, and every §14 predicate are
+ * unchanged. `headline` and `detailsLabel` are Norn-generated prose and must
+ * never contain a `json`-fenced block.
+ */
+export function formatFoldedRecordComment(
+  headline: string,
+  detailsLabel: string,
+  canonicalText: string,
+): string {
+  return `${headline}\n<details>\n<summary>${detailsLabel}</summary>\n\n${formatRecordEnvelope(
+    canonicalText,
+  )}</details>\n`
+}
