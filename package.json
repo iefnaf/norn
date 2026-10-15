@@ -11,6 +11,7 @@
   },
   "homepage": "https://github.com/iefnaf/norn#readme",
   "bugs": "https://github.com/iefnaf/norn/issues",
+  "license": "MIT",
   "type": "module",
   "files": [
     "src",
