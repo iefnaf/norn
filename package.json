@@ -1,12 +1,22 @@
 {
-  "name": "norn",
+  "name": "@iefnaf/norn",
   "version": "0.2.0",
   "description": "Weave the graph. Prove the outcome. A deterministic runner for GitHub Task Maps.",
   "keywords": [
     "pi-package"
   ],
-  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/iefnaf/norn.git"
+  },
+  "homepage": "https://github.com/iefnaf/norn#readme",
+  "bugs": "https://github.com/iefnaf/norn/issues",
   "type": "module",
+  "files": [
+    "src",
+    "docs",
+    "CONTEXT.md"
+  ],
   "scripts": {
     "build": "tsc --noEmit",
     "test": "node --test \"test/*.test.ts\""
