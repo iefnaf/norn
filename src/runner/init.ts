@@ -3,11 +3,15 @@
  *
  * The operation resolves the repository root and the stable GitHub repository
  * identity — requiring explicit operator selection when multiple remotes are
- * plausible — then collects typed operator choices for the Run Config,
- * validates them against the authenticated model catalog, and writes
- * `metadata.json` and `config.json` under repository home in Norn home. No LLM
- * is asked to invent configuration, and nothing is written inside the target
- * repository's working tree.
+ * plausible — then runs a quick flow: setup and test commands are detected
+ * from the repository's own build files when recognized, and the operator
+ * picks only the exact Worker and Reviewer models (the reviewer selection
+ * also offers Customize, which re-asks every field explicitly). Every other
+ * field takes its fixed default. All answers are validated against the
+ * authenticated model catalog, then `metadata.json` and `config.json` are
+ * written under repository home in Norn home. No LLM is asked to invent
+ * configuration, and nothing is written inside the target repository's
+ * working tree.
  *
  * All policy lives here. The typed interaction contract below crosses the
  * extension boundary: the extension renders each question with its dialogs and
@@ -25,9 +29,12 @@ import type {
   ResolvedGitHubRepository,
 } from '../adapters/github-gateway.ts'
 import type { CatalogModel, ModelCatalogAdapter, ThinkingLevel } from '../adapters/model-catalog.ts'
-import { modelFamilyResolver } from '../adapters/model-catalog.ts'
+import { highestThinkingLevel, modelFamilyResolver } from '../adapters/model-catalog.ts'
 import type { LocalControlStore, RepositoryMetadata } from '../control/control-store.ts'
 import { REPOSITORY_METADATA_SCHEMA } from '../control/control-store.ts'
+import type { WorkspaceReaderAdapter } from '../adapters/workspace-reader.ts'
+import type { DetectedCommandPlan } from './command-detection.ts'
+import { detectWorkspaceCommandPlan } from './command-detection.ts'
 import type {
   ResolvedRunConfig,
   RunConfigResolution,
@@ -69,18 +76,37 @@ export type AgentRoleInput = {
 /** Explicit extra environment entries for every child agent pane. */
 export type AgentEnvironmentInput = Readonly<Record<string, string>>
 
+/** The operator's quick model pick, or the request for the full question set. */
+export type QuickAgentModelChoice = CatalogModel | 'customize'
+
 /**
  * The typed choice contract crossing the extension boundary (§6). Every method
  * receives complete question data and returns the operator's answer as data;
  * `undefined` means the operator cancelled the dialog. The extension owns no
  * policy: it renders the question and parses operator input into these
  * shapes, while validation of every answer happens in this module.
+ *
+ * The quick flow is the default path: when command detection recognized the
+ * workspace, the only dialogs are the two model picks, and every other field
+ * comes from the fixed schema defaults, the remote default branch, the
+ * strongest supported thinking level, and the suggested budgets. When
+ * detection failed, `chooseTestCommands` asks for the machine gate directly —
+ * Norn never invents one. The reviewer model list ends with a `customize`
+ * entry that enters the full question set below, where the operator answers
+ * every field explicitly.
  */
 export type InitInteraction = {
   /** Explicit selection among plausible GitHub remotes (§2.3). */
   selectRepositoryIdentity(
     options: readonly PlausibleRepositoryRemote[],
   ): Promise<PlausibleRepositoryRemote | undefined>
+  /** Asked only when command detection failed: the tests gate must be explicit. */
+  chooseTestCommands(): Promise<readonly CommandSpecInput[] | undefined>
+  /** One quick model pick per role; the reviewer list ends with `customize`. */
+  chooseQuickAgentModel(
+    role: 'worker' | 'reviewer',
+    models: readonly CatalogModel[],
+  ): Promise<QuickAgentModelChoice | undefined>
   /** Target branch; the remote default branch is offered as the suggestion. */
   chooseTargetBranch(suggested: string): Promise<string | undefined>
   /** Zero or more setup commands (`setup`) or one or more test commands (`tests`). */
@@ -124,6 +150,7 @@ export type InitErrorCode =
   | 'git-failed'
   | 'github-unavailable'
   | 'model-catalog-unavailable'
+  | 'workspace-read'
   | 'control-store'
 
 export type InitReport = {
@@ -133,6 +160,8 @@ export type InitReport = {
   readonly config: ResolvedRunConfig
   readonly configRevision: Sha256Digest
   readonly replacedExistingConfig: boolean
+  /** Detection provenance of the written commands, e.g. `npm (package-lock.json)`. */
+  readonly detectedCommandSource: string | undefined
 }
 
 export type InitOutcome = Outcome<InitReport, InitBlockCode, InitErrorCode>
@@ -144,6 +173,7 @@ export type InitDeps = {
   readonly gateway: GitHubGatewayAdapter
   readonly catalog: ModelCatalogAdapter
   readonly store: LocalControlStore
+  readonly workspace: WorkspaceReaderAdapter
   readonly interaction: InitInteraction
 }
 
@@ -296,10 +326,19 @@ export async function initRepository(deps: InitDeps): Promise<InitOutcome> {
     })
   }
 
-  const answers = await askInitChoices(deps.interaction, repository.value, actor.value, models.value)
-  if (answers.kind !== 'ok') return answers
+  const detected = await detectWorkspaceCommandPlan(deps.workspace, root.value)
+  if (detected.kind !== 'ok') {
+    return error({ scope: 'operation', code: detected.code, reason: detected.reason })
+  }
 
-  const validated = validateAnswersAndBuildConfig(answers.value, actor.value, models.value)
+  const quick = await askQuickChoices(deps.interaction, repository.value, models.value, detected.value)
+  if (quick.kind !== 'ok') return quick
+
+  const detectedCommandSource = quick.value.kind === 'answers' ? quick.value.detectedCommandSource : undefined
+  const validated =
+    quick.value.kind === 'customize'
+      ? await customizeAllChoices(deps.interaction, repository.value, actor.value, models.value)
+      : validateAnswersAndBuildConfig(quick.value.answers, actor.value, models.value)
   if (validated.kind !== 'ok') return validated
 
   const metadata: RepositoryMetadata = {
@@ -365,9 +404,96 @@ export async function initRepository(deps: InitDeps): Promise<InitOutcome> {
     config: validated.value.config,
     configRevision: validated.value.configRevision,
     replacedExistingConfig,
+    detectedCommandSource,
   })
 }
 
+/** Everything the quick flow decided, or the request for the full question set. */
+type QuickChoices =
+  | {
+      readonly kind: 'answers'
+      readonly answers: InitAnswers
+      readonly detectedCommandSource: string | undefined
+    }
+  | { readonly kind: 'customize' }
+
+/**
+ * The quick flow: detected (or explicitly entered) commands plus two model
+ * picks, everything else from the fixed defaults. The reviewer pick only
+ * offers families different from the chosen worker's, so a quick write always
+ * satisfies family divergence — unless the whole catalog shares one family,
+ * in which case validation blocks with the explicit rule. Either model pick
+ * may return `'customize'` to enter the full question set.
+ */
+async function askQuickChoices(
+  interaction: InitInteraction,
+  repository: ResolvedGitHubRepository,
+  models: readonly CatalogModel[],
+  detected: DetectedCommandPlan | undefined,
+): Promise<Outcome<QuickChoices, 'operator-cancelled', never>> {
+  let setup = detected?.setup ?? []
+  let tests = detected?.tests
+  let detectedCommandSource = detected?.source
+  if (tests === undefined) {
+    const entered = await interaction.chooseTestCommands()
+    if (entered === undefined) return cancelled('test commands')
+    setup = []
+    tests = entered
+    detectedCommandSource = undefined
+  }
+
+  const workerChoice = await interaction.chooseQuickAgentModel('worker', models)
+  if (workerChoice === undefined) return cancelled('quick worker model')
+  if (workerChoice === 'customize') return ok({ kind: 'customize' })
+
+  const divergentFamilies = models.filter((model) => model.family !== workerChoice.family)
+  const reviewerChoice = await interaction.chooseQuickAgentModel(
+    'reviewer',
+    divergentFamilies.length > 0 ? divergentFamilies : models,
+  )
+  if (reviewerChoice === undefined) return cancelled('quick reviewer model')
+  if (reviewerChoice === 'customize') return ok({ kind: 'customize' })
+
+  return ok({
+    kind: 'answers',
+    detectedCommandSource,
+    answers: {
+      targetBranch: repository.defaultBranch,
+      setup,
+      tests,
+      worker: {
+        model: workerChoice.id,
+        thinking: highestThinkingLevel(workerChoice),
+        timeoutMs: SUGGESTED_WORKER_TIMEOUT_MS,
+      },
+      reviewer: {
+        model: reviewerChoice.id,
+        thinking: highestThinkingLevel(reviewerChoice),
+        timeoutMs: SUGGESTED_REVIEWER_TIMEOUT_MS,
+      },
+      maxWorkRounds: RUN_CONFIG_DEFAULTS.maxWorkRounds,
+      maxPushRetries: RUN_CONFIG_DEFAULTS.maxPushRetries,
+      concurrency: RUN_CONFIG_DEFAULTS.concurrency,
+      commentLanguage: RUN_CONFIG_DEFAULTS.commentLanguage,
+      agentEnv: {},
+      trustedEvidenceAuthorIds: [],
+    },
+  })
+}
+
+/** The full question set, reached only when the operator picks Customize. */
+async function customizeAllChoices(
+  interaction: InitInteraction,
+  repository: ResolvedGitHubRepository,
+  actor: GitHubActor,
+  models: readonly CatalogModel[],
+): Promise<Outcome<ValidatedConfig, 'operator-cancelled' | 'invalid-choice', never>> {
+  const answers = await askInitChoices(interaction, repository, actor, models)
+  if (answers.kind !== 'ok') return answers
+  return validateAnswersAndBuildConfig(answers.value, actor, models)
+}
+
+/** The complete explicit question set (§2.3), one field at a time. */
 async function askInitChoices(
   interaction: InitInteraction,
   repository: ResolvedGitHubRepository,

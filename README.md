@@ -34,4 +34,18 @@ npm run build   # typecheck
 npm test
 ```
 
-To try the package in a Pi session without installing it: `pi -e /path/to/norn`. To install: `pi install git:github.com/iefnaf/norn`.
+## Install
+
+Install the published package from npm into Pi:
+
+```bash
+pi install npm:@alexlikevibe/norn
+```
+
+Or install directly from git:
+
+```bash
+pi install git:github.com/iefnaf/norn
+```
+
+To try the package in a Pi session without installing it: `pi -e /path/to/norn`.

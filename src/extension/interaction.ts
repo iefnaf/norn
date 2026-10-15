@@ -3,7 +3,9 @@
  * §2.1, §6): each typed runner question becomes dialogs, and operator input is
  * parsed back into the typed answer shapes. This file renders and parses; it
  * never decides — validation of every answer happens in the runner, and a
- * cancelled dialog surfaces as `undefined`.
+ * cancelled dialog surfaces as `undefined`. The quick flow is usually two
+ * model picks; choosing Customize on the reviewer list renders the full
+ * question set.
  */
 import type { InitInteraction, PlausibleRepositoryRemote } from '../runner/init.ts'
 import type { AgentRoleInput, CommandSpecInput } from '../runner/init.ts'
@@ -26,12 +28,23 @@ const FIELD_LABELS: Record<'maxWorkRounds' | 'maxPushRetries' | 'concurrency', s
   concurrency: 'Repository-wide Work concurrency',
 }
 
+const QUICK_CUSTOMIZE = 'Customize every setting…'
+
 function remoteLabel(remote: PlausibleRepositoryRemote): string {
   return `${remote.owner}/${remote.name} @ ${remote.githubHost} (remotes: ${remote.remoteNames.join(', ')})`
 }
 
 function modelLabel(model: CatalogModel): string {
   return `${model.id} — ${model.displayName}`
+}
+
+/** Parse one `;`-separated line of commands into typed command entries. */
+function parseQuickCommandLines(text: string): CommandSpecInput[] {
+  return text
+    .split(';')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+    .map((line) => ({ argv: line.split(/\s+/), timeoutMs: SUGGESTED_COMMAND_TIMEOUT_MS }))
 }
 
 function parseNumber(text: string | undefined, suggested: number): number {
@@ -77,6 +90,33 @@ export function dialogInitInteraction(ui: DialogUi): InitInteraction {
         options.map(remoteLabel),
       )
       return options.find((remote) => remoteLabel(remote) === selection)
+    },
+
+    async chooseTestCommands() {
+      for (;;) {
+        const answer = await ui.input(
+          'No test commands were recognized in this repository — enter them, ";"-separated (at least one)',
+          'npm test',
+        )
+        if (answer === undefined) return undefined
+        const commands = parseQuickCommandLines(answer)
+        if (commands.length > 0) return commands
+        ui.notify('At least one test command is required.', 'warning')
+      }
+    },
+
+    async chooseQuickAgentModel(role, models) {
+      if (models.length === 0) return undefined
+      const options = models.map(modelLabel)
+      // The last quick question doubles as the escape hatch into the full
+      // question set; the worker pick stays a plain model list.
+      if (role === 'reviewer') options.push(QUICK_CUSTOMIZE)
+      const selection = await ui.select(
+        `Exact ${role} model (validated against the authenticated catalog)`,
+        options,
+      )
+      if (selection === QUICK_CUSTOMIZE) return 'customize'
+      return models.find((model) => modelLabel(model) === selection)
     },
 
     async chooseTargetBranch(suggested) {

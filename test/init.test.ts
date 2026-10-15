@@ -16,6 +16,8 @@ import { blocked, error, ok } from '../src/core/outcome.ts'
 import type { CatalogModel, ModelCatalogAdapter } from '../src/adapters/model-catalog.ts'
 import { initRepository, plausibleRemoteIdentities } from '../src/runner/init.ts'
 import { resolveNornHome } from '../src/config/paths.ts'
+import type { WorkspaceReaderAdapter } from '../src/adapters/workspace-reader.ts'
+import { fakeWorkspaceReader } from './helpers/fake-dialog-ui.ts'
 import type {
   AgentRoleInput,
   CommandSpecInput,
@@ -109,6 +111,16 @@ function scriptedInteraction(
       recorder.selected = selected
       return selected
     },
+    // Asked only when command detection fails.
+    async chooseTestCommands() {
+      return TESTS
+    },
+    async chooseQuickAgentModel(role, models) {
+      if (role === 'worker') return models.find((model) => model.id === 'provider-a/model-x') ?? models[0]!
+      return models.find((model) => model.family === 'provider-b') ?? models[0]!
+    },
+    // The full Customize question set, reached when an override returns
+    // 'customize' from chooseQuickAgentModel.
     async chooseTargetBranch(suggested) {
       return suggested
     },
@@ -166,6 +178,7 @@ function makeEnvironment(
     remotes?: readonly GitRemote[]
     gateway?: GitHubGatewayAdapter
     catalog?: ModelCatalogAdapter
+    workspace?: WorkspaceReaderAdapter
     store?: LocalControlStore
     interactionOverrides?: Partial<InitInteraction>
     existingRunStatus?: 'running' | 'terminal' | 'aborted'
@@ -194,6 +207,7 @@ function makeEnvironment(
     ]),
     gateway: recordingGateway,
     catalog: overrides.catalog ?? fakeCatalog(MODELS),
+    workspace: overrides.workspace ?? fakeWorkspaceReader(),
     store,
     interaction: scriptedInteraction(recorder, overrides.interactionOverrides),
   }
@@ -239,9 +253,12 @@ function cleanup(environment: Environment): void {
 }
 
 describe('initRepository: successful setup', () => {
-  it('writes metadata and a config with exactly the operator choices under repository home', async () => {
+  it('customize writes metadata and a config with exactly the operator choices', async () => {
     const environment = makeEnvironment({
       interactionOverrides: {
+        async chooseQuickAgentModel() {
+          return 'customize'
+        },
         async chooseCommandList(kind) {
           return kind === 'setup'
             ? [{ argv: ['npm', 'ci'], timeoutMs: 180_000 }]
@@ -341,6 +358,7 @@ describe('initRepository: successful setup', () => {
         git: fakeGit(repoTree, [{ name: 'origin', url: 'https://github.com/iefnaf/norn.git' }]),
         gateway: fakeGateway('ok'),
         catalog: fakeCatalog(MODELS),
+        workspace: fakeWorkspaceReader(),
         store,
         interaction: scriptedInteraction(recorder),
       })
@@ -378,6 +396,186 @@ describe('initRepository: successful setup', () => {
       assert.ok(isOk(outcome))
       assert.deepEqual(listFilesRecursive(environment.repoTree), before)
       assert.deepEqual(before, [])
+    } finally {
+      cleanup(environment)
+    }
+  })
+})
+
+describe('initRepository: quick flow', () => {
+  it('detects the commands and writes the complete default document verbatim', async () => {
+    const environment = makeEnvironment()
+    try {
+      const outcome = await initRepository(environment.deps)
+      assert.ok(isOk(outcome))
+
+      const config = JSON.parse(readFileSync(join(environment.home, 'config.json'), 'utf8'))
+      assert.deepEqual(config, {
+        schema: 'norn-run:v1',
+        targetBranch: 'main',
+        setup: [{ argv: ['npm', 'ci'], timeoutMs: 600_000 }],
+        tests: [{ argv: ['npm', 'test'], timeoutMs: 600_000 }],
+        maxWorkRounds: 3,
+        maxPushRetries: 2,
+        concurrency: 4,
+        commentLanguage: 'en',
+        agentEnv: {},
+        worker: { model: 'provider-a/model-x', thinking: 'high', timeoutMs: 3_600_000 },
+        reviewer: { model: 'provider-b/model-y', thinking: 'high', timeoutMs: 1_800_000 },
+        trustedEvidenceAuthorIds: ['I_actor'],
+      })
+      if (outcome.kind === 'ok') {
+        assert.equal(outcome.value.replacedExistingConfig, false)
+        assert.equal(outcome.value.detectedCommandSource, 'npm (package-lock.json)')
+      }
+    } finally {
+      cleanup(environment)
+    }
+  })
+
+  it('asks only the two model questions when commands are detected', async () => {
+    const environment = makeEnvironment()
+    try {
+      const outcome = await initRepository(environment.deps)
+      assert.ok(isOk(outcome))
+      assert.deepEqual(environment.recorder.calls, [
+        'chooseQuickAgentModel',
+        'chooseQuickAgentModel',
+      ])
+    } finally {
+      cleanup(environment)
+    }
+  })
+
+  it('an unrecognized workspace asks for the test commands and no setup', async () => {
+    const environment = makeEnvironment({
+      workspace: fakeWorkspaceReader({ 'README.md': '# demo' }),
+      interactionOverrides: {
+        async chooseTestCommands() {
+          return [{ argv: ['make', 'check'], timeoutMs: 90_000 }]
+        },
+      },
+    })
+    try {
+      const outcome = await initRepository(environment.deps)
+      assert.ok(isOk(outcome))
+      const config = JSON.parse(readFileSync(join(environment.home, 'config.json'), 'utf8'))
+      assert.deepEqual(config.setup, [])
+      assert.deepEqual(config.tests, [{ argv: ['make', 'check'], timeoutMs: 90_000 }])
+      assert.equal(environment.recorder.calls.includes('chooseTestCommands'), true)
+      if (outcome.kind === 'ok') assert.equal(outcome.value.detectedCommandSource, undefined)
+    } finally {
+      cleanup(environment)
+    }
+  })
+
+  it('a workspace read failure errors without asking anything', async () => {
+    const failingReader: WorkspaceReaderAdapter = {
+      async readTextFile() {
+        return error({ scope: 'operation', code: 'workspace-read', reason: 'permission denied' })
+      },
+    }
+    const environment = makeEnvironment({ workspace: failingReader })
+    try {
+      const outcome = await initRepository(environment.deps)
+      assert.ok(isError(outcome))
+      if (outcome.kind === 'error') assert.equal(outcome.code, 'workspace-read')
+      assert.deepEqual(environment.recorder.calls, [])
+      assert.equal(existsSync(environment.home), false)
+    } finally {
+      cleanup(environment)
+    }
+  })
+
+  it('offers the reviewer only families different from the chosen worker', async () => {
+    let reviewerOffered: readonly CatalogModel[] | undefined
+    const environment = makeEnvironment({
+      interactionOverrides: {
+        async chooseQuickAgentModel(role, models) {
+          if (role === 'reviewer') reviewerOffered = models
+          return models.find((model) => model.id === 'provider-a/model-x') ?? models[0]!
+        },
+      },
+    })
+    try {
+      const outcome = await initRepository(environment.deps)
+      assert.ok(isOk(outcome))
+      assert.notEqual(reviewerOffered, undefined)
+      assert.ok(reviewerOffered!.every((model) => model.family !== 'provider-a'))
+      assert.deepEqual(
+        reviewerOffered!.map((model) => model.id),
+        ['provider-b/model-y'],
+      )
+    } finally {
+      cleanup(environment)
+    }
+  })
+
+  it('customize from the reviewer selection runs the full question set afterwards', async () => {
+    const environment = makeEnvironment({
+      interactionOverrides: {
+        async chooseQuickAgentModel(role) {
+          return role === 'worker' ? MODELS[0]! : 'customize'
+        },
+      },
+    })
+    try {
+      const outcome = await initRepository(environment.deps)
+      assert.ok(isOk(outcome))
+      const customizeAt = environment.recorder.calls.lastIndexOf('chooseQuickAgentModel')
+      const after = environment.recorder.calls.slice(customizeAt + 1)
+      for (const question of [
+        'chooseTargetBranch',
+        'chooseCommandList',
+        'chooseAgentRole',
+        'chooseInteger',
+        'chooseAgentEnvironment',
+        'chooseTrustedEvidenceAuthors',
+      ]) {
+        assert.equal(after.includes(question), true, question)
+      }
+    } finally {
+      cleanup(environment)
+    }
+  })
+
+  it('an empty entered test list blocks as an invalid choice', async () => {
+    const environment = makeEnvironment({
+      workspace: fakeWorkspaceReader({}),
+      interactionOverrides: {
+        async chooseTestCommands() {
+          return []
+        },
+      },
+    })
+    try {
+      const outcome = await initRepository(environment.deps)
+      assert.ok(isBlocked(outcome))
+      if (outcome.kind === 'blocked') {
+        assert.equal(outcome.code, 'invalid-choice')
+        assert.match(outcome.reason, /at least one/)
+      }
+      assert.equal(existsSync(environment.home), false)
+    } finally {
+      cleanup(environment)
+    }
+  })
+
+  it('a single-family catalog blocks quick apply with the divergence rule', async () => {
+    const environment = makeEnvironment({
+      catalog: fakeCatalog([
+        { id: 'provider-a/model-x', family: 'provider-a', displayName: 'Model X', thinkingLevels: ['off', 'high'] },
+        { id: 'provider-a/model-z', family: 'provider-a', displayName: 'Model Z', thinkingLevels: ['off', 'low'] },
+      ]),
+    })
+    try {
+      const outcome = await initRepository(environment.deps)
+      assert.ok(isBlocked(outcome))
+      if (outcome.kind === 'blocked') {
+        assert.equal(outcome.code, 'invalid-choice')
+        assert.match(outcome.reason, /different provider families/)
+      }
+      assert.equal(existsSync(environment.home), false)
     } finally {
       cleanup(environment)
     }
@@ -491,6 +689,7 @@ describe('initRepository: adapter failures map to typed outcomes', () => {
         git: fakeGit(repoTree, []),
         gateway: fakeGateway('ok'),
         catalog: fakeCatalog(MODELS),
+        workspace: fakeWorkspaceReader(),
         store: fsControlStore(nornHome),
         interaction: scriptedInteraction(recorder),
       }
@@ -561,6 +760,7 @@ describe('initRepository: adapter failures map to typed outcomes', () => {
         git: fakeGit(repoTree, [{ name: 'origin', url: 'https://github.com/iefnaf/norn.git' }]),
         gateway: fakeGateway('ok'),
         catalog: fakeCatalog(MODELS),
+        workspace: fakeWorkspaceReader(),
         store: failingStore,
         interaction: scriptedInteraction(recorder),
       }
@@ -677,48 +877,85 @@ describe('initRepository: existing configuration', () => {
 })
 
 describe('initRepository: operator cancellations', () => {
-  const CANCELLATIONS: Array<{ name: string; override: Partial<InitInteraction> }> = [
+  /** Route the flow into the full Customize question set. */
+  const customize = {
+    async chooseQuickAgentModel() {
+      return 'customize' as const
+    },
+  }
+
+  const CANCELLATIONS: Array<{
+    name: string
+    override: Partial<InitInteraction>
+    emptyWorkspace?: boolean
+  }> = [
     {
-      name: 'target branch',
-      override: { async chooseTargetBranch() { return undefined } },
+      name: 'test commands when nothing is detected',
+      emptyWorkspace: true,
+      override: {
+        async chooseTestCommands() { return undefined },
+      },
     },
     {
-      name: 'setup commands',
-      override: { async chooseCommandList() { return undefined } },
+      name: 'quick worker model',
+      override: {
+        async chooseQuickAgentModel(role, models) {
+          return role === 'worker' ? undefined : models[models.length - 1]!
+        },
+      },
     },
     {
-      name: 'test commands',
-      override: { async chooseCommandList(kind) { return kind === 'tests' ? undefined : [] } },
+      name: 'quick reviewer model',
+      override: {
+        async chooseQuickAgentModel(role, models) {
+          return role === 'worker' ? models[0]! : undefined
+        },
+      },
     },
     {
-      name: 'worker role',
-      override: { async chooseAgentRole(role) { return role === 'worker' ? undefined : REVIEWER } },
+      name: 'target branch (customize)',
+      override: { ...customize, async chooseTargetBranch() { return undefined } },
     },
     {
-      name: 'reviewer role',
-      override: { async chooseAgentRole(role) { return role === 'reviewer' ? undefined : WORKER } },
+      name: 'setup commands (customize)',
+      override: { ...customize, async chooseCommandList() { return undefined } },
     },
     {
-      name: 'maxWorkRounds',
-      override: { async chooseInteger(field, suggested) { return field === 'maxWorkRounds' ? undefined : suggested } },
+      name: 'test commands (customize)',
+      override: { ...customize, async chooseCommandList(kind) { return kind === 'tests' ? undefined : [] } },
     },
     {
-      name: 'concurrency',
-      override: { async chooseInteger(field, suggested) { return field === 'concurrency' ? undefined : suggested } },
+      name: 'worker role (customize)',
+      override: { ...customize, async chooseAgentRole(role) { return role === 'worker' ? undefined : REVIEWER } },
     },
     {
-      name: 'child agent environment',
-      override: { async chooseAgentEnvironment() { return undefined } },
+      name: 'reviewer role (customize)',
+      override: { ...customize, async chooseAgentRole(role) { return role === 'reviewer' ? undefined : WORKER } },
     },
     {
-      name: 'trusted evidence authors',
-      override: { async chooseTrustedEvidenceAuthors() { return undefined } },
+      name: 'maxWorkRounds (customize)',
+      override: { ...customize, async chooseInteger(field, suggested) { return field === 'maxWorkRounds' ? undefined : suggested } },
+    },
+    {
+      name: 'concurrency (customize)',
+      override: { ...customize, async chooseInteger(field, suggested) { return field === 'concurrency' ? undefined : suggested } },
+    },
+    {
+      name: 'child agent environment (customize)',
+      override: { ...customize, async chooseAgentEnvironment() { return undefined } },
+    },
+    {
+      name: 'trusted evidence authors (customize)',
+      override: { ...customize, async chooseTrustedEvidenceAuthors() { return undefined } },
     },
   ]
 
   for (const cancellation of CANCELLATIONS) {
     it(`cancelling the ${cancellation.name} prompt blocks and writes nothing`, async () => {
-      const environment = makeEnvironment({ interactionOverrides: cancellation.override })
+      const environment = makeEnvironment({
+        workspace: cancellation.emptyWorkspace === true ? fakeWorkspaceReader({}) : undefined,
+        interactionOverrides: cancellation.override,
+      })
       try {
         const outcome: InitOutcome = await initRepository(environment.deps)
         assert.ok(isBlocked(outcome), cancellation.name)
@@ -734,17 +971,36 @@ describe('initRepository: operator cancellations', () => {
 })
 
 describe('initRepository: invalid choices', () => {
-  type Case = { name: string; override: Partial<InitInteraction>; expect?: RegExp }
+  type Case = {
+    name: string
+    override: Partial<InitInteraction>
+    expect?: RegExp
+    emptyWorkspace?: boolean
+  }
+
+  /** Route the flow into the full Customize question set. */
+  const customize = {
+    async chooseQuickAgentModel() {
+      return 'customize' as const
+    },
+  }
 
   const cases: Case[] = [
     {
-      name: 'empty test list',
-      override: { async chooseCommandList(kind) { return kind === 'setup' ? [] : [] } },
+      name: 'empty entered test list when nothing is detected',
+      emptyWorkspace: true,
+      override: { async chooseTestCommands() { return [] } },
       expect: /at least one/,
     },
     {
-      name: 'worker and reviewer in the same provider family',
+      name: 'empty test list (customize)',
+      override: { ...customize, async chooseCommandList(kind) { return kind === 'setup' ? [] : [] } },
+      expect: /at least one/,
+    },
+    {
+      name: 'worker and reviewer in the same provider family (customize)',
       override: {
+        ...customize,
         async chooseAgentRole(role) {
           return role === 'worker'
             ? WORKER
@@ -754,8 +1010,9 @@ describe('initRepository: invalid choices', () => {
       expect: /different provider families/,
     },
     {
-      name: 'model not in the catalog',
+      name: 'model not in the catalog (customize)',
       override: {
+        ...customize,
         async chooseAgentRole(role) {
           return role === 'worker'
             ? { model: 'provider-c/model-q', thinking: 'low', timeoutMs: 900_000 }
@@ -765,8 +1022,9 @@ describe('initRepository: invalid choices', () => {
       expect: /not in the authenticated model catalog/,
     },
     {
-      name: 'unsupported thinking level',
+      name: 'unsupported thinking level (customize)',
       override: {
+        ...customize,
         async chooseAgentRole(role) {
           return role === 'worker'
             ? { model: 'provider-a/model-x', thinking: 'max', timeoutMs: 3_600_000 }
@@ -776,32 +1034,34 @@ describe('initRepository: invalid choices', () => {
       expect: /not supported/,
     },
     {
-      name: 'malformed branch name',
-      override: { async chooseTargetBranch() { return '-bad branch' } },
+      name: 'malformed branch name (customize)',
+      override: { ...customize, async chooseTargetBranch() { return '-bad branch' } },
     },
     {
-      name: 'empty branch name',
-      override: { async chooseTargetBranch() { return '' } },
+      name: 'empty branch name (customize)',
+      override: { ...customize, async chooseTargetBranch() { return '' } },
     },
     {
-      name: 'non-integer attempt limit',
-      override: { async chooseInteger(field, suggested) { return field === 'maxWorkRounds' ? 2.5 : suggested } },
+      name: 'non-integer attempt limit (customize)',
+      override: { ...customize, async chooseInteger(field, suggested) { return field === 'maxWorkRounds' ? 2.5 : suggested } },
     },
     {
-      name: 'zero concurrency',
-      override: { async chooseInteger(field, suggested) { return field === 'concurrency' ? 0 : suggested } },
+      name: 'zero concurrency (customize)',
+      override: { ...customize, async chooseInteger(field, suggested) { return field === 'concurrency' ? 0 : suggested } },
     },
     {
-      name: 'NaN timeout parsed from a blank dialog',
+      name: 'NaN timeout parsed from a blank dialog (customize)',
       override: {
+        ...customize,
         async chooseCommandList(kind) {
           return kind === 'setup' ? [] : [{ argv: ['npm', 'test'], timeoutMs: Number('abc') }]
         },
       },
     },
     {
-      name: 'command with empty argv',
+      name: 'command with empty argv (customize)',
       override: {
+        ...customize,
         async chooseCommandList(kind) {
           return kind === 'setup' ? [{ argv: [], timeoutMs: 1000 }] : TESTS
         },
@@ -809,29 +1069,32 @@ describe('initRepository: invalid choices', () => {
       expect: /non-empty/,
     },
     {
-      name: 'GitHub token in child agent environment',
-      override: { async chooseAgentEnvironment() { return { GH_TOKEN: 'secret' } } },
+      name: 'GitHub token in child agent environment (customize)',
+      override: { ...customize, async chooseAgentEnvironment() { return { GH_TOKEN: 'secret' } } },
       expect: /denied credential/,
     },
     {
-      name: 'push credential in child agent environment',
-      override: { async chooseAgentEnvironment() { return { SSH_AUTH_SOCK: '/tmp/agent.sock' } } },
+      name: 'push credential in child agent environment (customize)',
+      override: { ...customize, async chooseAgentEnvironment() { return { SSH_AUTH_SOCK: '/tmp/agent.sock' } } },
       expect: /denied credential/,
     },
     {
-      name: 'empty trusted author id',
-      override: { async chooseTrustedEvidenceAuthors() { return ['I_x', ''] } },
+      name: 'empty trusted author id (customize)',
+      override: { ...customize, async chooseTrustedEvidenceAuthors() { return ['I_x', ''] } },
     },
     {
-      name: 'duplicate trusted author ids',
-      override: { async chooseTrustedEvidenceAuthors() { return ['I_x', 'I_x'] } },
+      name: 'duplicate trusted author ids (customize)',
+      override: { ...customize, async chooseTrustedEvidenceAuthors() { return ['I_x', 'I_x'] } },
       expect: /more than once/,
     },
   ]
 
   for (const testCase of cases) {
     it(`blocks invalid choice: ${testCase.name}`, async () => {
-      const environment = makeEnvironment({ interactionOverrides: testCase.override })
+      const environment = makeEnvironment({
+        workspace: testCase.emptyWorkspace === true ? fakeWorkspaceReader({}) : undefined,
+        interactionOverrides: testCase.override,
+      })
       try {
         const outcome = await initRepository(environment.deps)
         assert.ok(isBlocked(outcome), testCase.name)
@@ -854,6 +1117,9 @@ describe('initRepository: trusted evidence authors', () => {
   it('always includes the authenticated actor, in canonical order', async () => {
     const environment = makeEnvironment({
       interactionOverrides: {
+        async chooseQuickAgentModel() {
+          return 'customize'
+        },
         async chooseTrustedEvidenceAuthors() {
           return ['I_zeta', 'I_beta']
         },
@@ -877,6 +1143,9 @@ describe('initRepository: trusted evidence authors', () => {
   it('the actor id may be repeated by the operator without becoming invalid', async () => {
     const environment = makeEnvironment({
       interactionOverrides: {
+        async chooseQuickAgentModel() {
+          return 'customize'
+        },
         async chooseTrustedEvidenceAuthors() {
           return [ACTOR.id]
         },

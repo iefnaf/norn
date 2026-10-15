@@ -40,6 +40,7 @@ import { ModelRegistry, ModelRuntime } from '@earendil-works/pi-coding-agent'
 import { ghApiTaskMapLoader, ghCliGateway } from '../src/adapters/github-gateway.ts'
 import { gitCliRepository } from '../src/adapters/git-repository.ts'
 import { registryModelCatalog } from '../src/adapters/model-catalog.ts'
+import { fsWorkspaceReader } from '../src/adapters/workspace-reader.ts'
 import { fsControlStore } from '../src/control/control-store.ts'
 import { resolveNornHome } from '../src/config/paths.ts'
 import {
@@ -167,6 +168,16 @@ function scriptedInteraction(): InitInteraction {
       }
       return Promise.resolve(options[0])
     },
+    chooseTestCommands() {
+      // Only reached when detection fails; CHOICES pin the explicit answers.
+      console.log(`test commands (nothing detected): ${JSON.stringify(CHOICES.tests)}`)
+      return Promise.resolve(CHOICES.tests)
+    },
+    async chooseQuickAgentModel(role) {
+      // The driver pins every field explicitly, so take the full question set.
+      console.log(`${role} model: choosing to customize every setting`)
+      return 'customize'
+    },
     chooseTargetBranch(suggested) {
       console.log(`target branch: ${CHOICES.targetBranch} (suggested ${suggested})`)
       return Promise.resolve(CHOICES.targetBranch)
@@ -213,6 +224,7 @@ async function cmdInit(): Promise<number> {
     git: gitCliRepository(),
     gateway: ghCliGateway(),
     catalog: registryModelCatalog(modelRegistry),
+    workspace: fsWorkspaceReader(),
     store: fsControlStore(resolveNornHome(process.env, homedir())),
     interaction: scriptedInteraction(),
   })

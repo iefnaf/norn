@@ -10,6 +10,7 @@ import { ghCliGateway } from '../adapters/github-gateway.ts'
 import { gitCliRepository } from '../adapters/git-repository.ts'
 import { registryModelCatalog } from '../adapters/model-catalog.ts'
 import type { ModelRegistryLike } from '../adapters/model-catalog.ts'
+import { fsWorkspaceReader } from '../adapters/workspace-reader.ts'
 import { fsControlStore } from '../control/control-store.ts'
 import { resolveNornHome } from '../config/paths.ts'
 import { initRepository } from '../runner/init.ts'
@@ -30,14 +31,16 @@ export type InitCommandAdapters = Omit<InitDeps, 'cwd' | 'interaction'>
 
 /**
  * Build the built-in production adapters: the `git` and `gh` CLIs, the Pi
- * model registry, and the filesystem Local control store under Norn home,
- * honoring `PI_CODING_AGENT_DIR` (design.md §2.2).
+ * model registry, the filesystem workspace reader, and the filesystem Local
+ * control store under Norn home, honoring `PI_CODING_AGENT_DIR` (design.md
+ * §2.2).
  */
 export function productionInitAdapters(ctx: InitCommandContext): InitCommandAdapters {
   return {
     git: gitCliRepository(),
     gateway: ghCliGateway(),
     catalog: registryModelCatalog(ctx.modelRegistry),
+    workspace: fsWorkspaceReader(),
     store: fsControlStore(resolveNornHome(process.env, homedir())),
   }
 }

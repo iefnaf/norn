@@ -41,7 +41,8 @@ export function renderPending(subcommand: NornSubcommandInfo): string {
 export function renderInitTakesNoArguments(): string {
   return [
     '/norn init takes no arguments.',
-    'It resolves the current repository and asks for every choice explicitly.',
+    'It detects the setup and test commands when it recognizes this repository,',
+    'asks only for the Worker and Reviewer models, and can customize every choice.',
   ].join('\n')
 }
 
@@ -61,6 +62,7 @@ export function renderInitOutcome(outcome: InitOutcome): string {
       `Concurrency: ${value.config.concurrency} · maxWorkRounds: ${value.config.maxWorkRounds} · maxPushRetries: ${value.config.maxPushRetries}`,
       `Child agent env: ${Object.keys(value.config.agentEnv).join(', ') || 'none'}`,
       `Tests: ${value.config.tests.map((test) => test.argv.join(' ')).join(' ; ')}`,
+      `Commands: ${value.detectedCommandSource ?? 'entered manually'}`,
       `configRevision: ${value.configRevision}`,
     ]
     if (!isSha256Digest(value.configRevision)) {

@@ -1,8 +1,11 @@
 /**
- * Shared fakes for extension-level tests: a scripted dialog UI and a fixed
- * model catalog. Presentation only — no policy, no I/O.
+ * Shared fakes for extension-level tests: a scripted dialog UI, a fixed
+ * model catalog, and a canned workspace. Presentation only — no policy, no
+ * real I/O.
  */
 import type { CatalogModel } from '../../src/adapters/model-catalog.ts'
+import type { WorkspaceReaderAdapter } from '../../src/adapters/workspace-reader.ts'
+import { ok } from '../../src/core/outcome.ts'
 
 export type FakeDialogUi = {
   select(title: string, options: readonly string[]): Promise<string | undefined>
@@ -29,6 +32,26 @@ export function fakeCatalogModels(models: readonly CatalogModel[] = FAKE_CATALOG
   return {
     async listModels() {
       return { kind: 'ok' as const, value: models }
+    },
+  }
+}
+
+/** A recognizable JavaScript workspace: npm lockfile plus a real test script. */
+export const FAKE_WORKSPACE_FILES: Readonly<Record<string, string>> = {
+  'package.json': JSON.stringify({
+    name: 'demo',
+    scripts: { test: 'node --test' },
+  }),
+  'package-lock.json': '{}',
+}
+
+/** A canned workspace reader over a fixed file tree (absent paths → undefined). */
+export function fakeWorkspaceReader(
+  files: Readonly<Record<string, string>> = FAKE_WORKSPACE_FILES,
+): WorkspaceReaderAdapter {
+  return {
+    async readTextFile(_root, relativePath) {
+      return ok(files[relativePath])
     },
   }
 }
