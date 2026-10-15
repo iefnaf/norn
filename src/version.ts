@@ -9,4 +9,4 @@
  * The value must track `package.json`; it is a constant so identity never
  * depends on file reads at runtime.
  */
-export const NORN_VERSION = '0.1.0'
+export const NORN_VERSION = '0.2.0'

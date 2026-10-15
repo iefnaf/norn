@@ -65,6 +65,21 @@ export function supportedThinkingLevels(
   return THINKING_LEVELS.filter((level) => model.thinkingLevelMap?.[level] !== null)
 }
 
+/**
+ * The strongest thinking level a catalog model supports, in `THINKING_LEVELS`
+ * order. The quick init flow uses it as the fixed default for a model the
+ * operator picked; the full Customize path still asks explicitly.
+ */
+export function highestThinkingLevel(
+  model: Pick<CatalogModel, 'thinkingLevels'>,
+): ThinkingLevel {
+  let highest: ThinkingLevel = 'off'
+  for (const level of THINKING_LEVELS) {
+    if (model.thinkingLevels.includes(level)) highest = level
+  }
+  return highest
+}
+
 /** The built-in production adapter over the Pi model registry. */
 export function registryModelCatalog(registry: ModelRegistryLike): ModelCatalogAdapter {
   return {

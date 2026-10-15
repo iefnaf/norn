@@ -8,7 +8,7 @@ import { describe, it } from 'node:test'
 import nornExtension from '../src/extension/index.ts'
 import { executeInitCommand } from '../src/extension/init-command.ts'
 import { fsControlStore } from '../src/control/control-store.ts'
-import { fakeCatalogModels, type FakeDialogUi } from './helpers/fake-dialog-ui.ts'
+import { fakeCatalogModels, fakeWorkspaceReader, type FakeDialogUi } from './helpers/fake-dialog-ui.ts'
 
 type RegisteredCommand = {
   name: string
@@ -63,7 +63,7 @@ function fakeCtx(options: { cwd: string; ui: FakeDialogUi; hasUI?: boolean }) {
   }
 }
 
-/** The happy-path operator: accepts every suggestion, adds one test command. */
+/** The happy-path operator: takes the quick flow and accepts every suggestion. */
 function acceptingUi(): FakeDialogUi {
   return {
     async select(title, options) {
@@ -78,8 +78,36 @@ function acceptingUi(): FakeDialogUi {
       }
       return options[0]
     },
+    async confirm() {
+      return false
+    },
+    async input(title) {
+      if (title.includes('test commands')) return 'npm test' // only asked when undetected
+      return '' // accept every suggested value
+    },
+  }
+}
+
+/** The customizing operator: Customize on the reviewer list, then answer everything. */
+function customizingUi(): FakeDialogUi {
+  return {
+    async select(title, options) {
+      if (title.includes('reviewer model')) {
+        // The Customize entry exists only on the quick reviewer list; the
+        // full question set re-asks the role as a plain model list.
+        return (
+          options.find((option) => option.startsWith('Customize')) ??
+          options.find((option) => option.startsWith('provider-b/model-y')) ??
+          options[0]
+        )
+      }
+      if (title.includes('worker model')) {
+        return options.find((option) => option.startsWith('provider-a/model-x')) ?? options[0]
+      }
+      if (title.includes('thinking')) return options.includes('medium') ? 'medium' : 'high'
+      return options[0]
+    },
     async confirm(title) {
-      if (title.startsWith('Add setup')) return false
       return title.startsWith('Add tests command #1')
     },
     async input(title) {
@@ -89,7 +117,7 @@ function acceptingUi(): FakeDialogUi {
   }
 }
 
-function fakeAdapters(cwd: string, store: ReturnType<typeof fsControlStore>) {
+function fakeAdapters(cwd: string, store: ReturnType<typeof fsControlStore>, workspace = fakeWorkspaceReader()) {
   return {
     cwd,
     git: {
@@ -121,6 +149,7 @@ function fakeAdapters(cwd: string, store: ReturnType<typeof fsControlStore>) {
       },
     },
     catalog: fakeCatalogModels(),
+    workspace,
     store,
   }
 }
@@ -146,15 +175,92 @@ describe('executeInitCommand through the real dialog interaction', () => {
       assert.match(message, /Target branch: main/)
       assert.match(message, /Worker: provider-a\/model-x/)
       assert.match(message, /Reviewer: provider-b\/model-y/)
+      assert.match(message, /Commands: npm \(package-lock\.json\)/)
 
       const home = join(nornHome, 'repositories', 'github.com', 'R_kgDOB123')
       assert.ok(existsSync(join(home, 'config.json')))
       const config = JSON.parse(readFileSync(join(home, 'config.json'), 'utf8'))
       assert.equal(config.targetBranch, 'main')
-      assert.deepEqual(config.tests, [{ argv: ['npm', 'test'], timeoutMs: 120_000 }])
+      assert.deepEqual(config.setup, [{ argv: ['npm', 'ci'], timeoutMs: 600_000 }])
+      assert.deepEqual(config.tests, [{ argv: ['npm', 'test'], timeoutMs: 600_000 }])
+      assert.deepEqual(config.worker, {
+        model: 'provider-a/model-x',
+        thinking: 'high',
+        timeoutMs: 3_600_000,
+      })
+      assert.deepEqual(config.reviewer, {
+        model: 'provider-b/model-y',
+        thinking: 'high',
+        timeoutMs: 1_800_000,
+      })
       assert.deepEqual(config.trustedEvidenceAuthorIds, ['I_actor'])
       // Nothing was created inside the target repository working tree.
       assert.deepEqual(readdirSync(repoTree), [])
+    } finally {
+      rmSync(nornHome, { recursive: true, force: true })
+      rmSync(repoTree, { recursive: true, force: true })
+    }
+  })
+
+  it('choosing Customize on the reviewer list runs the full question set', async () => {
+    const nornHome = mkdtempSync(join(tmpdir(), 'norn-ext-home-'))
+    const repoTree = mkdtempSync(join(tmpdir(), 'norn-ext-repo-'))
+    try {
+      const { ctx, notifications } = fakeCtx({ cwd: repoTree, ui: customizingUi() })
+      const deps = fakeAdapters(repoTree, fsControlStore(nornHome))
+      await executeInitCommand(ctx, deps as never)
+
+      const report = notifications.at(-1)!
+      assert.equal(report.level, 'info')
+      assert.match(report.message, /Norn repository initialized/)
+
+      const home = join(nornHome, 'repositories', 'github.com', 'R_kgDOB123')
+      const config = JSON.parse(readFileSync(join(home, 'config.json'), 'utf8'))
+      assert.equal(config.targetBranch, 'main')
+      assert.deepEqual(config.setup, [])
+      assert.deepEqual(config.tests, [{ argv: ['npm', 'test'], timeoutMs: 120_000 }])
+      assert.deepEqual(config.worker, {
+        model: 'provider-a/model-x',
+        thinking: 'medium',
+        timeoutMs: 3_600_000,
+      })
+      assert.deepEqual(config.reviewer, {
+        model: 'provider-b/model-y',
+        thinking: 'high',
+        timeoutMs: 1_800_000,
+      })
+      assert.deepEqual(config.trustedEvidenceAuthorIds, ['I_actor'])
+    } finally {
+      rmSync(nornHome, { recursive: true, force: true })
+      rmSync(repoTree, { recursive: true, force: true })
+    }
+  })
+
+  it('asks for the test commands only when the workspace is unrecognized', async () => {
+    const nornHome = mkdtempSync(join(tmpdir(), 'norn-ext-home-'))
+    const repoTree = mkdtempSync(join(tmpdir(), 'norn-ext-repo-'))
+    const asked: string[] = []
+    try {
+      const ui = acceptingUi()
+      const recording: FakeDialogUi = {
+        ...ui,
+        async input(title, placeholder) {
+          asked.push(title)
+          return ui.input(title, placeholder)
+        },
+      }
+      const { ctx, notifications } = fakeCtx({ cwd: repoTree, ui: recording })
+      const deps = fakeAdapters(repoTree, fsControlStore(nornHome), fakeWorkspaceReader({}))
+      await executeInitCommand(ctx, deps as never)
+
+      assert.match(notifications.at(-1)!.message, /Norn repository initialized/)
+      assert.equal(asked.length, 1)
+      assert.match(asked[0]!, /No test commands were recognized/)
+
+      const home = join(nornHome, 'repositories', 'github.com', 'R_kgDOB123')
+      const config = JSON.parse(readFileSync(join(home, 'config.json'), 'utf8'))
+      assert.deepEqual(config.setup, [])
+      assert.deepEqual(config.tests, [{ argv: ['npm', 'test'], timeoutMs: 120_000 }])
     } finally {
       rmSync(nornHome, { recursive: true, force: true })
       rmSync(repoTree, { recursive: true, force: true })
